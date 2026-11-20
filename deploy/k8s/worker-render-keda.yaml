@@ -1,14 +1,15 @@
 # KEDA autoscaling for the BullMQ `render-export` worker pool.
 # Requires KEDA v2 CRDs installed in the cluster.
-# If Redis requires authentication, create Secret `openmotion-keda-redis-auth`
-# in namespace `openmotion` with key `password` (and uncomment authenticationRef below).
+# Authentication uses `TriggerAuthentication/openmotion-keda-redis-auth`, backed by
+# Secret `openmotion-keda-redis-auth` (key `password`; see deploy/k8s/secret.example.yaml).
 #
-# Note on BullMQ v5 prioritized jobs: QueueService.enqueueRenderExport sets priority
-# (export_render=1, render_thumbnail=5), which BullMQ stores in the
-# `bull:render-export:prioritized` ZSET before moving to `active`. KEDA's native
-# `redis` scaler evaluates Redis Lists (`wait` and `active`). For instant scale-from-zero
-# on prioritized jobs, either raise minReplicaCount to 1 (warm pool) or pair this
-# ScaledObject with a Prometheus/BullMQ queue-depth metric on `bullmq_prioritized_count`.
+# Why minReplicaCount defaults to 1:
+# QueueService.enqueueRenderExport sets BullMQ v5 priority (export_render=1,
+# render_thumbnail=5), placing waiting jobs in the `bull:render-export:prioritized` ZSET
+# until a worker moves them to `bull:render-export:active`. Because KEDA's native `redis`
+# scaler evaluates Redis Lists (`wait`/`active`), scaling to 0 would deadlock prioritized
+# jobs. Keep minReplicaCount: 1 (warm pool) by default, or lower to 0 only after pairing
+# this ScaledObject with a Prometheus/BullMQ ZSET queue-depth metric trigger.
 apiVersion: keda.sh/v1alpha1
 kind: TriggerAuthentication
 metadata:
@@ -40,7 +41,7 @@ spec:
     name: openmotion-worker-render
   pollingInterval: 15
   cooldownPeriod: 300
-  minReplicaCount: 0
+  minReplicaCount: 1
   maxReplicaCount: 30
   advanced:
     horizontalPodAutoscalerConfig:

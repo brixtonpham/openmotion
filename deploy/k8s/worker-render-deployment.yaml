@@ -8,8 +8,8 @@ metadata:
     app.kubernetes.io/component: worker-render
     app.kubernetes.io/part-of: openmotion
 spec:
-  # Managed dynamically by KEDA ScaledObject (worker-render-keda.yaml).
-  replicas: 1
+  # Replicas are intentionally omitted so `kubectl apply -k` does not clobber
+  # KEDA ScaledObject-managed replica counts (see worker-render-keda.yaml).
   revisionHistoryLimit: 5
   selector:
     matchLabels:

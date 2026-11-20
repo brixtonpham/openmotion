@@ -106,10 +106,9 @@ Production manifests live under [`deploy/k8s/`](k8s/kustomization.yaml) and targ
 ### 1. Provision Secrets & Config
 
 1. Review [`deploy/k8s/configmap.yaml`](k8s/configmap.yaml) and update `APP_PUBLIC_ORIGIN`, `OIDC_ISSUER`, `OIDC_CLIENT_ID`, `OIDC_CALLBACK_URL`, `MCP_OAUTH_ISSUER`, `S3_ENDPOINT`, `S3_PUBLIC_ENDPOINT`, and `S3_BUCKET` for your cluster.
-2. Provision the `openmotion-secrets` Secret in namespace `openmotion` using [`deploy/k8s/secret.example.yaml`](k8s/secret.example.yaml) as a template (via External Secrets Operator, Sealed Secrets, or SOPS — never commit live credentials).
-3. If your Redis instance requires a password for KEDA polling, create the `openmotion-keda-redis-auth` Secret referenced by `TriggerAuthentication/openmotion-keda-redis-auth` in [`deploy/k8s/worker-render-keda.yaml`](k8s/worker-render-keda.yaml).
-4. Ensure your S3/R2 bucket has the canonical CORS policy applied (either run `scripts/init-s3.ts` once against the bucket or configure the same `GET`/`HEAD`/`PUT` + `Range`/`ETag`/`Content-Range` rules via Terraform).
-5. Update `deploy/k8s/ingress.yaml` with your domain and TLS certificate secret, and update `deploy/k8s/networkpolicy.yaml` if PostgreSQL, Redis, or S3 run outside the cluster (pin exact PrivateLink / VPC endpoint CIDRs rather than opening `0.0.0.0/0` to `worker-render`).
+2. Provision both `openmotion-secrets` and `openmotion-keda-redis-auth` in namespace `openmotion` using [`deploy/k8s/secret.example.yaml`](k8s/secret.example.yaml) as a template (via External Secrets Operator, Sealed Secrets, or SOPS — never commit live credentials).
+3. Ensure your S3/R2 bucket has the canonical CORS policy applied (either run `scripts/init-s3.ts` once against the bucket or configure the same `GET`/`HEAD`/`PUT` + `Range`/`ETag`/`Content-Range` rules via Terraform).
+4. Update `deploy/k8s/ingress.yaml` with your domain and TLS certificate secret, and update `deploy/k8s/networkpolicy.yaml` if PostgreSQL, Redis, or S3 run outside the cluster (pin exact PrivateLink / VPC endpoint CIDRs rather than opening `0.0.0.0/0` to `worker-render`).
 
 ### 2. Render & Apply Manifests
 
@@ -135,8 +134,8 @@ kubectl -n openmotion wait --for=condition=complete job/openmotion-catalog-sync 
 ### 3. Autoscaling & Graceful Export Drain
 
 - **`api`**: Managed by `HorizontalPodAutoscaler` (`api-hpa.yaml`, 2–20 replicas) and `PodDisruptionBudget` (`minAvailable: 1`). Ingress disables proxy buffering (`proxy-buffering: "off"`) with 3600s read/send timeouts for SSE (`/api/events`, `/api/render/:id/progress`) and Streamable HTTP `/mcp`.
-- **`worker-render`**: Managed by KEDA `ScaledObject` (`worker-render-keda.yaml`) targeting BullMQ `render-export` (`minReplicaCount: 0`, `maxReplicaCount: 30`, `cooldownPeriod: 300`, scale-down stabilization `300s`), paired with `terminationGracePeriodSeconds: 1800` so in-flight video renders complete and upload cleanly before pod termination.
-  - *Prioritized BullMQ v5 note:* Because `QueueService.enqueueRenderExport` assigns BullMQ priorities (`export_render=1`, `render_thumbnail=5`), waiting jobs enter the `bull:render-export:prioritized` ZSET before transitioning to `bull:render-export:active`. KEDA's built-in `redis` scaler evaluates Redis Lists (`wait`/`active`); for instant scale-from-zero on prioritized jobs, set `minReplicaCount: 1` for a warm render pod or pair with a Prometheus/BullMQ queue-depth trigger.
+- **`worker-render`**: Managed by KEDA `ScaledObject` (`worker-render-keda.yaml`) targeting BullMQ `render-export` (`minReplicaCount: 1`, `maxReplicaCount: 30`, `cooldownPeriod: 300`, scale-down stabilization `300s`), paired with `terminationGracePeriodSeconds: 1800` so in-flight video renders complete and upload cleanly before pod termination.
+  - *Prioritized BullMQ v5 note:* Because `QueueService.enqueueRenderExport` assigns BullMQ priorities (`export_render=1`, `render_thumbnail=5`), waiting jobs enter the `bull:render-export:prioritized` ZSET before transitioning to `bull:render-export:active`. KEDA's native `redis` scaler evaluates Redis Lists (`wait`/`active`), so `minReplicaCount` defaults to `1` (warm pool) to prevent prioritized jobs from deadlocking at zero replicas; lower `minReplicaCount` to `0` only after pairing with a Prometheus/BullMQ ZSET queue-depth trigger.
 
 ### 4. Security Hardening Summary
 

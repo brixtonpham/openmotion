@@ -66,6 +66,8 @@ COPY shared/ ./shared/
 COPY gateway/ ./gateway/
 COPY tracking/ ./tracking/
 COPY skills/ ./skills/
+COPY library/design/ ./library/design/
+COPY library/skills/ ./library/skills/
 COPY docs/transcripts.md ./docs/transcripts.md
 COPY packages/design-system/ ./packages/design-system/
 COPY packages/motion-package/ ./packages/motion-package/
@@ -78,8 +80,8 @@ COPY mcp-ui/template-recommendations/manifest.json \
      ./mcp-ui/template-recommendations/
 COPY mcp-ui/template-recommendations/assets/ ./mcp-ui/template-recommendations/assets/
 COPY mcp-ui/template-recommendations/project-previews/ ./mcp-ui/template-recommendations/project-previews/
-COPY scripts/verify-export.ts scripts/init-s3.ts scripts/lint-project.mjs ./scripts/
-COPY hyperframes.ts server.ts LICENSE ./
+COPY scripts/verify-export.ts scripts/init-s3.ts scripts/lint-project.mjs scripts/zip.mjs ./scripts/
+COPY hyperframes.ts server.ts template-library.ts LICENSE ./
 
 # Built frontend, MCP Apps card bundle, and compiled tracking artifacts.
 COPY --from=deps-build /app/studio/build ./studio/build
@@ -171,7 +173,6 @@ CMD ["node", "--experimental-strip-types", "src/entrypoints/worker.ts"]
 FROM prod-base AS catalog-sync
 COPY --chown=node:node template-library/ ./template-library/
 COPY --chown=node:node library/templates/catalog/ ./library/templates/catalog/
-COPY --chown=node:node library/skills/openmotion-design-remix/vendor/ ./library/skills/openmotion-design-remix/vendor/
 COPY --chown=node:node scripts/sync-catalog-cas.ts ./scripts/sync-catalog-cas.ts
 
 ENV NODE_ENV=production \

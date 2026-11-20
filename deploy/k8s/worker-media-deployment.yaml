@@ -125,6 +125,12 @@ spec:
                 secretKeyRef:
                   name: openmotion-secrets
                   key: OPENDESIGN_S2S_API_KEY
+            - name: OPENDESIGN_ASR_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: openmotion-config
+                  key: OPENDESIGN_ASR_URL
+                  optional: true
             - name: OPENDESIGN_BILLING_SYNC_ENABLED
               valueFrom:
                 configMapKeyRef:
