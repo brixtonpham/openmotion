@@ -1282,4 +1282,74 @@ describe('Catalog Hono Routes (src/routes/catalog.ts)', () => {
     assert.equal(BUILTIN_TEMPLATES[0].id, WELCOME_TEMPLATE_ID);
     pg.assertZeroWorkspaceBlobWrites();
   });
+
+  it('supports sub-router mounting with basePath="" under /api and /motion-api for wildcard source routes and traversal defense', async () => {
+    const pg = new MockPgHarness();
+    const storage = new MockStorage();
+    pg.seedWorkspace(WID_A, USER_A);
+
+    await syncCatalogCas({ db: pg.db, storage }, { templateIds: [WELCOME_TEMPLATE_ID] });
+    const catalog = new CatalogService({ db: pg.db, storage });
+
+    const mounted = new Hono<CatalogRouteEnv>();
+    mounted.route('/api', createCatalogRoutes({ catalog, basePath: '' }));
+    mounted.route('/motion-api', createCatalogRoutes({ catalog, basePath: '' }));
+
+    for (const prefix of ['/api', '/motion-api']) {
+      // Poster 302
+      const poster = await mounted.request(`${prefix}/templates/${WELCOME_TEMPLATE_ID}/poster`);
+      assert.equal(poster.status, 302);
+
+      // /templates/:id/source/* (HEAD from PG + GET 302 presigned)
+      const presignBefore = storage.presignGetCalls;
+      const headSource = await mounted.request(
+        `${prefix}/templates/${WELCOME_TEMPLATE_ID}/source/assets/horizon.webp`,
+        { method: 'HEAD' },
+      );
+      assert.equal(headSource.status, 200);
+      assert.equal(headSource.headers.get('content-type'), 'image/webp');
+      assert.equal(storage.presignGetCalls, presignBefore);
+
+      const getSource = await mounted.request(
+        `${prefix}/templates/${WELCOME_TEMPLATE_ID}/source/assets/horizon.webp`,
+      );
+      assert.equal(getSource.status, 302);
+      assert.match(
+        getSource.headers.get('location') ?? '',
+        /^https:\/\/s3\.example\.test\/openmotion\/catalog\/blobs\/[a-f0-9]{64}\?/,
+      );
+
+      // /template-source/:id/* (HEAD from PG + GET 302 presigned)
+      const presignBeforeLegacy = storage.presignGetCalls;
+      const headLegacy = await mounted.request(
+        `${prefix}/template-source/${WELCOME_TEMPLATE_ID}/assets/horizon.webp`,
+        { method: 'HEAD' },
+      );
+      assert.equal(headLegacy.status, 200);
+      assert.equal(headLegacy.headers.get('content-type'), 'image/webp');
+      assert.equal(storage.presignGetCalls, presignBeforeLegacy);
+
+      const getLegacy = await mounted.request(
+        `${prefix}/template-source/${WELCOME_TEMPLATE_ID}/assets/horizon.webp`,
+      );
+      assert.equal(getLegacy.status, 302);
+      assert.match(
+        getLegacy.headers.get('location') ?? '',
+        /^https:\/\/s3\.example\.test\/openmotion\/catalog\/blobs\/[a-f0-9]{64}\?/,
+      );
+
+      // Traversal rejection on both wildcard patterns
+      const badSource = await mounted.request(
+        `${prefix}/templates/${WELCOME_TEMPLATE_ID}/source/..%2Fsecret.txt`,
+      );
+      assert.equal(badSource.status, 400);
+      assert.equal(((await badSource.json()) as { code: string }).code, 'INVALID_PATH');
+
+      const badLegacy = await mounted.request(
+        `${prefix}/template-source/${WELCOME_TEMPLATE_ID}/..%2Fsecret.txt`,
+      );
+      assert.equal(badLegacy.status, 400);
+      assert.equal(((await badLegacy.json()) as { code: string }).code, 'INVALID_PATH');
+    }
+  });
 });

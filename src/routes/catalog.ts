@@ -69,35 +69,73 @@ function parseOptionalKind(value: string | undefined): CatalogTemplateKind | und
   });
 }
 
+function safeDecodeSegment(segment: string): string {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    throw new CloudError('INVALID_PATH', 'Malformed percent-encoding in asset path', {
+      status: 400,
+      applied: false,
+    });
+  }
+}
+
+function matchesBaseSuffix(segments: readonly string[], beforeIndex: number, baseSegments: readonly string[]): boolean {
+  if (baseSegments.length === 0) return true;
+  if (beforeIndex < baseSegments.length) return false;
+  for (let offset = 0; offset < baseSegments.length; offset++) {
+    if (segments[beforeIndex - baseSegments.length + offset] !== baseSegments[offset]) {
+      return false;
+    }
+  }
+  return true;
+}
+
 function extractWildcardAssetPath(
   requestUrl: string,
   base: string,
   mode: 'templates-source' | 'template-source',
+  expectedId: string,
 ): string {
   const pathname = new URL(requestUrl).pathname;
-  const escapedBase = base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const pattern =
-    mode === 'templates-source'
-      ? new RegExp(`^${escapedBase}/templates/[^/]+/source/(.+)$`)
-      : new RegExp(`^${escapedBase}/template-source/[^/]+/(.+)$`);
-  const match = pathname.match(pattern);
-  const encodedTail = match?.[1];
-  if (!encodedTail) {
+  const rawPath = pathname.startsWith('/') ? pathname.slice(1) : pathname;
+  const segments = rawPath.split('/');
+  const baseSegments = base ? base.replace(/^\/+|\/+$/g, '').split('/').filter(Boolean) : [];
+
+  let tailStart = -1;
+  if (mode === 'templates-source') {
+    for (let i = 0; i + 3 <= segments.length; i++) {
+      if (
+        segments[i] === 'templates' &&
+        segments[i + 2] === 'source' &&
+        matchesBaseSuffix(segments, i, baseSegments) &&
+        safeDecodeSegment(segments[i + 1]) === expectedId
+      ) {
+        tailStart = i + 3;
+        break;
+      }
+    }
+  } else {
+    for (let i = 0; i + 2 <= segments.length; i++) {
+      if (
+        segments[i] === 'template-source' &&
+        matchesBaseSuffix(segments, i, baseSegments) &&
+        safeDecodeSegment(segments[i + 1]) === expectedId
+      ) {
+        tailStart = i + 2;
+        break;
+      }
+    }
+  }
+
+  if (tailStart < 0 || tailStart >= segments.length) {
     throw new CloudError('INVALID_PATH', 'Missing template source asset path', { status: 400, applied: false });
   }
 
-  const rawSegments = encodedTail.split('/');
+  const rawSegments = segments.slice(tailStart);
   const decodedSegments: string[] = [];
   for (const segment of rawSegments) {
-    let decoded: string;
-    try {
-      decoded = decodeURIComponent(segment);
-    } catch {
-      throw new CloudError('INVALID_PATH', 'Malformed percent-encoding in asset path', {
-        status: 400,
-        applied: false,
-      });
-    }
+    const decoded = safeDecodeSegment(segment);
     if (!decoded || decoded === '.' || decoded === '..' || decoded.includes('/') || decoded.includes('\\')) {
       throw new CloudError('INVALID_PATH', 'Catalog asset path contains invalid segments or traversal', {
         status: 400,
@@ -259,7 +297,7 @@ export function createCatalogRoutes(deps: CatalogRoutesDeps): Hono<CatalogRouteE
     mode: 'templates-source' | 'template-source',
   ) => {
     const rawId = c.req.param('id') ?? '';
-    const assetPath = extractWildcardAssetPath(c.req.url, base, mode);
+    const assetPath = extractWildcardAssetPath(c.req.url, base, mode, rawId);
     if (c.req.method === 'HEAD') {
       return buildHeadResponse(await catalog.headTemplateAsset(rawId, assetPath));
     }
