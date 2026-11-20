@@ -129,6 +129,16 @@ export const inlineVideoPreviewPayloadSchema = z.object({
   sourceSha256: sha256Schema,
 });
 
+export const generatePreviewProxyPayloadSchema = z.object({
+  kind: z.literal('generate_preview_proxy').default('generate_preview_proxy'),
+  workspaceId: uuidSchema,
+  sha256: sha256Schema,
+  mimeType: z.string().min(1).max(128),
+  sizeBytes: z.number().int().nonnegative(),
+  width: z.number().int().positive().optional(),
+  height: z.number().int().positive().optional(),
+});
+
 export const mediaIngestJobSchemas = {
   upload_commit: uploadCommitPayloadSchema,
   url_fetch: urlFetchPayloadSchema,
@@ -139,6 +149,7 @@ export const mediaIngestJobSchemas = {
   freeze_frame: freezeFramePayloadSchema,
   extract_asset_read: extractAssetReadPayloadSchema,
   inline_video_preview: inlineVideoPreviewPayloadSchema,
+  generate_preview_proxy: generatePreviewProxyPayloadSchema,
 } as const;
 
 export type MediaIngestJobName = keyof typeof mediaIngestJobSchemas;
@@ -229,9 +240,12 @@ export type RenderExportPayloadMap = {
 // Queue 4: blob-gc (worker-media repeatable sweeper)
 // ---------------------------------------------------------------------------
 
+/** Default 7-day grace window before Mark-and-Sweep CAS GC physically deletes unreferenced blobs. */
+export const DEFAULT_BLOB_GC_GRACE_SECONDS = 604_800;
+
 export const sweepUnreferencedBlobsPayloadSchema = z.object({
   batchSize: z.number().int().min(1).max(2000).default(500),
-  graceSeconds: z.number().int().min(0).default(86_400),
+  graceSeconds: z.number().int().min(0).default(DEFAULT_BLOB_GC_GRACE_SECONDS),
 });
 
 export const sweepExpiredUploadsPayloadSchema = z.object({

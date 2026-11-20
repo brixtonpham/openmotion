@@ -1,18 +1,33 @@
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { access, mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
+import { access, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import { describe, it } from 'node:test';
+import { promisify } from 'node:util';
+import type { SQL } from 'drizzle-orm';
+import { PgDialect } from 'drizzle-orm/pg-core';
 import sharp from 'sharp';
+import { verificationBinaries } from '../../scripts/verify-export.ts';
 import { computeProjectRevision } from '../../shared/project-validation.ts';
 import { PAT_SCOPES } from '../../src/contracts/auth.ts';
-import type { MediaIngestJobName, MediaIngestPayloadMap } from '../../src/contracts/jobs.ts';
+import {
+  DEFAULT_BLOB_GC_GRACE_SECONDS,
+  type MediaIngestJobName,
+  type MediaIngestPayloadMap,
+} from '../../src/contracts/jobs.ts';
 import type { StoragePort } from '../../src/contracts/storage.ts';
-import { normalizeBlobRefDeltas } from '../../src/db/cas.ts';
+import {
+  finalizeBlobDeletion,
+  markZeroRefForDeletion,
+  normalizeBlobRefDeltas,
+  reconcileDriftedBlobRefCounts,
+  type PreviewProxyMetadata,
+} from '../../src/db/cas.ts';
 import type { Database } from '../../src/db/client.ts';
-import { uploadTickets } from '../../src/db/schema/blobs-assets.ts';
+import { uploadTickets, workspaceBlobs } from '../../src/db/schema/blobs-assets.ts';
 import { jobs } from '../../src/db/schema/jobs.ts';
 import {
   projectFiles,
@@ -22,7 +37,7 @@ import {
 } from '../../src/db/schema/project-files.ts';
 import { projects } from '../../src/db/schema/projects.ts';
 import { createLogger } from '../../src/infra/logger.ts';
-import { validateMediaIngestPayload } from '../../src/infra/queues.ts';
+import { buildPreviewProxyJobId, validateMediaIngestPayload } from '../../src/infra/queues.ts';
 import { jobChannel, projectChannel } from '../../src/infra/redis.ts';
 import {
   blobDerivedPrefix,
@@ -40,6 +55,7 @@ import {
   type UploadTicketRecord,
 } from '../../src/mcp/import-assets.ts';
 import {
+  runBlobGcSweep,
   sweepExpiredUploads,
   sweepUnreferencedBlobs,
 } from '../../src/workers/blob-gc.ts';
@@ -48,14 +64,19 @@ import {
   type PlatformModelGateway,
 } from '../../src/workers/media-generate.ts';
 import {
+  classifyPreviewProxyTarget,
   handleExtractWaveformPeaksJob,
   handleFreezeFrameJob,
+  handleGeneratePreviewProxyJob,
   handleImageThumbnailJob,
   handleLoudnessNormalizeJob,
   handleUploadCommitJob,
   handleUrlFetchJob,
+  processMediaIngestJob,
   safePublicHttpsFetchToFile,
 } from '../../src/workers/media-ingest.ts';
+
+const execFileAsync = promisify(execFile);
 
 const WID_A = '11111111-1111-4111-8111-111111111111';
 const PID_A = '22222222-2222-4222-8222-222222222222';
@@ -1208,6 +1229,293 @@ describe('worker-media: Two-Phase CAS blob-gc & Expired Upload Sweeper', () => {
     assert.equal(storage.objects.has(mainKey), false);
     assert.equal(storage.objects.has(licKey), false);
   });
+
+  it('heals drifted ref_count=0 live blobs, enforces 7-day grace window, and protects concurrent references on finalize (c3)', async () => {
+    assert.equal(runBlobGcSweep, sweepUnreferencedBlobs);
+
+    const nowMs = Date.UTC(2026, 10, 20, 12, 0, 0);
+    const dayMs = 86_400_000;
+    const shaProjectFile = '1'.repeat(64);
+    const shaVersionFile = '2'.repeat(64);
+    const shaAssetVersion = '3'.repeat(64);
+    const shaUploadTicket = '4'.repeat(64);
+    const shaDriftedHigh = '5'.repeat(64);
+    const shaWithinGrace = '6'.repeat(64);
+    const shaPastGrace = '7'.repeat(64);
+
+    interface BlobRow {
+      workspaceId: string;
+      sha256: string;
+      s3Key: string;
+      refCount: number;
+      zeroRefSince: Date | null;
+      gcState: 'active' | 'deleting';
+    }
+
+    const blobs = new Map<string, BlobRow>([
+      [
+        shaProjectFile,
+        {
+          workspaceId: WID_A,
+          sha256: shaProjectFile,
+          s3Key: workspaceBlobKey(WID_A, shaProjectFile),
+          refCount: 0,
+          zeroRefSince: new Date(nowMs - 10 * dayMs),
+          gcState: 'active',
+        },
+      ],
+      [
+        shaVersionFile,
+        {
+          workspaceId: WID_A,
+          sha256: shaVersionFile,
+          s3Key: workspaceBlobKey(WID_A, shaVersionFile),
+          refCount: 0,
+          zeroRefSince: new Date(nowMs - 10 * dayMs),
+          gcState: 'deleting',
+        },
+      ],
+      [
+        shaAssetVersion,
+        {
+          workspaceId: WID_A,
+          sha256: shaAssetVersion,
+          s3Key: workspaceBlobKey(WID_A, shaAssetVersion),
+          refCount: 0,
+          zeroRefSince: new Date(nowMs - 10 * dayMs),
+          gcState: 'active',
+        },
+      ],
+      [
+        shaUploadTicket,
+        {
+          workspaceId: WID_A,
+          sha256: shaUploadTicket,
+          s3Key: workspaceBlobKey(WID_A, shaUploadTicket),
+          refCount: 0,
+          zeroRefSince: new Date(nowMs - 10 * dayMs),
+          gcState: 'active',
+        },
+      ],
+      [
+        shaDriftedHigh,
+        {
+          workspaceId: WID_A,
+          sha256: shaDriftedHigh,
+          s3Key: workspaceBlobKey(WID_A, shaDriftedHigh),
+          refCount: 2,
+          zeroRefSince: null,
+          gcState: 'active',
+        },
+      ],
+      [
+        shaWithinGrace,
+        {
+          workspaceId: WID_A,
+          sha256: shaWithinGrace,
+          s3Key: workspaceBlobKey(WID_A, shaWithinGrace),
+          refCount: 0,
+          zeroRefSince: new Date(nowMs - 6 * dayMs),
+          gcState: 'active',
+        },
+      ],
+      [
+        shaPastGrace,
+        {
+          workspaceId: WID_A,
+          sha256: shaPastGrace,
+          s3Key: workspaceBlobKey(WID_A, shaPastGrace),
+          refCount: 0,
+          zeroRefSince: new Date(nowMs - 8 * dayMs),
+          gcState: 'active',
+        },
+      ],
+    ]);
+
+    const pfRefs = [{ workspaceId: WID_A, blobScope: 'workspace', sha256: shaProjectFile }];
+    const pvfRefs = [
+      { workspaceId: WID_A, blobScope: 'workspace', sha256: shaVersionFile },
+      { workspaceId: WID_A, blobScope: 'workspace', sha256: shaVersionFile },
+    ];
+    const avRefs = [{ workspaceId: WID_A, sha256: shaAssetVersion }];
+    const activeUploadTickets = [{ workspaceId: WID_A, expectedSha256: shaUploadTicket, state: 'processing' }];
+
+    const liveRefCount = (wid: string, sha: string) =>
+      pfRefs.filter((r) => r.workspaceId === wid && r.blobScope === 'workspace' && r.sha256 === sha).length +
+      pvfRefs.filter((r) => r.workspaceId === wid && r.blobScope === 'workspace' && r.sha256 === sha).length +
+      avRefs.filter((r) => r.workspaceId === wid && r.sha256 === sha).length;
+    const hasActiveUpload = (wid: string, sha: string) =>
+      activeUploadTickets.some(
+        (ut) =>
+          ut.workspaceId === wid &&
+          ut.expectedSha256 === sha &&
+          ['issued', 'uploaded', 'processing'].includes(ut.state),
+      );
+
+    const storage = new InMemoryStorage();
+    for (const row of blobs.values()) {
+      await storage.putObject(row.s3Key, Buffer.from(`bytes-${row.sha256.slice(0, 4)}`), 'video/mp4');
+      await storage.putObject(thumbnailKey(WID_A, row.sha256, 'w320'), Buffer.from('thumb'), 'image/jpeg');
+      await storage.putObject(derivedAssetKey(WID_A, row.sha256, 'proxy.mp4'), Buffer.from('proxy'), 'video/mp4');
+    }
+
+    const dialect = new PgDialect();
+    const callOrder: string[] = [];
+
+    const markAndSweepDb = {
+      execute: async (query: SQL) => {
+        const compiled = dialect.sqlToQuery(query);
+        if (compiled.sql.includes('WITH drifted_live AS')) {
+          callOrder.push('reconcile:heal_live');
+          const healed: Array<Record<string, unknown>> = [];
+          for (const row of blobs.values()) {
+            const count = liveRefCount(row.workspaceId, row.sha256);
+            if (count > 0 && (row.refCount === 0 || row.zeroRefSince !== null || row.gcState === 'deleting')) {
+              row.refCount = count;
+              row.zeroRefSince = null;
+              row.gcState = 'active';
+              healed.push({ workspaceId: row.workspaceId, sha256: row.sha256, liveCount: count });
+            }
+          }
+          return { rows: healed };
+        }
+        if (compiled.sql.includes('WITH drifted_unreferenced AS')) {
+          callOrder.push('reconcile:mark_unref');
+          const marked: Array<Record<string, unknown>> = [];
+          for (const row of blobs.values()) {
+            if (
+              row.gcState === 'active' &&
+              (row.refCount > 0 || row.zeroRefSince === null) &&
+              liveRefCount(row.workspaceId, row.sha256) === 0 &&
+              !hasActiveUpload(row.workspaceId, row.sha256)
+            ) {
+              row.refCount = 0;
+              row.zeroRefSince = row.zeroRefSince ?? new Date(nowMs);
+              marked.push({ workspaceId: row.workspaceId, sha256: row.sha256 });
+            }
+          }
+          return { rows: marked };
+        }
+        if (compiled.sql.includes('WITH candidates AS')) {
+          callOrder.push('mark_for_deletion');
+          const graceSec = Number(compiled.params[0]);
+          const cutoffMs = nowMs - graceSec * 1000;
+          const claimed: Array<Record<string, unknown>> = [];
+          for (const row of blobs.values()) {
+            if (
+              row.gcState === 'active' &&
+              row.zeroRefSince !== null &&
+              row.zeroRefSince.getTime() <= cutoffMs &&
+              liveRefCount(row.workspaceId, row.sha256) === 0 &&
+              !hasActiveUpload(row.workspaceId, row.sha256)
+            ) {
+              row.gcState = 'deleting';
+              row.refCount = 0;
+              claimed.push({ workspaceId: row.workspaceId, sha256: row.sha256, s3Key: row.s3Key });
+            }
+          }
+          return { rows: claimed };
+        }
+        if (compiled.sql.includes('DELETE FROM workspace_blobs wb')) {
+          callOrder.push('finalize_delete');
+          const [wid, sha] = compiled.params as [string, string];
+          const row = blobs.get(sha);
+          if (
+            row &&
+            row.workspaceId === wid &&
+            row.gcState === 'deleting' &&
+            row.refCount === 0 &&
+            liveRefCount(wid, sha) === 0 &&
+            !hasActiveUpload(wid, sha)
+          ) {
+            blobs.delete(sha);
+            return { rows: [{ sha256: sha }] };
+          }
+          return { rows: [] };
+        }
+        throw new Error(`Unexpected SQL in Mark-and-Sweep test: ${compiled.sql}`);
+      },
+    } as unknown as Database;
+
+    const sweepRes = await runBlobGcSweep(
+      {
+        db: markAndSweepDb,
+        storage,
+        logger: SILENT_LOGGER,
+      },
+      { batchSize: 500, graceSeconds: DEFAULT_BLOB_GC_GRACE_SECONDS },
+    );
+
+    assert.deepEqual(callOrder, [
+      'reconcile:heal_live',
+      'reconcile:mark_unref',
+      'mark_for_deletion',
+      'finalize_delete',
+    ]);
+    assert.equal(sweepRes.reconciledLive, 3);
+    assert.equal(sweepRes.markedUnreferenced, 1);
+    assert.equal(sweepRes.claimed, 1);
+    assert.equal(sweepRes.deleted, 1);
+    assert.equal(sweepRes.failed, 0);
+
+    // Drifted live blobs were healed and NEVER deleted.
+    assert.equal(blobs.get(shaProjectFile)?.refCount, 1);
+    assert.equal(blobs.get(shaProjectFile)?.zeroRefSince, null);
+    assert.equal(blobs.get(shaProjectFile)?.gcState, 'active');
+    assert.equal(blobs.get(shaVersionFile)?.refCount, 2);
+    assert.equal(blobs.get(shaVersionFile)?.gcState, 'active');
+    assert.equal(blobs.get(shaAssetVersion)?.refCount, 1);
+    assert.equal(storage.objects.has(workspaceBlobKey(WID_A, shaProjectFile)), true);
+    assert.equal(storage.objects.has(workspaceBlobKey(WID_A, shaVersionFile)), true);
+    assert.equal(storage.objects.has(workspaceBlobKey(WID_A, shaAssetVersion)), true);
+
+    // Active upload ticket, newly zeroed drifted-high blob, and within-grace blob all survived.
+    assert.equal(blobs.has(shaUploadTicket), true);
+    assert.equal(storage.objects.has(workspaceBlobKey(WID_A, shaUploadTicket)), true);
+    assert.equal(blobs.get(shaDriftedHigh)?.refCount, 0);
+    assert.equal(blobs.get(shaDriftedHigh)?.zeroRefSince?.getTime(), nowMs);
+    assert.equal(blobs.has(shaWithinGrace), true);
+
+    // Only the truly unreferenced 8-day-old blob (plus thumb + proxy) was deleted.
+    assert.equal(blobs.has(shaPastGrace), false);
+    assert.equal(storage.objects.has(workspaceBlobKey(WID_A, shaPastGrace)), false);
+    assert.equal(storage.objects.has(thumbnailKey(WID_A, shaPastGrace, 'w320')), false);
+    assert.equal(storage.objects.has(derivedAssetKey(WID_A, shaPastGrace, 'proxy.mp4')), false);
+
+    // Concurrent live reference before finalize prevents PG deletion.
+    const shaRace = '8'.repeat(64);
+    blobs.set(shaRace, {
+      workspaceId: WID_A,
+      sha256: shaRace,
+      s3Key: workspaceBlobKey(WID_A, shaRace),
+      refCount: 0,
+      zeroRefSince: new Date(nowMs - 9 * dayMs),
+      gcState: 'deleting',
+    });
+    pfRefs.push({ workspaceId: WID_A, blobScope: 'workspace', sha256: shaRace });
+    assert.equal(await finalizeBlobDeletion(markAndSweepDb, WID_A, shaRace), false);
+    assert.equal(blobs.has(shaRace), true);
+
+    // Direct markZeroRefForDeletion also guards NOT EXISTS without running reconcile first.
+    const shaDirectLive = '9'.repeat(64);
+    blobs.set(shaDirectLive, {
+      workspaceId: WID_A,
+      sha256: shaDirectLive,
+      s3Key: workspaceBlobKey(WID_A, shaDirectLive),
+      refCount: 0,
+      zeroRefSince: new Date(nowMs - 10 * dayMs),
+      gcState: 'active',
+    });
+    avRefs.push({ workspaceId: WID_A, sha256: shaDirectLive });
+    const directClaimed = await markZeroRefForDeletion(markAndSweepDb, {
+      graceSeconds: DEFAULT_BLOB_GC_GRACE_SECONDS,
+      batchSize: 50,
+    });
+    assert.equal(directClaimed.some((b) => b.sha256 === shaDirectLive), false);
+    const rec = await reconcileDriftedBlobRefCounts(markAndSweepDb);
+    assert.equal(rec.healedLive >= 1, true);
+    assert.equal(blobs.get(shaDirectLive)?.refCount, 1);
+  });
 });
 
 describe('MCP CloudImportAssetsService -> worker-media end-to-end project_asset integration', () => {
@@ -1754,6 +2062,415 @@ describe('MCP CloudImportAssetsService -> worker-media end-to-end project_asset 
         'fonts/Inter-Bold-v2.woff2',
         'fonts/OFL.txt',
       ]);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('worker-media: Dual-Track Preview Proxy Generation (c1)', () => {
+  it('classifies eligible media vs skipped formats accurately', () => {
+    assert.equal(classifyPreviewProxyTarget({ mimeType: 'video/mp4', sizeBytes: 1024 })?.derivedName, 'proxy.mp4');
+    assert.equal(classifyPreviewProxyTarget({ mimeType: 'video/webm', sizeBytes: 1024 })?.derivedName, 'proxy.mp4');
+    assert.equal(
+      classifyPreviewProxyTarget({ mimeType: 'image/png', sizeBytes: 200 * 1024, width: 800 })?.derivedName,
+      'proxy.webp',
+    );
+    assert.equal(
+      classifyPreviewProxyTarget({ mimeType: 'image/jpeg', sizeBytes: 50 * 1024, width: 2560 })?.derivedName,
+      'proxy.webp',
+    );
+    assert.equal(classifyPreviewProxyTarget({ mimeType: 'image/png', sizeBytes: 50 * 1024, width: 800 }), null);
+    assert.equal(classifyPreviewProxyTarget({ mimeType: 'image/svg+xml', sizeBytes: 500 * 1024, width: 4000 }), null);
+    assert.equal(classifyPreviewProxyTarget({ mimeType: 'image/gif', sizeBytes: 500 * 1024, width: 4000 }), null);
+    assert.equal(classifyPreviewProxyTarget({ mimeType: 'image/webp', sizeBytes: 500 * 1024, width: 4000 }), null);
+    assert.equal(classifyPreviewProxyTarget({ mimeType: 'audio/wav', sizeBytes: 1024 })?.derivedName, 'proxy.m4a');
+    assert.equal(classifyPreviewProxyTarget({ mimeType: 'audio/x-wav', sizeBytes: 1024 })?.derivedName, 'proxy.m4a');
+    assert.equal(classifyPreviewProxyTarget({ mimeType: 'audio/wave', sizeBytes: 1024 })?.derivedName, 'proxy.m4a');
+    assert.equal(classifyPreviewProxyTarget({ mimeType: 'audio/flac', sizeBytes: 1024 })?.derivedName, 'proxy.m4a');
+    assert.equal(classifyPreviewProxyTarget({ mimeType: 'audio/mpeg', sizeBytes: 500 * 1024 }), null);
+    assert.equal(classifyPreviewProxyTarget({ mimeType: 'font/woff2', sizeBytes: 500 * 1024 }), null);
+  });
+
+  it('generates valid proxy.mp4 (720p H.264 faststart), proxy.webp (<=1920px), and proxy.m4a (AAC), persists metadata, is idempotent, and cleans /tmp', async () => {
+    const tmpRoot = await mkdtemp(path.join(os.tmpdir(), 'om-test-proxy-'));
+    try {
+      const bins = verificationBinaries();
+      const storage = new InMemoryStorage();
+      const dialect = new PgDialect();
+      const blobMetadataBySha = new Map<string, Record<string, unknown>>();
+
+      const createProxyDb = (sha256: string) =>
+        ({
+          select: () => {
+            const chain: Record<string, unknown> = {
+              from: () => chain,
+              where: () => chain,
+              limit: () =>
+                Promise.resolve([
+                  {
+                    metadata: blobMetadataBySha.get(sha256) ?? null,
+                    gcState: 'active',
+                  },
+                ]),
+            };
+            return chain;
+          },
+          update: (table: unknown) => ({
+            set: (values: Record<string, unknown>) => {
+              const run = () => {
+                if (table === workspaceBlobs && values.metadata) {
+                  const query = dialect.sqlToQuery(values.metadata as SQL);
+                  const patchJson = query.params.find((p): p is string => typeof p === 'string');
+                  if (patchJson) {
+                    const patch = JSON.parse(patchJson) as Record<string, unknown>;
+                    blobMetadataBySha.set(sha256, {
+                      ...(blobMetadataBySha.get(sha256) ?? {}),
+                      ...patch,
+                    });
+                  }
+                }
+                return Promise.resolve([{ sha256 }]);
+              };
+              const chain: Record<string, unknown> = {
+                where: () => chain,
+                returning: () => run(),
+              };
+              return chain;
+            },
+          }),
+        }) as unknown as Database;
+
+      // 1. Video -> 720p H.264 faststart proxy.mp4
+      const synthVideoPath = path.join(tmpRoot, 'synth-source.mp4');
+      await execFileAsync(bins.ffmpeg, [
+        '-v',
+        'error',
+        '-f',
+        'lavfi',
+        '-i',
+        'testsrc2=size=1600x900:rate=30:duration=0.4',
+        '-f',
+        'lavfi',
+        '-i',
+        'sine=frequency=440:sample_rate=44100:duration=0.4',
+        '-c:v',
+        'libx264',
+        '-preset',
+        'ultrafast',
+        '-pix_fmt',
+        'yuv420p',
+        '-c:a',
+        'aac',
+        '-shortest',
+        '-y',
+        synthVideoPath,
+      ]);
+      const videoBytes = await readFile(synthVideoPath);
+      const videoSha = createHash('sha256').update(videoBytes).digest('hex');
+      await storage.putObject(workspaceBlobKey(WID_A, videoSha), videoBytes, 'video/mp4');
+
+      const proxyTmpDir = path.join(tmpRoot, 'work');
+      const videoRes = await handleGeneratePreviewProxyJob(
+        {
+          db: createProxyDb(videoSha),
+          storage,
+          eventBus: { publish: async () => 1 },
+          logger: SILENT_LOGGER,
+          workerId: 'media-proxy-1',
+          tmpBaseDir: proxyTmpDir,
+        },
+        {
+          kind: 'generate_preview_proxy',
+          workspaceId: WID_A,
+          sha256: videoSha,
+          mimeType: 'video/mp4',
+          sizeBytes: videoBytes.byteLength,
+          width: 1600,
+          height: 900,
+        },
+      );
+
+      assert.equal(videoRes.status, 'ready');
+      const videoProxyKey = derivedAssetKey(WID_A, videoSha, 'proxy.mp4');
+      assert.equal(videoRes.previewProxy?.s3Key, videoProxyKey);
+      assert.equal(videoRes.previewProxy?.mimeType, 'video/mp4');
+      assert.equal(videoRes.previewProxy?.width, 1280);
+      assert.equal(videoRes.previewProxy?.height, 720);
+      assert.equal(videoRes.previewProxy?.codec, 'h264');
+      assert.ok((videoRes.previewProxy?.sizeBytes ?? 0) > 0);
+
+      const storedVideoProxy = storage.objects.get(videoProxyKey);
+      assert.ok(storedVideoProxy && storedVideoProxy.bytes.byteLength > 0);
+      const moovOffset = storedVideoProxy.bytes.indexOf(Buffer.from('moov', 'ascii'));
+      const mdatOffset = storedVideoProxy.bytes.indexOf(Buffer.from('mdat', 'ascii'));
+      assert.ok(moovOffset > 0 && mdatOffset > moovOffset, 'proxy.mp4 must have moov before mdat (+faststart)');
+
+      const persistedVideoMeta = blobMetadataBySha.get(videoSha)?.previewProxy as PreviewProxyMetadata;
+      assert.equal(persistedVideoMeta.status, 'ready');
+      assert.equal(persistedVideoMeta.s3Key, videoProxyKey);
+
+      // Idempotency: re-running skips S3 download & transcoding when status === 'ready'.
+      let getStreamCalledOnRerun = false;
+      const origGetStream = storage.getObjectStream.bind(storage);
+      storage.getObjectStream = async (key) => {
+        getStreamCalledOnRerun = true;
+        return origGetStream(key);
+      };
+      const rerunRes = (await processMediaIngestJob(
+        {
+          db: createProxyDb(videoSha),
+          storage,
+          eventBus: { publish: async () => 1 },
+          logger: SILENT_LOGGER,
+          workerId: 'media-proxy-1',
+          tmpBaseDir: proxyTmpDir,
+        },
+        'generate_preview_proxy',
+        {
+          kind: 'generate_preview_proxy',
+          workspaceId: WID_A,
+          sha256: videoSha,
+          mimeType: 'video/mp4',
+          sizeBytes: videoBytes.byteLength,
+          width: 1600,
+          height: 900,
+        },
+      )) as { status: string; reason?: string };
+      assert.equal(rerunRes.status, 'skipped');
+      assert.equal(rerunRes.reason, 'already_ready');
+      assert.equal(getStreamCalledOnRerun, false);
+      storage.getObjectStream = origGetStream;
+
+      // 2. High-res PNG (2400x1200) -> <=1920px WebP proxy.webp
+      const largePng = await sharp({
+        create: { width: 2400, height: 1200, channels: 4, background: { r: 30, g: 140, b: 220, alpha: 1 } },
+      })
+        .png()
+        .toBuffer();
+      const pngSha = createHash('sha256').update(largePng).digest('hex');
+      await storage.putObject(workspaceBlobKey(WID_A, pngSha), largePng, 'image/png');
+
+      const imgRes = await handleGeneratePreviewProxyJob(
+        {
+          db: createProxyDb(pngSha),
+          storage,
+          eventBus: { publish: async () => 1 },
+          logger: SILENT_LOGGER,
+          workerId: 'media-proxy-1',
+          tmpBaseDir: proxyTmpDir,
+        },
+        {
+          kind: 'generate_preview_proxy',
+          workspaceId: WID_A,
+          sha256: pngSha,
+          mimeType: 'image/png',
+          sizeBytes: largePng.byteLength,
+          width: 2400,
+          height: 1200,
+        },
+      );
+      assert.equal(imgRes.status, 'ready');
+      const imgProxyKey = derivedAssetKey(WID_A, pngSha, 'proxy.webp');
+      assert.equal(imgRes.previewProxy?.s3Key, imgProxyKey);
+      assert.equal(imgRes.previewProxy?.mimeType, 'image/webp');
+      assert.equal(imgRes.previewProxy?.width, 1920);
+      assert.equal(imgRes.previewProxy?.height, 960);
+      const storedWebp = storage.objects.get(imgProxyKey);
+      assert.ok(storedWebp);
+      const webpMeta = await sharp(storedWebp.bytes).metadata();
+      assert.equal(webpMeta.format, 'webp');
+      assert.equal(webpMeta.width, 1920);
+
+      // 3. Uncompressed WAV -> AAC proxy.m4a
+      const synthWavPath = path.join(tmpRoot, 'synth-source.wav');
+      await execFileAsync(bins.ffmpeg, [
+        '-v',
+        'error',
+        '-f',
+        'lavfi',
+        '-i',
+        'sine=frequency=440:sample_rate=44100:duration=0.4',
+        '-c:a',
+        'pcm_s16le',
+        '-y',
+        synthWavPath,
+      ]);
+      const wavBytes = await readFile(synthWavPath);
+      const wavSha = createHash('sha256').update(wavBytes).digest('hex');
+      await storage.putObject(workspaceBlobKey(WID_A, wavSha), wavBytes, 'audio/wav');
+
+      const audioRes = await handleGeneratePreviewProxyJob(
+        {
+          db: createProxyDb(wavSha),
+          storage,
+          eventBus: { publish: async () => 1 },
+          logger: SILENT_LOGGER,
+          workerId: 'media-proxy-1',
+          tmpBaseDir: proxyTmpDir,
+        },
+        {
+          kind: 'generate_preview_proxy',
+          workspaceId: WID_A,
+          sha256: wavSha,
+          mimeType: 'audio/wav',
+          sizeBytes: wavBytes.byteLength,
+        },
+      );
+      assert.equal(audioRes.status, 'ready');
+      const audioProxyKey = derivedAssetKey(WID_A, wavSha, 'proxy.m4a');
+      assert.equal(audioRes.previewProxy?.s3Key, audioProxyKey);
+      assert.equal(audioRes.previewProxy?.mimeType, 'audio/mp4');
+      assert.equal(audioRes.previewProxy?.codec, 'aac');
+      const storedAudioProxy = storage.objects.get(audioProxyKey);
+      assert.ok(storedAudioProxy && storedAudioProxy.bytes.byteLength > 0);
+      const verifyAudioPath = path.join(tmpRoot, 'verify-proxy.m4a');
+      await writeFile(verifyAudioPath, storedAudioProxy.bytes);
+      const probeAudio = await execFileAsync(bins.ffprobe, [
+        '-v',
+        'error',
+        '-select_streams',
+        'a:0',
+        '-show_entries',
+        'stream=codec_name',
+        '-of',
+        'json',
+        verifyAudioPath,
+      ]);
+      const audioStreams = (JSON.parse(probeAudio.stdout) as { streams?: Array<{ codec_name?: string }> }).streams;
+      assert.equal(audioStreams?.[0]?.codec_name, 'aac');
+
+      // Verify /tmp scratch dirs under proxyTmpDir were all cleaned up in finally.
+      const leftovers = await readdir(proxyTmpDir);
+      assert.deepEqual(leftovers, []);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('enqueues generate_preview_proxy non-blockingly on upload_commit & url_fetch without failing ingest on queue error', async () => {
+    const tmpRoot = await mkdtemp(path.join(os.tmpdir(), 'om-test-proxy-enq-'));
+    try {
+      const storage = new InMemoryStorage();
+      const dummyVideo = Buffer.from('00000018667479706d703432000000006d70343269736f6d', 'hex');
+      const videoSha = createHash('sha256').update(dummyVideo).digest('hex');
+      const stagingKey = uploadStagingKey(WID_A, UID_A);
+      await storage.putObject(stagingKey, dummyVideo, 'video/mp4');
+
+      const enqueuedProxies: Array<{
+        name: MediaIngestJobName;
+        payload: MediaIngestPayloadMap[MediaIngestJobName];
+        jobId?: string;
+      }> = [];
+
+      const ticketRow = {
+        id: UID_A,
+        workspaceId: WID_A,
+        userId: UID_A,
+        purpose: 'library_asset',
+        targetProjectId: null,
+        targetAssetId: null,
+        targetPath: null,
+        filename: 'clip.mp4',
+        expectedMimeType: 'video/mp4',
+        expectedModality: 'video',
+        expectedSha256: videoSha,
+        maxBytes: 1_000_000,
+        s3StagingKey: stagingKey,
+        licenseS3StagingKey: null,
+        licenseFilename: null,
+        licenseMaxBytes: null,
+        state: 'uploaded',
+        requestId: 'req-proxy-upload',
+        resultPayload: null,
+        error: null,
+        expiresAt: new Date(Date.now() + 60_000),
+      };
+
+      const uploaded = await handleUploadCommitJob(
+        {
+          db: createFakeDb({ selectQueue: [[ticketRow]] }),
+          storage,
+          eventBus: { publish: async () => 1 },
+          logger: SILENT_LOGGER,
+          workerId: 'media-proxy-enq-1',
+          tmpBaseDir: tmpRoot,
+          queues: {
+            enqueueMediaIngest: async (name, payload, opts) => {
+              const validated = validateMediaIngestPayload(name, payload);
+              enqueuedProxies.push({ name, payload: validated, jobId: opts?.jobId });
+              return {} as never;
+            },
+          },
+          probeMedia: async () => ({
+            modality: 'video',
+            mimeType: 'video/mp4',
+            extension: 'mp4',
+            sizeBytes: dummyVideo.byteLength,
+            width: 1920,
+            height: 1080,
+            durationSec: 5,
+          }),
+          generateThumbnailBuffer: async () => Buffer.from('jpg'),
+          applyBlobDeltas: async () => {},
+        },
+        {
+          jobId: JID_A,
+          workspaceId: WID_A,
+          uploadId: UID_A,
+          purpose: 'library_asset',
+          name: 'Clip MP4',
+        },
+      );
+
+      assert.equal(uploaded.sha256, videoSha);
+      assert.equal(enqueuedProxies.length, 1);
+      assert.equal(enqueuedProxies[0].name, 'generate_preview_proxy');
+      assert.equal(enqueuedProxies[0].jobId, buildPreviewProxyJobId(WID_A, videoSha));
+      assert.equal(enqueuedProxies[0].jobId?.includes(':'), false);
+
+      // url_fetch with a failing queue MUST still succeed (best-effort non-blocking enqueue).
+      const fetched = await handleUrlFetchJob(
+        {
+          db: createFakeDb({}),
+          storage,
+          eventBus: { publish: async () => 1 },
+          logger: SILENT_LOGGER,
+          workerId: 'media-proxy-enq-1',
+          tmpBaseDir: tmpRoot,
+          queues: {
+            enqueueMediaIngest: async () => {
+              throw new Error('Simulated Redis queue unavailable');
+            },
+          },
+          fetchPublicUrlToFile: async (_url, destPath) => {
+            await writeFile(destPath, dummyVideo);
+            return {
+              finalUrl: 'https://cdn.example.com/audio.wav',
+              bytes: dummyVideo.byteLength,
+              sha256: videoSha,
+            };
+          },
+          probeMedia: async () => ({
+            modality: 'audio',
+            mimeType: 'audio/wav',
+            extension: 'wav',
+            sizeBytes: dummyVideo.byteLength,
+            durationSec: 3,
+          }),
+          applyBlobDeltas: async () => {},
+        },
+        {
+          jobId: JID_B,
+          workspaceId: WID_A,
+          url: 'https://cdn.example.com/audio.wav',
+          name: 'Remote WAV',
+          requestId: 'req-proxy-url',
+        },
+      );
+
+      assert.equal(fetched.sha256, videoSha);
+      assert.equal(fetched.mimeType, 'audio/wav');
     } finally {
       await rm(tmpRoot, { recursive: true, force: true });
     }

@@ -1,10 +1,37 @@
 import { and, eq, sql } from 'drizzle-orm';
 import { CloudError } from '../contracts/errors.ts';
+import { DEFAULT_BLOB_GC_GRACE_SECONDS } from '../contracts/jobs.ts';
 import type { BlobMetadata } from '../contracts/storage.ts';
 import { isSha256Hex, isUuid } from '../../shared/project-validation.ts';
 import type { Database, DbExecutor } from './client.ts';
 import { asInsert, asUpdate } from './helpers.ts';
 import { workspaceBlobs } from './schema/blobs-assets.ts';
+
+export { DEFAULT_BLOB_GC_GRACE_SECONDS };
+
+/**
+ * Frozen preview proxy metadata written by `worker-media` (`generate_preview_proxy`)
+ * into `workspace_blobs.metadata.previewProxy` and read by Studio preview routes.
+ */
+export interface PreviewProxyMetadata {
+  status: 'ready' | 'failed';
+  s3Key: string;
+  mimeType: string;
+  sizeBytes: number;
+  width?: number;
+  height?: number;
+  codec?: string;
+  generatedAt: string;
+}
+
+export type WorkspaceBlobMetadataPatch = BlobMetadata & {
+  previewProxy?: PreviewProxyMetadata;
+};
+
+export interface ReconcileBlobRefCountsResult {
+  healedLive: number;
+  markedUnreferenced: number;
+}
 
 export interface BlobRefDelta {
   sha256: string;
@@ -202,7 +229,7 @@ export async function updateWorkspaceBlobMetadata(
   tx: DbExecutor,
   workspaceId: string,
   sha256: string,
-  metadata: BlobMetadata,
+  metadata: WorkspaceBlobMetadataPatch,
 ): Promise<boolean> {
   assertWorkspaceId(workspaceId);
   if (!isSha256Hex(sha256)) {
@@ -227,31 +254,207 @@ export async function updateWorkspaceBlobMetadata(
 }
 
 /**
- * Phase 1 of two-phase CAS GC: atomically claim up to `batchSize` zero-ref blobs whose
- * grace window has elapsed, transitioning them to `gc_state = 'deleting'` without holding
- * a transaction open across subsequent S3 deletions.
+ * Authoritative Mark-and-Sweep self-healing reconciliation pass:
+ * 1. Detects any `workspace_blobs` row whose `ref_count = 0`, `zero_ref_since IS NOT NULL`, or
+ *    `gc_state = 'deleting'` despite having live references in `project_files`,
+ *    `project_version_files`, or `asset_versions`; heals `ref_count` to the true live count,
+ *    clears `zero_ref_since`, and restores `gc_state = 'active'`.
+ * 2. Detects truly unreferenced active blobs (`NOT EXISTS` across `project_files`,
+ *    `project_version_files`, `asset_versions`, and active `upload_tickets`) whose `ref_count`
+ *    drifted above 0 or whose `zero_ref_since` is null, resetting `ref_count = 0` and starting
+ *    their grace clock via `zero_ref_since = COALESCE(zero_ref_since, now())`.
+ */
+export async function reconcileDriftedBlobRefCounts(
+  db: Database,
+  options: { batchSize?: number } = {},
+): Promise<ReconcileBlobRefCountsResult> {
+  const batchSize = Math.max(1, Math.min(5000, Math.floor(options.batchSize ?? 1000)));
+
+  const healedLiveResult = await db.execute(sql`
+    WITH drifted_live AS (
+      SELECT
+        wb.workspace_id,
+        wb.sha256,
+        (
+          (
+            SELECT COUNT(*)::int
+            FROM project_files pf
+            WHERE pf.workspace_id = wb.workspace_id
+              AND pf.blob_scope = 'workspace'
+              AND pf.sha256 = wb.sha256
+          )
+          +
+          (
+            SELECT COUNT(*)::int
+            FROM project_version_files pvf
+            WHERE pvf.workspace_id = wb.workspace_id
+              AND pvf.blob_scope = 'workspace'
+              AND pvf.sha256 = wb.sha256
+          )
+          +
+          (
+            SELECT COUNT(*)::int
+            FROM asset_versions av
+            WHERE av.workspace_id = wb.workspace_id
+              AND av.sha256 = wb.sha256
+          )
+        ) AS live_count
+      FROM workspace_blobs wb
+      WHERE (
+        wb.ref_count = 0
+        OR wb.zero_ref_since IS NOT NULL
+        OR wb.gc_state = 'deleting'
+      )
+      AND (
+        EXISTS (
+          SELECT 1
+          FROM project_files pf
+          WHERE pf.workspace_id = wb.workspace_id
+            AND pf.blob_scope = 'workspace'
+            AND pf.sha256 = wb.sha256
+        )
+        OR EXISTS (
+          SELECT 1
+          FROM project_version_files pvf
+          WHERE pvf.workspace_id = wb.workspace_id
+            AND pvf.blob_scope = 'workspace'
+            AND pvf.sha256 = wb.sha256
+        )
+        OR EXISTS (
+          SELECT 1
+          FROM asset_versions av
+          WHERE av.workspace_id = wb.workspace_id
+            AND av.sha256 = wb.sha256
+        )
+      )
+      LIMIT ${batchSize}
+      FOR UPDATE OF wb SKIP LOCKED
+    )
+    UPDATE workspace_blobs wb
+    SET ref_count = d.live_count,
+        zero_ref_since = NULL,
+        gc_state = 'active'
+    FROM drifted_live d
+    WHERE wb.workspace_id = d.workspace_id
+      AND wb.sha256 = d.sha256
+      AND d.live_count > 0
+    RETURNING wb.workspace_id AS "workspaceId", wb.sha256 AS "sha256", d.live_count AS "liveCount"
+  `);
+
+  const markedUnrefResult = await db.execute(sql`
+    WITH drifted_unreferenced AS (
+      SELECT wb.workspace_id, wb.sha256
+      FROM workspace_blobs wb
+      WHERE wb.gc_state = 'active'
+        AND (wb.ref_count > 0 OR wb.zero_ref_since IS NULL)
+        AND NOT EXISTS (
+          SELECT 1
+          FROM project_files pf
+          WHERE pf.workspace_id = wb.workspace_id
+            AND pf.blob_scope = 'workspace'
+            AND pf.sha256 = wb.sha256
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM project_version_files pvf
+          WHERE pvf.workspace_id = wb.workspace_id
+            AND pvf.blob_scope = 'workspace'
+            AND pvf.sha256 = wb.sha256
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM asset_versions av
+          WHERE av.workspace_id = wb.workspace_id
+            AND av.sha256 = wb.sha256
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM upload_tickets ut
+          WHERE ut.workspace_id = wb.workspace_id
+            AND ut.expected_sha256 = wb.sha256
+            AND ut.state IN ('issued', 'uploaded', 'processing')
+        )
+      LIMIT ${batchSize}
+      FOR UPDATE OF wb SKIP LOCKED
+    )
+    UPDATE workspace_blobs wb
+    SET ref_count = 0,
+        zero_ref_since = COALESCE(wb.zero_ref_since, now())
+    FROM drifted_unreferenced d
+    WHERE wb.workspace_id = d.workspace_id
+      AND wb.sha256 = d.sha256
+    RETURNING wb.workspace_id AS "workspaceId", wb.sha256 AS "sha256"
+  `);
+
+  return {
+    healedLive: (healedLiveResult.rows as Array<Record<string, unknown>>).length,
+    markedUnreferenced: (markedUnrefResult.rows as Array<Record<string, unknown>>).length,
+  };
+}
+
+export interface MarkUnreferencedBlobsOptions {
+  graceSeconds?: number;
+  gracePeriodSeconds?: number;
+  batchSize: number;
+}
+
+/**
+ * Authoritative Mark-and-Sweep Phase 1 of CAS GC: atomically claim up to `batchSize`
+ * unreferenced blobs whose grace window (default 7 days = 604800s) has elapsed AND that
+ * satisfy strict `NOT EXISTS` across ALL live reference tables (`project_files`,
+ * `project_version_files`, `asset_versions`, and active `upload_tickets`).
+ *
+ * NEVER relies solely on `workspace_blobs.ref_count = 0` to physically delete a blob.
  */
 export async function markZeroRefForDeletion(
   db: Database,
-  options: { graceSeconds: number; batchSize: number },
+  options: MarkUnreferencedBlobsOptions,
 ): Promise<ClaimedGcBlob[]> {
-  const graceSeconds = Math.max(0, Math.floor(options.graceSeconds));
+  const rawGrace = options.graceSeconds ?? options.gracePeriodSeconds ?? DEFAULT_BLOB_GC_GRACE_SECONDS;
+  const graceSeconds = Math.max(0, Math.floor(rawGrace));
   const batchSize = Math.max(1, Math.min(2000, Math.floor(options.batchSize)));
 
   const result = await db.execute(sql`
     WITH candidates AS (
-      SELECT workspace_id, sha256
-      FROM workspace_blobs
-      WHERE ref_count = 0
-        AND gc_state = 'active'
-        AND zero_ref_since IS NOT NULL
-        AND zero_ref_since <= now() - make_interval(secs => ${graceSeconds})
-      ORDER BY zero_ref_since ASC
+      SELECT wb.workspace_id, wb.sha256
+      FROM workspace_blobs wb
+      WHERE wb.gc_state = 'active'
+        AND wb.zero_ref_since IS NOT NULL
+        AND wb.zero_ref_since <= now() - make_interval(secs => ${graceSeconds})
+        AND NOT EXISTS (
+          SELECT 1
+          FROM project_files pf
+          WHERE pf.workspace_id = wb.workspace_id
+            AND pf.blob_scope = 'workspace'
+            AND pf.sha256 = wb.sha256
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM project_version_files pvf
+          WHERE pvf.workspace_id = wb.workspace_id
+            AND pvf.blob_scope = 'workspace'
+            AND pvf.sha256 = wb.sha256
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM asset_versions av
+          WHERE av.workspace_id = wb.workspace_id
+            AND av.sha256 = wb.sha256
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM upload_tickets ut
+          WHERE ut.workspace_id = wb.workspace_id
+            AND ut.expected_sha256 = wb.sha256
+            AND ut.state IN ('issued', 'uploaded', 'processing')
+        )
+      ORDER BY wb.zero_ref_since ASC
       LIMIT ${batchSize}
-      FOR UPDATE SKIP LOCKED
+      FOR UPDATE OF wb SKIP LOCKED
     )
     UPDATE workspace_blobs wb
-    SET gc_state = 'deleting'
+    SET gc_state = 'deleting',
+        ref_count = 0
     FROM candidates c
     WHERE wb.workspace_id = c.workspace_id
       AND wb.sha256 = c.sha256
@@ -265,9 +468,13 @@ export async function markZeroRefForDeletion(
   }));
 }
 
+export const markUnreferencedBlobsForDeletion = markZeroRefForDeletion;
+
 /**
- * Phase 3 of two-phase CAS GC: after S3 object + thumbnail + derived cleanup succeeds,
- * delete the PG row only if it is still `gc_state = 'deleting'` and `ref_count = 0`.
+ * Authoritative Phase 3 of CAS GC: after S3 object + thumbnail + derived cleanup succeeds,
+ * delete the PG row ONLY if it is still `gc_state = 'deleting'`, `ref_count = 0`, AND still
+ * satisfies strict `NOT EXISTS` across all live reference tables so a concurrent reference
+ * can never be lost.
  */
 export async function finalizeBlobDeletion(
   db: DbExecutor,
@@ -278,18 +485,42 @@ export async function finalizeBlobDeletion(
   if (!isSha256Hex(sha256)) {
     throw new CloudError('INVALID_ARGUMENT', `Invalid sha256 digest: ${sha256}`, { status: 400, applied: false });
   }
-  const rows = await db
-    .delete(workspaceBlobs)
-    .where(
-      and(
-        eq(workspaceBlobs.workspaceId, workspaceId),
-        eq(workspaceBlobs.sha256, sha256),
-        eq(workspaceBlobs.gcState, 'deleting'),
-        eq(workspaceBlobs.refCount, 0),
-      ),
-    )
-    .returning({ sha256: workspaceBlobs.sha256 });
-  return rows.length > 0;
+  const result = await db.execute(sql`
+    DELETE FROM workspace_blobs wb
+    WHERE wb.workspace_id = ${workspaceId}
+      AND wb.sha256 = ${sha256}
+      AND wb.gc_state = 'deleting'
+      AND wb.ref_count = 0
+      AND NOT EXISTS (
+        SELECT 1
+        FROM project_files pf
+        WHERE pf.workspace_id = wb.workspace_id
+          AND pf.blob_scope = 'workspace'
+          AND pf.sha256 = wb.sha256
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM project_version_files pvf
+        WHERE pvf.workspace_id = wb.workspace_id
+          AND pvf.blob_scope = 'workspace'
+          AND pvf.sha256 = wb.sha256
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM asset_versions av
+        WHERE av.workspace_id = wb.workspace_id
+          AND av.sha256 = wb.sha256
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM upload_tickets ut
+        WHERE ut.workspace_id = wb.workspace_id
+          AND ut.expected_sha256 = wb.sha256
+          AND ut.state IN ('issued', 'uploaded', 'processing')
+      )
+    RETURNING wb.sha256 AS "sha256"
+  `);
+  return (result.rows as Array<Record<string, unknown>>).length > 0;
 }
 
 /**

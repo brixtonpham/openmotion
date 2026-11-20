@@ -3,6 +3,8 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
+import type { SQL } from 'drizzle-orm';
+import { PgDialect } from 'drizzle-orm/pg-core';
 import {
   DEFAULT_PAT_SCOPES,
   PAT_SCOPES,
@@ -19,13 +21,21 @@ import {
   revisionConflict,
   workspaceForbidden,
 } from '../../src/contracts/errors.ts';
-import { QUEUE_NAMES } from '../../src/contracts/jobs.ts';
+import { DEFAULT_BLOB_GC_GRACE_SECONDS, QUEUE_NAMES } from '../../src/contracts/jobs.ts';
 import { S3_CANONICAL_CORS_SPEC } from '../../src/contracts/storage.ts';
-import { normalizeBlobRefDeltas } from '../../src/db/cas.ts';
+import {
+  finalizeBlobDeletion,
+  markUnreferencedBlobsForDeletion,
+  markZeroRefForDeletion,
+  normalizeBlobRefDeltas,
+  reconcileDriftedBlobRefCounts,
+} from '../../src/db/cas.ts';
+import type { Database } from '../../src/db/client.ts';
 import { parseConfig } from '../../src/infra/config.ts';
 import { createLogger, redactString, redactValue } from '../../src/infra/logger.ts';
 import {
   QUEUE_DEFAULT_JOB_OPTIONS,
+  buildPreviewProxyJobId,
   buildRenderThumbnailJobId,
   validateBlobGcPayload,
   validateMediaGeneratePayload,
@@ -46,6 +56,9 @@ import {
 } from '../../src/infra/redis.ts';
 import { ShutdownCoordinator } from '../../src/infra/shutdown.ts';
 import {
+  DEFAULT_PRESIGN_CACHE_WINDOW_SEC,
+  IMMUTABLE_PRIVATE_CACHE_CONTROL,
+  IMMUTABLE_PUBLIC_CACHE_CONTROL,
   StorageService,
   archiveKey,
   assertTenantScopedKey,
@@ -55,6 +68,9 @@ import {
   compThumbnailKey,
   derivedAssetKey,
   exportKey,
+  floorSigningDate,
+  isCatalogCasKey,
+  isImmutableCasKey,
   resolveCorsAllowedOrigins,
   thumbnailKey,
   uploadLicenseStagingKey,
@@ -244,6 +260,99 @@ describe('S3 Tenant-Scoped Keyspace, Dual Clients & CORS Spec', () => {
       'http://127.0.0.1:5173',
     ]);
   });
+
+  it('produces byte-for-byte identical window-aligned Presigned GET URLs with immutable Cache-Control for CAS keys (c4)', async () => {
+    const blobKey = workspaceBlobKey(WID_A, SHA_A);
+    const catalogKey = catalogBlobKey(SHA_A);
+    const thumbKey = thumbnailKey(WID_A, SHA_A, 'w320');
+    const derivedKey = derivedAssetKey(WID_A, SHA_A, 'proxy.mp4');
+    const mutableExportKey = exportKey(WID_A, JID_A, 'final.mp4');
+
+    assert.equal(isImmutableCasKey(blobKey), true);
+    assert.equal(isImmutableCasKey(catalogKey), true);
+    assert.equal(isImmutableCasKey(thumbKey), true);
+    assert.equal(isImmutableCasKey(derivedKey), true);
+    assert.equal(isImmutableCasKey(mutableExportKey), false);
+    assert.equal(isImmutableCasKey(uploadStagingKey(WID_A, JID_A)), false);
+    assert.equal(isCatalogCasKey(catalogKey), true);
+    assert.equal(isCatalogCasKey(blobKey), false);
+
+    assert.equal(DEFAULT_PRESIGN_CACHE_WINDOW_SEC, 3600);
+    assert.equal(
+      floorSigningDate(Date.UTC(2026, 10, 20, 14, 58, 59), 3600).toISOString(),
+      '2026-11-20T14:00:00.000Z',
+    );
+
+    const storage = new StorageService({
+      bucket: 'openmotion',
+      region: 'us-east-1',
+      endpoint: 'http://127.0.0.1:9000',
+      accessKeyId: 'minioadmin',
+      secretAccessKey: 'minioadmin',
+      forcePathStyle: true,
+      defaultPresignGetTtlSec: 300,
+    });
+
+    try {
+      const t1 = Date.UTC(2026, 10, 20, 14, 5, 12);
+      const t2 = Date.UTC(2026, 10, 20, 14, 58, 59);
+      const tNextWindow = Date.UTC(2026, 10, 20, 15, 0, 1);
+
+      // Two calls at different times inside the same UTC hour MUST return byte-for-byte identical URLs.
+      const url1 = await storage.presignGet(blobKey, { nowMs: t1 });
+      const url2 = await storage.presignGet(blobKey, { nowMs: t2 });
+      assert.equal(url1, url2);
+
+      const parsed1 = new URL(url1);
+      assert.equal(parsed1.searchParams.get('X-Amz-Date'), '20261120T140000Z');
+      assert.equal(parsed1.searchParams.get('X-Amz-Expires'), '7200');
+      assert.equal(parsed1.searchParams.get('response-cache-control'), IMMUTABLE_PRIVATE_CACHE_CONTROL);
+
+      // Crossing into the next UTC hour cleanly rotates signingDate and signature.
+      const urlNext = await storage.presignGet(blobKey, { nowMs: tNextWindow });
+      assert.notEqual(urlNext, url1);
+      const parsedNext = new URL(urlNext);
+      assert.equal(parsedNext.searchParams.get('X-Amz-Date'), '20261120T150000Z');
+      assert.equal(parsedNext.searchParams.get('X-Amz-Expires'), '7200');
+
+      // Catalog CAS blobs receive public immutable Cache-Control; thumbnails & derived receive private immutable.
+      const catalogUrl = await storage.presignGet(catalogKey, { nowMs: t1 });
+      assert.equal(
+        new URL(catalogUrl).searchParams.get('response-cache-control'),
+        IMMUTABLE_PUBLIC_CACHE_CONTROL,
+      );
+      const derivedUrl1 = await storage.presignGet(derivedKey, { nowMs: t1 });
+      const derivedUrl2 = await storage.presignGet(derivedKey, { nowMs: t2 });
+      assert.equal(derivedUrl1, derivedUrl2);
+      assert.equal(
+        new URL(derivedUrl1).searchParams.get('response-cache-control'),
+        IMMUTABLE_PRIVATE_CACHE_CONTROL,
+      );
+      const thumbUrl = await storage.presignGet(thumbKey, { nowMs: t1 });
+      assert.equal(
+        new URL(thumbUrl).searchParams.get('response-cache-control'),
+        IMMUTABLE_PRIVATE_CACHE_CONTROL,
+      );
+
+      // Explicit opt-out (`cacheWindowSec: 0`) preserves caller's short TTL without window flooring.
+      const unalignedUrl = await storage.presignGet(blobKey, {
+        cacheWindowSec: 0,
+        expiresInSec: 120,
+        responseCacheControl: 'no-store',
+      });
+      const parsedUnaligned = new URL(unalignedUrl);
+      assert.equal(parsedUnaligned.searchParams.get('X-Amz-Expires'), '120');
+      assert.equal(parsedUnaligned.searchParams.get('response-cache-control'), 'no-store');
+
+      // Non-CAS export URLs stay unaligned and do not attach `immutable` by default.
+      const exportUrl = await storage.presignGet(mutableExportKey, { expiresInSec: 300 });
+      const parsedExport = new URL(exportUrl);
+      assert.equal(parsedExport.searchParams.get('X-Amz-Expires'), '300');
+      assert.equal(parsedExport.searchParams.get('response-cache-control'), null);
+    } finally {
+      storage.close();
+    }
+  });
 });
 
 describe('Redis Key/Channel Builders & BullMQ Contracts', () => {
@@ -319,9 +428,24 @@ describe('Redis Key/Channel Builders & BullMQ Contracts', () => {
     assert.equal(thumbJobId.includes(':'), false);
     assert.equal(thumbJobId, `thumb__${WID_A}__${PID_A}__main-0`);
 
+    const proxyPayload = validateMediaIngestPayload('generate_preview_proxy', {
+      kind: 'generate_preview_proxy',
+      workspaceId: WID_A,
+      sha256: SHA_A,
+      mimeType: 'video/mp4',
+      sizeBytes: 1_048_576,
+      width: 1920,
+      height: 1080,
+    });
+    assert.equal(proxyPayload.kind, 'generate_preview_proxy');
+    const proxyJobId = buildPreviewProxyJobId(WID_A, SHA_A);
+    assert.equal(proxyJobId.includes(':'), false);
+    assert.equal(proxyJobId, `proxy__${WID_A}__${SHA_A}`);
+
     const gc = validateBlobGcPayload('sweep_unreferenced_blobs', {});
     assert.equal(gc.batchSize, 500);
-    assert.equal(gc.graceSeconds, 86_400);
+    assert.equal(gc.graceSeconds, DEFAULT_BLOB_GC_GRACE_SECONDS);
+    assert.equal(gc.graceSeconds, 604_800);
 
     assert.throws(() =>
       validateRenderExportPayload('export_render', {
@@ -378,6 +502,63 @@ describe('CAS Refcount Lock-Sorting Invariant', () => {
   it('rejects invalid sha256 digests and non-integer deltas', () => {
     assert.throws(() => normalizeBlobRefDeltas([{ sha256: 'bad', delta: 1 }]), { code: 'INVALID_ARGUMENT' });
     assert.throws(() => normalizeBlobRefDeltas([{ sha256: SHA_A, delta: 1.5 }]), { code: 'INVALID_ARGUMENT' });
+  });
+
+  it('enforces authoritative Mark-and-Sweep SQL guards across all live reference tables with 7-day default grace (c3)', async () => {
+    assert.equal(markUnreferencedBlobsForDeletion, markZeroRefForDeletion);
+
+    const dialect = new PgDialect();
+    const capturedQueries: Array<{ sql: string; params: unknown[] }> = [];
+    const inspectDb = {
+      execute: async (query: SQL) => {
+        capturedQueries.push(dialect.sqlToQuery(query));
+        return { rows: [] };
+      },
+    } as unknown as Database;
+
+    // 1. Self-heal reconciliation queries both drifted live blobs and drifted unreferenced blobs.
+    await reconcileDriftedBlobRefCounts(inspectDb, { batchSize: 250 });
+    assert.equal(capturedQueries.length, 2);
+
+    const healLiveSql = capturedQueries[0].sql;
+    assert.match(healLiveSql, /FROM project_files pf/);
+    assert.match(healLiveSql, /FROM project_version_files pvf/);
+    assert.match(healLiveSql, /FROM asset_versions av/);
+    assert.match(healLiveSql, /SET ref_count = d\.live_count,\s*zero_ref_since = NULL,\s*gc_state = 'active'/);
+    assert.match(healLiveSql, /FOR UPDATE OF wb SKIP LOCKED/);
+
+    const markUnrefSql = capturedQueries[1].sql;
+    assert.match(markUnrefSql, /NOT EXISTS[\s\S]*FROM project_files pf/);
+    assert.match(markUnrefSql, /NOT EXISTS[\s\S]*FROM project_version_files pvf/);
+    assert.match(markUnrefSql, /NOT EXISTS[\s\S]*FROM asset_versions av/);
+    assert.match(markUnrefSql, /NOT EXISTS[\s\S]*FROM upload_tickets ut[\s\S]*ut\.state IN \('issued', 'uploaded', 'processing'\)/);
+    assert.match(markUnrefSql, /zero_ref_since = COALESCE\(wb\.zero_ref_since, now\(\)\)/);
+
+    // 2. markZeroRefForDeletion defaults to 7 days (604800s) and NEVER deletes on ref_count = 0 alone.
+    capturedQueries.length = 0;
+    await markZeroRefForDeletion(inspectDb, { batchSize: 100 });
+    assert.equal(capturedQueries.length, 1);
+    const markSql = capturedQueries[0].sql;
+    assert.deepEqual(capturedQueries[0].params, [604_800, 100]);
+    assert.doesNotMatch(markSql, /WHERE\s+ref_count\s*=\s*0/i);
+    assert.match(markSql, /NOT EXISTS[\s\S]*FROM project_files pf[\s\S]*pf\.blob_scope = 'workspace'/);
+    assert.match(markSql, /NOT EXISTS[\s\S]*FROM project_version_files pvf[\s\S]*pvf\.blob_scope = 'workspace'/);
+    assert.match(markSql, /NOT EXISTS[\s\S]*FROM asset_versions av/);
+    assert.match(markSql, /NOT EXISTS[\s\S]*FROM upload_tickets ut[\s\S]*ut\.expected_sha256 = wb\.sha256[\s\S]*ut\.state IN \('issued', 'uploaded', 'processing'\)/);
+    assert.match(markSql, /FOR UPDATE OF wb SKIP LOCKED/);
+
+    // 3. finalizeBlobDeletion ALSO enforces NOT EXISTS across all 4 live tables before PG row delete.
+    capturedQueries.length = 0;
+    await finalizeBlobDeletion(inspectDb, WID_A, SHA_A);
+    assert.equal(capturedQueries.length, 1);
+    const finalizeSql = capturedQueries[0].sql;
+    assert.deepEqual(capturedQueries[0].params, [WID_A, SHA_A]);
+    assert.match(finalizeSql, /DELETE FROM workspace_blobs wb/);
+    assert.match(finalizeSql, /wb\.gc_state = 'deleting'/);
+    assert.match(finalizeSql, /NOT EXISTS[\s\S]*FROM project_files pf/);
+    assert.match(finalizeSql, /NOT EXISTS[\s\S]*FROM project_version_files pvf/);
+    assert.match(finalizeSql, /NOT EXISTS[\s\S]*FROM asset_versions av/);
+    assert.match(finalizeSql, /NOT EXISTS[\s\S]*FROM upload_tickets ut[\s\S]*ut\.state IN \('issued', 'uploaded', 'processing'\)/);
   });
 });
 

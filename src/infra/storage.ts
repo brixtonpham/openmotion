@@ -26,6 +26,36 @@ import { isSha256Hex, isUuid } from '../../shared/project-validation.ts';
 const SAFE_SPEC_REGEX = /^[a-z0-9_-]{1,64}$/;
 const SAFE_SEGMENT_REGEX = /^[a-zA-Z0-9._-]{1,160}$/;
 const HEAD_SKIP_THRESHOLD_BYTES = 256 * 1024;
+const MAX_SIGV4_PRESIGN_EXPIRES_SEC = 604_800;
+
+export const DEFAULT_PRESIGN_CACHE_WINDOW_SEC = 3600;
+export const IMMUTABLE_PUBLIC_CACHE_CONTROL = 'public, max-age=31536000, immutable';
+export const IMMUTABLE_PRIVATE_CACHE_CONTROL = 'private, max-age=31536000, immutable';
+
+const CATALOG_CAS_KEY_REGEX = /^catalog\/blobs\/[a-f0-9]{64}$/;
+const WORKSPACE_IMMUTABLE_CAS_KEY_REGEX =
+  /^workspaces\/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\/(?:blobs\/[a-f0-9]{64}|(?:thumbnails|derived)\/[a-f0-9]{64}\/[^/]+)$/;
+
+export function isCatalogCasKey(key: string): boolean {
+  return CATALOG_CAS_KEY_REGEX.test(key);
+}
+
+/**
+ * Returns true for content-addressed immutable object keys whose bytes never change at that key:
+ * - `workspaces/{wid}/blobs/{sha256}`
+ * - `catalog/blobs/{sha256}`
+ * - `workspaces/{wid}/thumbnails/{sha256}/*`
+ * - `workspaces/{wid}/derived/{sha256}/*`
+ */
+export function isImmutableCasKey(key: string): boolean {
+  return CATALOG_CAS_KEY_REGEX.test(key) || WORKSPACE_IMMUTABLE_CAS_KEY_REGEX.test(key);
+}
+
+/** Floor an epoch timestamp (ms) down to the start of its fixed UTC window boundary. */
+export function floorSigningDate(nowMs: number, windowSec: number): Date {
+  const bucketMs = windowSec * 1000;
+  return new Date(Math.floor(nowMs / bucketMs) * bucketMs);
+}
 
 function assertUuid(value: string, label: string): void {
   if (!isUuid(value)) {
@@ -206,7 +236,19 @@ export interface StorageServiceOptions {
   forcePathStyle?: boolean;
   defaultPresignPutTtlSec?: number;
   defaultPresignGetTtlSec?: number;
+  defaultPresignCacheWindowSec?: number;
   publicOrigin?: string;
+}
+
+export interface StoragePresignGetOptions extends PresignGetOptions {
+  /** Fixed UTC signing window in seconds for cacheable presigned URLs. Pass `0` to opt out. */
+  cacheWindowSec?: number;
+  /** Explicitly mark the target key as immutable (auto-detected for CAS keys when omitted). */
+  immutable?: boolean;
+  /** Override `ResponseCacheControl` sent by S3 on GET responses. */
+  responseCacheControl?: string;
+  /** Optional epoch millisecond clock override for deterministic tests. */
+  nowMs?: number;
 }
 
 function isNotFoundS3Error(error: unknown): boolean {
@@ -244,6 +286,7 @@ export class StorageService implements StoragePort {
   readonly signerClient: S3Client;
   private readonly defaultPresignPutTtlSec: number;
   private readonly defaultPresignGetTtlSec: number;
+  private readonly defaultPresignCacheWindowSec: number;
   private readonly publicOrigin?: string;
 
   constructor(options: StorageServiceOptions) {
@@ -256,6 +299,8 @@ export class StorageService implements StoragePort {
         : buildS3Client(options, signerEndpoint);
     this.defaultPresignPutTtlSec = options.defaultPresignPutTtlSec ?? 900;
     this.defaultPresignGetTtlSec = options.defaultPresignGetTtlSec ?? 300;
+    this.defaultPresignCacheWindowSec =
+      options.defaultPresignCacheWindowSec ?? DEFAULT_PRESIGN_CACHE_WINDOW_SEC;
     this.publicOrigin = options.publicOrigin;
   }
 
@@ -410,7 +455,33 @@ export class StorageService implements StoragePort {
     });
   }
 
-  async presignGet(key: string, options: PresignGetOptions = {}): Promise<string> {
+  async presignGet(key: string, options: StoragePresignGetOptions = {}): Promise<string> {
+    const immutable = options.immutable ?? isImmutableCasKey(key);
+    const rawWindowSec =
+      options.cacheWindowSec !== undefined
+        ? options.cacheWindowSec
+        : immutable
+          ? this.defaultPresignCacheWindowSec
+          : 0;
+    const windowSec = Math.max(0, Math.floor(rawWindowSec));
+    const requestedExpiresIn = options.expiresInSec ?? this.defaultPresignGetTtlSec;
+    const useAlignedWindow = windowSec > 0 && (immutable || options.cacheWindowSec !== undefined);
+
+    const signingDate = useAlignedWindow
+      ? floorSigningDate(options.nowMs ?? Date.now(), windowSec)
+      : undefined;
+    const expiresIn = useAlignedWindow
+      ? Math.min(MAX_SIGV4_PRESIGN_EXPIRES_SEC, Math.max(requestedExpiresIn, windowSec * 2))
+      : requestedExpiresIn;
+
+    const responseCacheControl =
+      options.responseCacheControl ??
+      (immutable
+        ? isCatalogCasKey(key)
+          ? IMMUTABLE_PUBLIC_CACHE_CONTROL
+          : IMMUTABLE_PRIVATE_CACHE_CONTROL
+        : undefined);
+
     const command = new GetObjectCommand({
       Bucket: this.bucket,
       Key: key,
@@ -418,9 +489,11 @@ export class StorageService implements StoragePort {
         ? { ResponseContentDisposition: options.responseContentDisposition }
         : {}),
       ...(options.responseContentType ? { ResponseContentType: options.responseContentType } : {}),
+      ...(responseCacheControl ? { ResponseCacheControl: responseCacheControl } : {}),
     });
     return getSignedUrl(this.signerClient, command, {
-      expiresIn: options.expiresInSec ?? this.defaultPresignGetTtlSec,
+      expiresIn,
+      ...(signingDate ? { signingDate } : {}),
     });
   }
 

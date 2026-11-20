@@ -167,6 +167,7 @@ export async function startMediaWorker(deps: MediaWorkerDeps): Promise<Worker[]>
           db,
           storage,
           eventBus,
+          queues,
           logger: logger.child({ queue: QUEUE_NAMES.mediaIngest, bullJobId: job.id, jobName: name }),
           workerId,
           allowDohFakeIpFallback: config.ALLOW_DOH_FAKEIP_FALLBACK,
@@ -406,6 +407,8 @@ export async function startWorkerRuntime(options: StartWorkerRuntimeOptions): Pr
     connectionString: config.DATABASE_URL,
     max: Math.min(config.PG_POOL_MAX, role === 'render' ? 5 : 15),
   });
+  const presignCacheWindowSec = (config as { S3_PRESIGN_CACHE_WINDOW_SEC?: number })
+    .S3_PRESIGN_CACHE_WINDOW_SEC;
   const storage = new StorageService({
     bucket: config.S3_BUCKET,
     region: config.S3_REGION,
@@ -416,6 +419,9 @@ export async function startWorkerRuntime(options: StartWorkerRuntimeOptions): Pr
     forcePathStyle: config.S3_FORCE_PATH_STYLE,
     defaultPresignPutTtlSec: config.S3_PRESIGN_PUT_TTL_SEC,
     defaultPresignGetTtlSec: config.S3_PRESIGN_GET_TTL_SEC,
+    ...(typeof presignCacheWindowSec === 'number'
+      ? { defaultPresignCacheWindowSec: presignCacheWindowSec }
+      : {}),
     publicOrigin: config.APP_PUBLIC_ORIGIN,
   });
   const eventBus = new RedisEventBus(config.REDIS_URL);

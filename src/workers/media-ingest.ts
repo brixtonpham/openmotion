@@ -31,6 +31,8 @@ import {
   normalizeBlobRefDeltas,
   updateWorkspaceBlobMetadata,
   type BlobRefDelta,
+  type PreviewProxyMetadata,
+  type WorkspaceBlobMetadataPatch,
 } from '../db/cas.ts';
 import type { Database, DbExecutor } from '../db/client.ts';
 import { asInsert, asUpdate } from '../db/helpers.ts';
@@ -38,6 +40,7 @@ import {
   assets,
   assetVersions,
   uploadTickets,
+  workspaceBlobs,
   type AssetModality,
 } from '../db/schema/blobs-assets.ts';
 import { jobs } from '../db/schema/jobs.ts';
@@ -49,6 +52,7 @@ import {
 } from '../db/schema/project-files.ts';
 import { projects } from '../db/schema/projects.ts';
 import type { Logger } from '../infra/logger.ts';
+import { buildPreviewProxyJobId, type QueueService } from '../infra/queues.ts';
 import { jobChannel, projectChannel, type RedisEventBus } from '../infra/redis.ts';
 import {
   assertTenantScopedKey,
@@ -66,10 +70,66 @@ import {
 export const DEFAULT_MAX_REDIRECTS = 3;
 export const DEFAULT_FETCH_IDLE_TIMEOUT_MS = 60_000;
 export const DEFAULT_FETCH_TOTAL_TIMEOUT_MS = 300_000;
+export const PREVIEW_PROXY_IMAGE_MIN_BYTES = 100 * 1024;
+export const PREVIEW_PROXY_IMAGE_MAX_WIDTH = 1920;
 const BLOB_GC_RETRY_MAX = 5;
 const BLOB_GC_RETRY_DELAY_MS = 150;
 const ASSET_READ_MAX_PREVIEW_BYTES = 4 * 1024 * 1024;
 const ASSET_READ_MAX_TOTAL_BYTES = 8 * 1024 * 1024;
+
+export type PreviewProxyTrackKind = 'video' | 'image' | 'audio';
+
+export interface PreviewProxyTarget {
+  track: PreviewProxyTrackKind;
+  derivedName: string;
+  mimeType: string;
+  codec: string;
+}
+
+const PROXY_ELIGIBLE_RASTER_IMAGE_MIMES = new Set([
+  'image/png',
+  'image/jpeg',
+  'image/jpg',
+  'image/tiff',
+  'image/bmp',
+  'image/avif',
+]);
+
+const PROXY_ELIGIBLE_AUDIO_MIMES = new Set([
+  'audio/wav',
+  'audio/x-wav',
+  'audio/wave',
+  'audio/flac',
+]);
+
+/**
+ * Determine whether an ingested workspace media blob should have a lightweight preview proxy
+ * generated in `workspaces/{wid}/derived/{sha256}/proxy.{mp4,webp,m4a}`.
+ */
+export function classifyPreviewProxyTarget(input: {
+  mimeType: string;
+  sizeBytes: number;
+  width?: number;
+  height?: number;
+}): PreviewProxyTarget | null {
+  const mime = input.mimeType.trim().toLowerCase().split(';')[0] ?? '';
+  if (mime.startsWith('video/')) {
+    return { track: 'video', derivedName: 'proxy.mp4', mimeType: 'video/mp4', codec: 'h264' };
+  }
+  if (mime === 'image/svg+xml' || mime === 'image/gif' || mime === 'image/webp') {
+    return null;
+  }
+  if (PROXY_ELIGIBLE_RASTER_IMAGE_MIMES.has(mime)) {
+    const exceedsBytes = input.sizeBytes > PREVIEW_PROXY_IMAGE_MIN_BYTES;
+    const exceedsWidth = typeof input.width === 'number' && input.width > PREVIEW_PROXY_IMAGE_MAX_WIDTH;
+    if (!exceedsBytes && !exceedsWidth) return null;
+    return { track: 'image', derivedName: 'proxy.webp', mimeType: 'image/webp', codec: 'webp' };
+  }
+  if (PROXY_ELIGIBLE_AUDIO_MIMES.has(mime)) {
+    return { track: 'audio', derivedName: 'proxy.m4a', mimeType: 'audio/mp4', codec: 'aac' };
+  }
+  return null;
+}
 
 export interface ProbedMediaInfo {
   modality: AssetModality;
@@ -113,6 +173,7 @@ export interface MediaIngestDeps {
   readonly eventBus: Pick<RedisEventBus, 'publish'>;
   readonly logger: Logger;
   readonly workerId: string;
+  readonly queues?: Pick<QueueService, 'enqueueMediaIngest'>;
   readonly allowDohFakeIpFallback?: boolean;
   readonly tmpBaseDir?: string;
   readonly probeMedia?: (filePath: string) => Promise<ProbedMediaInfo>;
@@ -1313,6 +1374,39 @@ async function promoteFileToLibraryOrProject(
   }
   await Promise.allSettled(publications);
 
+  // Best-effort non-blocking preview proxy enqueue for eligible media blobs.
+  // Never fail upload_commit / url_fetch if background proxy scheduling fails.
+  const proxyTarget = classifyPreviewProxyTarget({
+    mimeType,
+    sizeBytes,
+    width: probed?.width,
+    height: probed?.height,
+  });
+  if (proxyTarget && deps.queues) {
+    try {
+      await deps.queues.enqueueMediaIngest(
+        'generate_preview_proxy',
+        {
+          kind: 'generate_preview_proxy',
+          workspaceId: params.workspaceId,
+          sha256,
+          mimeType,
+          sizeBytes,
+          ...(probed?.width !== undefined ? { width: probed.width } : {}),
+          ...(probed?.height !== undefined ? { height: probed.height } : {}),
+        },
+        { jobId: buildPreviewProxyJobId(params.workspaceId, sha256) },
+      );
+    } catch (error) {
+      deps.logger.warn('Best-effort preview proxy enqueue failed (ingest still committed)', {
+        workspaceId: params.workspaceId,
+        sha256,
+        mimeType,
+        error,
+      });
+    }
+  }
+
   return {
     assetId: committed.assetId,
     versionId: committed.versionId,
@@ -2149,6 +2243,263 @@ export async function handleInlineVideoPreviewJob(
   }
 }
 
+export interface GeneratePreviewProxyResult {
+  status: 'ready' | 'skipped';
+  reason?: 'ineligible' | 'already_ready' | 'blob_deleting';
+  previewProxy?: PreviewProxyMetadata;
+}
+
+/**
+ * Dual-track preview proxy generator (`generate_preview_proxy`):
+ * - Video (`video/*`): 720p H.264 + short GOP (1s) + faststart -> `derived/{sha256}/proxy.mp4`
+ * - Large/high-res raster image (`png`/`jpeg`/`tiff`/`bmp`/`avif`): <=1920px WebP -> `derived/{sha256}/proxy.webp`
+ * - Uncompressed audio (`wav`/`flac`): AAC M4A + faststart -> `derived/{sha256}/proxy.m4a`
+ *
+ * Persists frozen `workspace_blobs.metadata.previewProxy` contract and is idempotent when
+ * `previewProxy.status === 'ready'` already exists for `(workspaceId, sha256)`.
+ */
+export async function handleGeneratePreviewProxyJob(
+  deps: MediaIngestDeps,
+  payload: MediaIngestPayloadMap['generate_preview_proxy'],
+): Promise<GeneratePreviewProxyResult> {
+  const target = classifyPreviewProxyTarget({
+    mimeType: payload.mimeType,
+    sizeBytes: payload.sizeBytes,
+    width: payload.width,
+    height: payload.height,
+  });
+  if (!target) {
+    return { status: 'skipped', reason: 'ineligible' };
+  }
+
+  const existingRows = await deps.db
+    .select({
+      metadata: workspaceBlobs.metadata,
+      gcState: workspaceBlobs.gcState,
+    })
+    .from(workspaceBlobs)
+    .where(and(eq(workspaceBlobs.workspaceId, payload.workspaceId), eq(workspaceBlobs.sha256, payload.sha256)))
+    .limit(1);
+
+  const existingRow = existingRows[0];
+  if (existingRow?.gcState === 'deleting') {
+    return { status: 'skipped', reason: 'blob_deleting' };
+  }
+  const existingProxy = (existingRow?.metadata as WorkspaceBlobMetadataPatch | null)?.previewProxy;
+  if (
+    existingProxy?.status === 'ready' &&
+    typeof existingProxy.s3Key === 'string' &&
+    existingProxy.s3Key.length > 0
+  ) {
+    return { status: 'skipped', reason: 'already_ready', previewProxy: existingProxy };
+  }
+
+  const workDir = path.join(
+    deps.tmpBaseDir ?? os.tmpdir(),
+    `om-proxy-${payload.sha256.slice(0, 12)}-${randomUUID()}`,
+  );
+  const runCmd = deps.runFfmpegCommand ?? defaultRunFfmpegCommand;
+  const sourceKey = workspaceBlobKey(payload.workspaceId, payload.sha256);
+  const destKey = derivedAssetKey(payload.workspaceId, payload.sha256, target.derivedName);
+
+  try {
+    await mkdir(workDir, { recursive: true, mode: 0o700 });
+    const sourcePath = path.join(workDir, 'source.bin');
+    await streamS3ObjectToFile(deps.storage, sourceKey, sourcePath, MAX_ASSET_BYTES);
+
+    let proxyBuffer: Buffer;
+    let proxyWidth: number | undefined;
+    let proxyHeight: number | undefined;
+    let proxyCodec: string = target.codec;
+
+    if (target.track === 'video') {
+      const outPath = path.join(workDir, 'proxy.mp4');
+      const transcode = await runCmd(
+        'ffmpeg',
+        [
+          '-v',
+          'error',
+          '-nostdin',
+          '-i',
+          sourcePath,
+          '-vf',
+          "scale='min(1280,iw)':-2",
+          '-c:v',
+          'libx264',
+          '-preset',
+          'veryfast',
+          '-crf',
+          '24',
+          '-pix_fmt',
+          'yuv420p',
+          '-g',
+          '30',
+          '-keyint_min',
+          '30',
+          '-movflags',
+          '+faststart',
+          '-c:a',
+          'aac',
+          '-b:a',
+          '128k',
+          '-y',
+          outPath,
+        ],
+        workDir,
+        300_000,
+      );
+      if (transcode.code !== 0) {
+        throw new CloudError(
+          'INVALID_ARGUMENT',
+          `Video preview proxy transcode failed: ${transcode.stderr.slice(-500)}`,
+          { status: 500 },
+        );
+      }
+
+      proxyBuffer = await readFile(outPath);
+      if (proxyBuffer.byteLength === 0) {
+        throw new CloudError('STORAGE_ERROR', 'Video preview proxy transcode produced empty output', {
+          status: 500,
+        });
+      }
+
+      const probedOut = await runCmd(
+        'ffprobe',
+        [
+          '-v',
+          'error',
+          '-select_streams',
+          'v:0',
+          '-show_entries',
+          'stream=width,height,codec_name',
+          '-of',
+          'json',
+          outPath,
+        ],
+        workDir,
+        15_000,
+      ).catch(() => null);
+      if (probedOut && probedOut.code === 0 && probedOut.stdout.trim()) {
+        try {
+          const parsed = JSON.parse(probedOut.stdout) as {
+            streams?: Array<{ width?: unknown; height?: unknown; codec_name?: unknown }>;
+          };
+          const stream = parsed.streams?.[0];
+          const w = Number(stream?.width ?? 0);
+          const h = Number(stream?.height ?? 0);
+          if (Number.isFinite(w) && w > 0) proxyWidth = w;
+          if (Number.isFinite(h) && h > 0) proxyHeight = h;
+          if (typeof stream?.codec_name === 'string' && stream.codec_name.trim()) {
+            proxyCodec = stream.codec_name.trim();
+          }
+        } catch {
+          // Ignore probe parse failure and fall back to computed dimensions below.
+        }
+      }
+      if (proxyWidth === undefined && payload.width !== undefined && payload.height !== undefined) {
+        proxyWidth = Math.min(1280, payload.width);
+        proxyHeight = Math.max(2, Math.round((payload.height * proxyWidth) / payload.width / 2) * 2);
+      }
+    } else if (target.track === 'image') {
+      const rendered = await sharp(sourcePath)
+        .rotate()
+        .resize({
+          width: PREVIEW_PROXY_IMAGE_MAX_WIDTH,
+          fit: 'inside',
+          withoutEnlargement: true,
+        })
+        .webp({ quality: 82 })
+        .toBuffer({ resolveWithObject: true });
+
+      if (rendered.data.byteLength === 0) {
+        throw new CloudError('STORAGE_ERROR', 'Image preview proxy encode produced empty output', {
+          status: 500,
+        });
+      }
+      proxyBuffer = rendered.data;
+      proxyWidth = rendered.info.width;
+      proxyHeight = rendered.info.height;
+      proxyCodec = 'webp';
+    } else {
+      const outPath = path.join(workDir, 'proxy.m4a');
+      const transcode = await runCmd(
+        'ffmpeg',
+        [
+          '-v',
+          'error',
+          '-nostdin',
+          '-i',
+          sourcePath,
+          '-vn',
+          '-c:a',
+          'aac',
+          '-b:a',
+          '128k',
+          '-movflags',
+          '+faststart',
+          '-y',
+          outPath,
+        ],
+        workDir,
+        120_000,
+      );
+      if (transcode.code !== 0) {
+        throw new CloudError(
+          'INVALID_ARGUMENT',
+          `Audio preview proxy transcode failed: ${transcode.stderr.slice(-500)}`,
+          { status: 500 },
+        );
+      }
+      proxyBuffer = await readFile(outPath);
+      if (proxyBuffer.byteLength === 0) {
+        throw new CloudError('STORAGE_ERROR', 'Audio preview proxy transcode produced empty output', {
+          status: 500,
+        });
+      }
+      proxyCodec = 'aac';
+    }
+
+    await deps.storage.putObject(destKey, proxyBuffer, target.mimeType, proxyBuffer.byteLength);
+
+    const previewProxy: PreviewProxyMetadata = {
+      status: 'ready',
+      s3Key: destKey,
+      mimeType: target.mimeType,
+      sizeBytes: proxyBuffer.byteLength,
+      ...(proxyWidth !== undefined ? { width: proxyWidth } : {}),
+      ...(proxyHeight !== undefined ? { height: proxyHeight } : {}),
+      codec: proxyCodec,
+      generatedAt: new Date().toISOString(),
+    };
+    await updateWorkspaceBlobMetadata(deps.db, payload.workspaceId, payload.sha256, {
+      previewProxy,
+    });
+
+    return { status: 'ready', previewProxy };
+  } catch (error) {
+    const failedProxy: PreviewProxyMetadata = {
+      status: 'failed',
+      s3Key: '',
+      mimeType: target.mimeType,
+      sizeBytes: 0,
+      codec: target.codec,
+      generatedAt: new Date().toISOString(),
+    };
+    await updateWorkspaceBlobMetadata(deps.db, payload.workspaceId, payload.sha256, {
+      previewProxy: failedProxy,
+    }).catch(() => {});
+    deps.logger.warn('Preview proxy generation failed', {
+      workspaceId: payload.workspaceId,
+      sha256: payload.sha256,
+      mimeType: payload.mimeType,
+      error,
+    });
+    throw error;
+  } finally {
+    await rm(workDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
 export async function processMediaIngestJob<K extends MediaIngestJobName>(
   deps: MediaIngestDeps,
   name: K,
@@ -2173,6 +2524,8 @@ export async function processMediaIngestJob<K extends MediaIngestJobName>(
       return handleExtractAssetReadJob(deps, payload as MediaIngestPayloadMap['extract_asset_read']);
     case 'inline_video_preview':
       return handleInlineVideoPreviewJob(deps, payload as MediaIngestPayloadMap['inline_video_preview']);
+    case 'generate_preview_proxy':
+      return handleGeneratePreviewProxyJob(deps, payload as MediaIngestPayloadMap['generate_preview_proxy']);
   }
 }
 
