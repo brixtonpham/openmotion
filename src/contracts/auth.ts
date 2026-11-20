@@ -56,12 +56,8 @@ export interface AuthContext {
   readonly displayName?: string;
 }
 
-export function hasScope(ctx: Pick<AuthContext, 'scopes' | 'role'>, required: PatScope): boolean {
-  if (ctx.scopes.includes('workspace:admin')) return true;
-  if (required === 'workspace:admin') {
-    return ctx.role === 'owner' || ctx.role === 'admin';
-  }
-  return ctx.scopes.includes(required);
+export function hasScope(ctx: Pick<AuthContext, 'scopes'>, required: PatScope): boolean {
+  return ctx.scopes.includes('workspace:admin') || ctx.scopes.includes(required);
 }
 
 export function hasMinRole(ctx: Pick<AuthContext, 'role'>, minimum: WorkspaceRole): boolean {

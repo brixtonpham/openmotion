@@ -163,6 +163,35 @@ export function assertTenantScopedKey(
   });
 }
 
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]', '::1']);
+
+/**
+ * Compute S3 bucket CORS `AllowedOrigins`.
+ * Loopback dev origins receive their matching `127.0.0.1`/`localhost` sibling on the same port,
+ * while non-loopback (e.g. production `https://`) origins NEVER leak localhost entries.
+ */
+export function resolveCorsAllowedOrigins(
+  publicOrigin?: string,
+  extraOrigins: readonly string[] = [],
+): string[] {
+  const cleanedExtras = extraOrigins.map((origin) => origin.trim()).filter(Boolean);
+  const trimmedPrimary = publicOrigin?.trim();
+  if (!trimmedPrimary) {
+    return [...new Set(['http://127.0.0.1:4173', 'http://localhost:4173', ...cleanedExtras])];
+  }
+
+  const parsed = new URL(trimmedPrimary);
+  const normalizedOrigin = parsed.origin;
+  if (LOOPBACK_HOSTS.has(parsed.hostname)) {
+    const portSuffix = parsed.port ? `:${parsed.port}` : '';
+    const siblingHost = parsed.hostname === 'localhost' ? '127.0.0.1' : 'localhost';
+    const siblingOrigin = `${parsed.protocol}//${siblingHost}${portSuffix}`;
+    return [...new Set([normalizedOrigin, siblingOrigin, ...cleanedExtras])];
+  }
+
+  return [...new Set([normalizedOrigin, ...cleanedExtras])];
+}
+
 // ---------------------------------------------------------------------------
 // StorageService Implementation (Dual Internal + Public Presigner Clients)
 // ---------------------------------------------------------------------------
@@ -408,10 +437,8 @@ export class StorageService implements StoragePort {
     }
 
     const origins = allowedOrigins?.length
-      ? [...allowedOrigins]
-      : this.publicOrigin
-        ? [...new Set([this.publicOrigin, 'http://127.0.0.1:4173', 'http://localhost:4173'])]
-        : ['http://127.0.0.1:4173', 'http://localhost:4173'];
+      ? [...new Set(allowedOrigins.map((origin) => origin.trim()).filter(Boolean))]
+      : resolveCorsAllowedOrigins(this.publicOrigin);
 
     await this.internalClient.send(
       new PutBucketCorsCommand({

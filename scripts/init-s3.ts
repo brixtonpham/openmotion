@@ -1,6 +1,6 @@
 import { isMain } from '../shared/entry.ts';
 import { createLogger } from '../src/infra/logger.ts';
-import { StorageService } from '../src/infra/storage.ts';
+import { StorageService, resolveCorsAllowedOrigins } from '../src/infra/storage.ts';
 
 function envBoolean(value: string | undefined, fallback: boolean): boolean {
   if (value === undefined || value.trim() === '') return fallback;
@@ -23,7 +23,7 @@ export async function initS3Bucket(env: NodeJS.ProcessEnv = process.env): Promis
     .map((origin) => origin.trim())
     .filter(Boolean);
 
-  const allowedOrigins = [...new Set([publicOrigin, 'http://127.0.0.1:4173', 'http://localhost:4173', ...extraOrigins])];
+  const allowedOrigins = resolveCorsAllowedOrigins(publicOrigin, extraOrigins);
 
   const storage = new StorageService({
     bucket,

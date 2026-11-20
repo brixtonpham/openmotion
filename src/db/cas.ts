@@ -67,14 +67,16 @@ export function normalizeBlobRefDeltas(deltas: readonly BlobRefDelta[]): Normali
         sizeBytes: item.sizeBytes,
         mimeType: item.mimeType,
         s3Key: item.s3Key,
-        metadata: item.metadata,
+        metadata: item.metadata ?? undefined,
       });
     } else {
       existing.delta += item.delta;
       if (item.sizeBytes !== undefined) existing.sizeBytes = item.sizeBytes;
       if (item.mimeType !== undefined) existing.mimeType = item.mimeType;
       if (item.s3Key !== undefined) existing.s3Key = item.s3Key;
-      if (item.metadata !== undefined) existing.metadata = item.metadata;
+      if (item.metadata !== undefined && item.metadata !== null) {
+        existing.metadata = existing.metadata ? { ...existing.metadata, ...item.metadata } : { ...item.metadata };
+      }
     }
   }
 
@@ -149,7 +151,7 @@ export async function applyWorkspaceBlobRefDeltas(
           set: asUpdate(workspaceBlobs, {
             refCount: sql`${workspaceBlobs.refCount} + ${item.delta}`,
             zeroRefSince: null,
-            ...(item.metadata !== undefined
+            ...(item.metadata !== undefined && item.metadata !== null
               ? {
                   metadata: sql`COALESCE(${workspaceBlobs.metadata}, '{}'::jsonb) || ${JSON.stringify(item.metadata)}::jsonb`,
                 }
@@ -205,6 +207,12 @@ export async function updateWorkspaceBlobMetadata(
   assertWorkspaceId(workspaceId);
   if (!isSha256Hex(sha256)) {
     throw new CloudError('INVALID_ARGUMENT', `Invalid sha256 digest: ${sha256}`, { status: 400, applied: false });
+  }
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) {
+    throw new CloudError('INVALID_ARGUMENT', 'Blob metadata must be a non-null JSON object', {
+      status: 400,
+      applied: false,
+    });
   }
   const rows = await tx
     .update(workspaceBlobs)

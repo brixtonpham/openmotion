@@ -26,6 +26,7 @@ import { parseConfig } from '../../src/infra/config.ts';
 import { createLogger, redactString, redactValue } from '../../src/infra/logger.ts';
 import {
   QUEUE_DEFAULT_JOB_OPTIONS,
+  buildRenderThumbnailJobId,
   validateBlobGcPayload,
   validateMediaGeneratePayload,
   validateMediaIngestPayload,
@@ -54,6 +55,7 @@ import {
   compThumbnailKey,
   derivedAssetKey,
   exportKey,
+  resolveCorsAllowedOrigins,
   thumbnailKey,
   uploadLicenseStagingKey,
   uploadStagingKey,
@@ -224,6 +226,24 @@ describe('S3 Tenant-Scoped Keyspace, Dual Clients & CORS Spec', () => {
     ]);
     assert.equal(S3_CANONICAL_CORS_SPEC.MaxAgeSeconds, 3600);
   });
+
+  it('excludes loopback origins from S3 CORS when APP_PUBLIC_ORIGIN is a non-loopback production origin', () => {
+    assert.deepEqual(resolveCorsAllowedOrigins('https://studio.open-design.ai'), [
+      'https://studio.open-design.ai',
+    ]);
+    assert.deepEqual(
+      resolveCorsAllowedOrigins('https://studio.open-design.ai/', ['https://cdn.open-design.ai']),
+      ['https://studio.open-design.ai', 'https://cdn.open-design.ai'],
+    );
+    assert.deepEqual(resolveCorsAllowedOrigins('http://127.0.0.1:4173'), [
+      'http://127.0.0.1:4173',
+      'http://localhost:4173',
+    ]);
+    assert.deepEqual(resolveCorsAllowedOrigins('http://localhost:5173'), [
+      'http://localhost:5173',
+      'http://127.0.0.1:5173',
+    ]);
+  });
 });
 
 describe('Redis Key/Channel Builders & BullMQ Contracts', () => {
@@ -294,6 +314,11 @@ describe('Redis Key/Channel Builders & BullMQ Contracts', () => {
     });
     assert.equal(thumb.width, 320);
 
+    // BullMQ v5 rejects custom jobIds containing ':'.
+    const thumbJobId = buildRenderThumbnailJobId(WID_A, PID_A, thumb.cacheKey);
+    assert.equal(thumbJobId.includes(':'), false);
+    assert.equal(thumbJobId, `thumb__${WID_A}__${PID_A}__main-0`);
+
     const gc = validateBlobGcPayload('sweep_unreferenced_blobs', {});
     assert.equal(gc.batchSize, 500);
     assert.equal(gc.graceSeconds, 86_400);
@@ -332,6 +357,24 @@ describe('CAS Refcount Lock-Sorting Invariant', () => {
     assert.equal(normalized[0].sizeBytes, 128);
   });
 
+  it('preserves existing metadata when a subsequent delta supplies metadata: null or merges non-null metadata', () => {
+    const preserved = normalizeBlobRefDeltas([
+      { sha256: SHA_A, delta: 1, sizeBytes: 1024, metadata: { width: 1920, height: 1080 } },
+      { sha256: SHA_A, delta: 1, metadata: null },
+    ]);
+    assert.equal(preserved.length, 1);
+    assert.deepEqual(preserved[0].metadata, { width: 1920, height: 1080 });
+
+    const merged = normalizeBlobRefDeltas([
+      { sha256: SHA_A, delta: 1, sizeBytes: 1024, metadata: { width: 1920 } },
+      { sha256: SHA_A, delta: 1, metadata: { height: 1080, fps: 30 } },
+    ]);
+    assert.deepEqual(merged[0].metadata, { width: 1920, height: 1080, fps: 30 });
+
+    const nullOnly = normalizeBlobRefDeltas([{ sha256: SHA_B, delta: 1, sizeBytes: 10, metadata: null }]);
+    assert.equal(nullOnly[0].metadata, undefined);
+  });
+
   it('rejects invalid sha256 digests and non-integer deltas', () => {
     assert.throws(() => normalizeBlobRefDeltas([{ sha256: 'bad', delta: 1 }]), { code: 'INVALID_ARGUMENT' });
     assert.throws(() => normalizeBlobRefDeltas([{ sha256: SHA_A, delta: 1.5 }]), { code: 'INVALID_ARGUMENT' });
@@ -364,6 +407,27 @@ describe('Auth Scopes, Errors, Logger Redaction, Shutdown & Extracted Helpers', 
     assert.equal(hasScope(editor, 'workspace:admin'), false);
     assert.equal(hasMinRole(editor, 'viewer'), true);
     assert.equal(hasMinRole(editor, 'admin'), false);
+
+    // A restricted PAT owned by a workspace owner MUST NOT escalate to workspace:admin via role.
+    const restrictedOwnerPat: AuthContext = {
+      workspaceId: WID_A,
+      userId: VID_A,
+      role: 'owner',
+      scopes: ['projects:read'],
+      authMode: 'oidc',
+      authMethod: 'pat',
+    };
+    assert.equal(hasMinRole(restrictedOwnerPat, 'owner'), true);
+    assert.equal(hasScope(restrictedOwnerPat, 'projects:read'), true);
+    assert.equal(hasScope(restrictedOwnerPat, 'projects:write'), false);
+    assert.equal(hasScope(restrictedOwnerPat, 'workspace:admin'), false);
+
+    const adminScopedPat: AuthContext = {
+      ...restrictedOwnerPat,
+      scopes: ['workspace:admin'],
+    };
+    assert.equal(hasScope(adminScopedPat, 'workspace:admin'), true);
+    assert.equal(hasScope(adminScopedPat, 'exports:write'), true);
   });
 
   it('maps canonical CloudError codes and HTTP statuses', () => {

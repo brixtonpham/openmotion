@@ -73,6 +73,15 @@ export function validateBlobGcPayload<K extends BlobGcJobName>(
   return blobGcJobSchemas[name].parse(payload) as BlobGcPayloadMap[K];
 }
 
+export function buildRenderThumbnailJobId(
+  workspaceId: string,
+  projectId: string,
+  cacheKey: string,
+): string {
+  // BullMQ v5 rejects custom jobIds containing ':'.
+  return `thumb__${workspaceId}__${projectId}__${cacheKey}`;
+}
+
 export class QueueService {
   readonly mediaIngest: Queue;
   readonly mediaGenerate: Queue;
@@ -136,7 +145,11 @@ export class QueueService {
     const defaultJobId =
       'jobId' in validated && typeof validated.jobId === 'string'
         ? validated.jobId
-        : `thumb:${validated.workspaceId}:${validated.projectId}:${(validated as RenderExportPayloadMap['render_thumbnail']).cacheKey}`;
+        : buildRenderThumbnailJobId(
+            validated.workspaceId,
+            validated.projectId,
+            (validated as RenderExportPayloadMap['render_thumbnail']).cacheKey,
+          );
     // Give export renders higher priority (1) than speculative composition thumbnails (5).
     const defaultPriority = name === 'export_render' ? 1 : 5;
     return this.renderExport.add(name, validated, {
