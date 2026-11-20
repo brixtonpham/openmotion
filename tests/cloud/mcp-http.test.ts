@@ -722,6 +722,30 @@ describe('3-Way Cloud openmotion_import_assets & Streamable HTTP Config Contract
           source: { kind: 'url', url: 'https://198.51.100.12/test.png' },
         },
         {
+          itemId: 'mode-b-ssrf-localhost-dot',
+          source: { kind: 'url', url: 'https://localhost./secret.png' },
+        },
+        {
+          itemId: 'mode-b-ssrf-sublocalhost-dot',
+          source: { kind: 'url', url: 'https://sub.localhost./secret.png' },
+        },
+        {
+          itemId: 'mode-b-ssrf-metadata-dot',
+          source: { kind: 'url', url: 'https://metadata.google.internal./computeMetadata/v1/' },
+        },
+        {
+          itemId: 'mode-b-ssrf-k8s-dot',
+          source: { kind: 'url', url: 'https://postgres.openmotion.svc.cluster.local./a.png' },
+        },
+        {
+          itemId: 'mode-b-ssrf-local-dot',
+          source: { kind: 'url', url: 'https://service.local./a.png' },
+        },
+        {
+          itemId: 'mode-b-ssrf-single-label-dot',
+          source: { kind: 'url', url: 'https://redis./a.png' },
+        },
+        {
           itemId: 'mode-c',
           source: { kind: 'library_asset', assetId, versionId },
           name: 'Library Clip',
@@ -736,6 +760,12 @@ describe('3-Way Cloud openmotion_import_assets & Streamable HTTP Config Contract
     assert.equal(byId.get('mode-b-ssrf-imds')?.error?.code, 'SSRF_BLOCKED');
     assert.equal(byId.get('mode-b-ssrf-dns')?.error?.code, 'SSRF_BLOCKED');
     assert.equal(byId.get('mode-b-ssrf-testnet')?.error?.code, 'SSRF_BLOCKED');
+    assert.equal(byId.get('mode-b-ssrf-localhost-dot')?.error?.code, 'SSRF_BLOCKED');
+    assert.equal(byId.get('mode-b-ssrf-sublocalhost-dot')?.error?.code, 'SSRF_BLOCKED');
+    assert.equal(byId.get('mode-b-ssrf-metadata-dot')?.error?.code, 'SSRF_BLOCKED');
+    assert.equal(byId.get('mode-b-ssrf-k8s-dot')?.error?.code, 'SSRF_BLOCKED');
+    assert.equal(byId.get('mode-b-ssrf-local-dot')?.error?.code, 'SSRF_BLOCKED');
+    assert.equal(byId.get('mode-b-ssrf-single-label-dot')?.error?.code, 'SSRF_BLOCKED');
     assert.equal(byId.get('mode-c')?.status, 'imported');
     assert.equal(byId.get('mode-c')?.zeroCopy, true);
 
@@ -754,6 +784,12 @@ describe('3-Way Cloud openmotion_import_assets & Streamable HTTP Config Contract
         { itemId: 'mode-b-ssrf-imds', source: { kind: 'url', url: 'https://169.254.169.254/latest/meta-data/' } },
         { itemId: 'mode-b-ssrf-dns', source: { kind: 'url', url: 'https://private.example.test/secret.png' } },
         { itemId: 'mode-b-ssrf-testnet', source: { kind: 'url', url: 'https://198.51.100.12/test.png' } },
+        { itemId: 'mode-b-ssrf-localhost-dot', source: { kind: 'url', url: 'https://localhost./secret.png' } },
+        { itemId: 'mode-b-ssrf-sublocalhost-dot', source: { kind: 'url', url: 'https://sub.localhost./secret.png' } },
+        { itemId: 'mode-b-ssrf-metadata-dot', source: { kind: 'url', url: 'https://metadata.google.internal./computeMetadata/v1/' } },
+        { itemId: 'mode-b-ssrf-k8s-dot', source: { kind: 'url', url: 'https://postgres.openmotion.svc.cluster.local./a.png' } },
+        { itemId: 'mode-b-ssrf-local-dot', source: { kind: 'url', url: 'https://service.local./a.png' } },
+        { itemId: 'mode-b-ssrf-single-label-dot', source: { kind: 'url', url: 'https://redis./a.png' } },
         { itemId: 'mode-c', source: { kind: 'library_asset', assetId, versionId }, name: 'Library Clip' },
       ],
     });

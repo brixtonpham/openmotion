@@ -93,9 +93,27 @@ export async function validatePublicImportUrl(
   }
 
   const parsed = new URL(normalized);
-  const hostname = parsed.hostname.replace(/^\[|\]$/g, '');
-  if (isIP(hostname) && !isHardenedPublicAddress(hostname)) {
-    throw new CloudError('SSRF_BLOCKED', 'Import URL points to a private or reserved IP address', {
+  const rawHostname = parsed.hostname.replace(/^\[|\]$/g, '');
+  const hostname = rawHostname.replace(/\.+$/, '').toLowerCase();
+  if (!hostname) {
+    throw new CloudError('SSRF_BLOCKED', 'Import URL must include a valid public host', {
+      status: 400,
+      applied: false,
+    });
+  }
+  if (isIP(hostname)) {
+    if (!isHardenedPublicAddress(hostname)) {
+      throw new CloudError('SSRF_BLOCKED', 'Import URL points to a private or reserved IP address', {
+        status: 400,
+        applied: false,
+      });
+    }
+  } else if (
+    hostname === 'localhost' ||
+    /\.(?:localhost|local|internal|home\.arpa)$/.test(hostname) ||
+    !hostname.includes('.')
+  ) {
+    throw new CloudError('SSRF_BLOCKED', 'Import URL points to a local or internal hostname', {
       status: 400,
       applied: false,
     });

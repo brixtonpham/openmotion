@@ -111,7 +111,7 @@ export function isAllowedOAuthRedirectUri(raw: string): boolean {
   } catch {
     return false;
   }
-  if (parsed.hash) return false;
+  if (parsed.hash || parsed.username || parsed.password) return false;
   if (parsed.protocol === 'https:') return Boolean(parsed.hostname);
   if (parsed.protocol === 'http:') {
     return LOOPBACK_HOSTS.has(parsed.hostname.toLowerCase());
