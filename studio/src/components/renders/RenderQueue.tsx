@@ -21,11 +21,15 @@ import {
   getRenderFpsOptions,
   getPersistedRenderSettings,
   persistRenderSettings,
+  getBrowserExportEnabled,
+  setBrowserExportEnabled,
   resolveRenderFormat,
   startConfiguredRender,
   isRenderExportBlocked,
 } from "./renderSettings";
 import { GpuEncodingToggle } from "./GpuEncodingToggle";
+import { BrowserExportToggle } from "./BrowserExportToggle";
+import { isBrowserWebCodecsSupported } from "../../render/browserExportPreflight";
 import { GifLoopInput, isInvalidGifLoop } from "./GifLoopInput";
 import { trackStudioEvent } from "../../utils/studioTelemetry";
 import { clickMethod, trackStudioClick } from "../../motion/editorTracking";
@@ -43,6 +47,7 @@ export type StartRenderHandler = (
   fps: 24 | 30 | 60,
   gpu?: boolean,
   gifLoop?: number,
+  engine?: "server" | "browser",
 ) => void | Promise<void>;
 
 export interface RenderQueueProps {
@@ -218,6 +223,10 @@ function FormatExportButton({
   const [requestedFps, setFps] = useState<24 | 30 | 60>(persisted.fps);
   const fps = resolveRenderFps(format, requestedFps);
   const [gpu, setGpu] = useState(persisted.gpu);
+  const [browserExport, setBrowserExport] = useState(getBrowserExportEnabled);
+  const webCodecsSupported = isBrowserWebCodecsSupported();
+  const usingBrowserExport =
+    browserExport && webCodecsSupported && (format === "mp4" || format === "webm");
   const [gifLoop, setGifLoop] = useState("0");
   const loopCount = mvp ? 0 : Number(gifLoop);
   const invalidGifLoop = !mvp && isInvalidGifLoop(format, gifLoop);
@@ -226,7 +235,7 @@ function FormatExportButton({
   // probe gave no answer, and refusing to export on no answer would break
   // setups that are perfectly fine. Holding the narrowed value rather than a
   // boolean keeps the notice from re-testing what this line already decided.
-  const missingFfmpeg = ffmpeg && !ffmpeg.ok ? ffmpeg : null;
+  const missingFfmpeg = !usingBrowserExport && ffmpeg && !ffmpeg.ok ? ffmpeg : null;
   const exportBlocked = emptyComposition || isRenderExportBlocked(isRendering, missingFfmpeg !== null, invalidGifLoop);
 
   // MOV (ProRes) is a fixed-quality codec — quality selector has no effect.
@@ -325,6 +334,16 @@ function FormatExportButton({
           }}
         />
       )}
+      <BrowserExportToggle
+        format={format}
+        checked={browserExport}
+        disabled={isRendering}
+        supported={webCodecsSupported}
+        onToggle={(next) => {
+          setBrowserExport(next);
+          setBrowserExportEnabled(next);
+        }}
+      />
       </details>
       <Button
         variant="primary"
@@ -347,6 +366,7 @@ function FormatExportButton({
             fps,
             gpu: mvp ? false : gpu,
             gifLoop: loopCount,
+            engine: usingBrowserExport ? "browser" : undefined,
           });
         }}
         // Width only. A type size or a weight here would win the merge against
