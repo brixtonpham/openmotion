@@ -462,6 +462,25 @@ function isSnapdomHtmlLayer(el: TimelineElement): boolean {
   return !["video", "audio"].includes(el.tag) && !["video", "audio"].includes(el.kind ?? "");
 }
 
+function shouldUseLiveHtmlCapture(
+  visible: ReadonlyArray<{ el: TimelineElement }>,
+  previewDoc: Document | null,
+): boolean {
+  return visible.some(({ el }) => {
+    if (
+      el.compositionSrc ||
+      el.tag === "hf-composition" ||
+      el.tag === "canvas" ||
+      el.tag === "svg" ||
+      (isSnapdomHtmlLayer(el) && el.start > 0 && !el.src)
+    ) {
+      return true;
+    }
+    const domEl = previewDoc ? findDomElement(previewDoc, el) : null;
+    return Boolean(domEl?.querySelector("canvas, svg, [data-composition-id]"));
+  });
+}
+
 export async function runBrowserExport(options: BrowserExportOptions): Promise<BrowserExportResult> {
   const {
     projectId,
@@ -514,13 +533,7 @@ export async function runBrowserExport(options: BrowserExportOptions): Promise<B
     previewDoc = null;
   }
   const hasHtmlElements = visible.some(({ el }) => isSnapdomHtmlLayer(el));
-  const initialRequiresLiveSeek = visible.some(({ el }) => {
-    if (el.compositionSrc || el.tag === "hf-composition" || el.tag === "canvas" || el.tag === "svg") {
-      return true;
-    }
-    const domEl = previewDoc ? findDomElement(previewDoc, el) : null;
-    return Boolean(domEl?.querySelector("canvas, svg, [data-composition-id]"));
-  });
+  const initialRequiresLiveSeek = shouldUseLiveHtmlCapture(visible, previewDoc);
   const initialResolvedMode: BrowserHtmlCaptureMode =
     htmlCaptureMode ?? (initialRequiresLiveSeek ? "snapdom-live" : "snapdom-cached");
 
@@ -571,13 +584,7 @@ export async function runBrowserExport(options: BrowserExportOptions): Promise<B
     ({ width, height } = resolveBrowserExportDimensions(resolution, effectiveCompDimensions));
     const bitrate = resolveBrowserExportBitrate(quality, width, height, fps);
 
-    const requiresLiveSeek = visible.some(({ el }) => {
-      if (el.compositionSrc || el.tag === "hf-composition" || el.tag === "canvas" || el.tag === "svg") {
-        return true;
-      }
-      const domEl = previewDoc ? findDomElement(previewDoc, el) : null;
-      return Boolean(domEl?.querySelector("canvas, svg, [data-composition-id]"));
-    });
+    const requiresLiveSeek = shouldUseLiveHtmlCapture(visible, previewDoc);
     const resolvedHtmlMode: BrowserHtmlCaptureMode =
       htmlCaptureMode ?? (requiresLiveSeek ? "snapdom-live" : "snapdom-cached");
     const snapdomFn =

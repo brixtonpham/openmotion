@@ -822,4 +822,103 @@ describe("cloud preview adaptation", () => {
       resolveIsolatablePreviewUrl(crossOriginThrowing, "proj-1", "https://studio.example.com"),
     ).toBe("/api/projects/proj-1/preview?original=1");
   });
+
+  it("auto-selects snapdom-live for delayed HTML elements (start > 0) even without explicit mode", async () => {
+    const snapdomCalls = vi.fn(async () => ({
+      toCanvas: async () => ({ width: 400, height: 120 }),
+    }));
+    vi.doMock("@zumer/snapdom", () => ({ snapdom: snapdomCalls }));
+    vi.doMock("mediabunny", () => ({
+      ALL_FORMATS: [],
+      Mp4OutputFormat: class {
+        getSupportedVideoCodecs = () => ["avc"];
+        getSupportedAudioCodecs = () => ["aac"];
+      },
+      WebMOutputFormat: class {
+        getSupportedVideoCodecs = () => ["vp9"];
+        getSupportedAudioCodecs = () => ["opus"];
+      },
+      BufferTarget: class {
+        buffer = new Uint8Array([0, 0, 0, 24, 102, 116, 121, 112]).buffer;
+      },
+      Output: class {
+        state = "started";
+        addVideoTrack = vi.fn();
+        addAudioTrack = vi.fn();
+        start = vi.fn(async () => {});
+        getMimeType = vi.fn(async () => "video/mp4");
+        finalize = vi.fn(async () => {});
+        cancel = vi.fn(async () => {});
+      },
+      CanvasSource: class {
+        add = vi.fn(async () => {});
+        close = vi.fn();
+      },
+      AudioBufferSource: class {
+        add = vi.fn(async () => {});
+        close = vi.fn();
+      },
+      Input: class {
+        getPrimaryVideoTrack = vi.fn(async () => null);
+        dispose = vi.fn();
+      },
+      UrlSource: class {},
+      CanvasSink: class {},
+      getFirstEncodableVideoCodec: vi.fn(async () => "avc"),
+      getFirstEncodableAudioCodec: vi.fn(async () => "aac"),
+    }));
+    const mockCtx = {
+      fillStyle: "",
+      font: "",
+      textAlign: "left",
+      textBaseline: "top",
+      globalAlpha: 1,
+      fillRect: vi.fn(),
+      fillText: vi.fn(),
+      drawImage: vi.fn(),
+      save: vi.fn(),
+      restore: vi.fn(),
+      translate: vi.fn(),
+      rotate: vi.fn(),
+      scale: vi.fn(),
+      beginPath: vi.fn(),
+      rect: vi.fn(),
+      clip: vi.fn(),
+      fill: vi.fn(),
+    };
+    vi.stubGlobal(
+      "OffscreenCanvas",
+      class {
+        width: number;
+        height: number;
+        constructor(w: number, h: number) {
+          this.width = w;
+          this.height = h;
+        }
+        getContext = () => mockCtx;
+      },
+    );
+    vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:mock-auto-live");
+
+    const iframe = document.createElement("iframe");
+    document.body.appendChild(iframe);
+    const doc = iframe.contentDocument!;
+    doc.body.innerHTML = `<div data-composition-id="root"><div data-hf-id="delayed-pill">Delayed</div></div>`;
+
+    const { runBrowserExport: runAuto } = await import("./browserExport");
+    const result = await runAuto({
+      projectId: "proj-1",
+      format: "mp4",
+      quality: "standard",
+      fps: 10,
+      compositionDimensions: { width: 1280, height: 720 },
+      duration: 0.4,
+      elements: [makeElement({ id: "d1", hfId: "delayed-pill", tag: "div", start: 0.2, duration: 0.2 })],
+      keyframeCache: new Map(),
+      iframe,
+      isolateIframe: false,
+    });
+    expect(result.stats?.htmlMode).toBe("snapdom-live");
+    iframe.remove();
+  });
 });
