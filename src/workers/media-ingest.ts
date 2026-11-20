@@ -14,20 +14,21 @@ import {
   loudnessMeasureArgs,
   parseEbur128Summary,
 } from '@hyperframes/studio-server/loudness';
-import { and, eq } from 'drizzle-orm';
+import { and, eq, gt, sql } from 'drizzle-orm';
 import sharp from 'sharp';
 import { resolveBrandAddresses } from '../../gateway/brand-network.ts';
 import { execute, pluginRoot } from '../../hyperframes.ts';
 import { verificationBinaries } from '../../scripts/verify-export.ts';
 import { MAX_ASSET_BYTES } from '../../shared/asset-limits.ts';
 import type { AssetReadResult } from '../../shared/asset-library.ts';
-import { isTextProjectPath, projectPath } from '../../shared/project-validation.ts';
+import { computeProjectRevision, isTextProjectPath, projectPath } from '../../shared/project-validation.ts';
 import { CloudError, isCloudError } from '../contracts/errors.ts';
 import type { JobProgressEvent, ProjectEvent } from '../contracts/events.ts';
 import type { MediaIngestJobName, MediaIngestPayloadMap } from '../contracts/jobs.ts';
 import type { BlobMetadata, StoragePort } from '../contracts/storage.ts';
 import {
   applyWorkspaceBlobRefDeltas,
+  normalizeBlobRefDeltas,
   updateWorkspaceBlobMetadata,
   type BlobRefDelta,
 } from '../db/cas.ts';
@@ -40,7 +41,12 @@ import {
   type AssetModality,
 } from '../db/schema/blobs-assets.ts';
 import { jobs } from '../db/schema/jobs.ts';
-import { projectFiles } from '../db/schema/project-files.ts';
+import {
+  projectFiles,
+  projectHistoryEntries,
+  projectVersionFiles,
+  projectVersions,
+} from '../db/schema/project-files.ts';
 import { projects } from '../db/schema/projects.ts';
 import type { Logger } from '../infra/logger.ts';
 import { jobChannel, projectChannel, type RedisEventBus } from '../infra/redis.ts';
@@ -691,6 +697,9 @@ async function promoteFileToLibraryOrProject(
   thumbnailKey?: string;
   projectPath?: string;
   licenseProjectPath?: string;
+  projectRevision?: string;
+  projectVersionId?: string;
+  projectVersionNumber?: number;
 }> {
   if (params.purpose === 'project_archive') {
     throw new CloudError(
@@ -814,13 +823,21 @@ async function promoteFileToLibraryOrProject(
       let createdVersionId: string | undefined;
       let committedProjectPath: string | undefined;
       let committedLicensePath: string | undefined;
+      let committedProjectRevision: string | undefined;
+      let committedProjectVersionId: string | undefined;
+      let committedProjectVersionNumber: number | undefined;
       const now = new Date();
 
       if (params.purpose === 'project_asset' && params.targetProjectId && params.targetPath) {
         // Lock parent project row FOR UPDATE so concurrent overwrites to the same path
-        // serialize and cannot double-decrement workspace_blobs.ref_count.
+        // serialize, revision/version snapshots stay linear, and workspace_blobs.ref_count stays exact.
         const lockedProject = await tx
-          .select({ id: projects.id, trashed: projects.trashed })
+          .select({
+            id: projects.id,
+            trashed: projects.trashed,
+            currentVersionNumber: projects.currentVersionNumber,
+            currentHistorySeq: projects.currentHistorySeq,
+          })
           .from(projects)
           .where(and(eq(projects.id, params.targetProjectId), eq(projects.workspaceId, params.workspaceId)))
           .for('update')
@@ -833,20 +850,19 @@ async function promoteFileToLibraryOrProject(
         }
 
         committedProjectPath = projectPath(params.targetPath);
-        const existingFile = await tx
+        const existingFiles = await tx
           .select()
           .from(projectFiles)
           .where(
             and(
               eq(projectFiles.workspaceId, params.workspaceId),
               eq(projectFiles.projectId, params.targetProjectId),
-              eq(projectFiles.path, committedProjectPath),
             ),
-          )
-          .limit(1);
+          );
 
-        if (existingFile.length > 0 && existingFile[0].blobScope === 'workspace') {
-          deltas.push({ sha256: existingFile[0].sha256, delta: -1 });
+        const existingFile = existingFiles.find((f) => f.path === committedProjectPath);
+        if (existingFile && existingFile.blobScope === 'workspace') {
+          deltas.push({ sha256: existingFile.sha256.trim(), delta: -1 });
         }
 
         let licenseTargetPath: string | null = null;
@@ -855,19 +871,9 @@ async function promoteFileToLibraryOrProject(
             path.posix.join(path.posix.dirname(committedProjectPath), params.licenseFilename),
           );
           committedLicensePath = licenseTargetPath;
-          const existingLicense = await tx
-            .select()
-            .from(projectFiles)
-            .where(
-              and(
-                eq(projectFiles.workspaceId, params.workspaceId),
-                eq(projectFiles.projectId, params.targetProjectId),
-                eq(projectFiles.path, licenseTargetPath),
-              ),
-            )
-            .limit(1);
-          if (existingLicense.length > 0 && existingLicense[0].blobScope === 'workspace') {
-            deltas.push({ sha256: existingLicense[0].sha256, delta: -1 });
+          const existingLicense = existingFiles.find((f) => f.path === licenseTargetPath);
+          if (existingLicense && existingLicense.blobScope === 'workspace') {
+            deltas.push({ sha256: existingLicense.sha256.trim(), delta: -1 });
           }
           deltas.push({
             sha256: licenseSha256,
@@ -878,7 +884,61 @@ async function promoteFileToLibraryOrProject(
           });
         }
 
-        await applyDeltas(tx, params.workspaceId, deltas);
+        const nextByPath = new Map<
+          string,
+          {
+            path: string;
+            blobScope: 'workspace' | 'catalog';
+            sha256: string;
+            sizeBytes: number;
+            mimeType: string;
+            isText: boolean;
+          }
+        >();
+        for (const file of existingFiles) {
+          nextByPath.set(file.path, {
+            path: file.path,
+            blobScope: file.blobScope,
+            sha256: file.sha256.trim(),
+            sizeBytes: Number(file.sizeBytes),
+            mimeType: file.mimeType,
+            isText: file.isText,
+          });
+        }
+        nextByPath.set(committedProjectPath, {
+          path: committedProjectPath,
+          blobScope: 'workspace',
+          sha256,
+          sizeBytes,
+          mimeType,
+          isText: isTextProjectPath(committedProjectPath),
+        });
+        if (licenseTargetPath && licenseSha256 && params.licenseBuffer) {
+          nextByPath.set(licenseTargetPath, {
+            path: licenseTargetPath,
+            blobScope: 'workspace',
+            sha256: licenseSha256,
+            sizeBytes: params.licenseBuffer.byteLength,
+            mimeType: 'text/plain; charset=utf-8',
+            isText: true,
+          });
+        }
+        const nextFiles = [...nextByPath.values()];
+
+        // Account for the immutable project_version_files snapshot (+1 per workspace-scoped file).
+        for (const file of nextFiles) {
+          if (file.blobScope === 'workspace') {
+            deltas.push({
+              sha256: file.sha256,
+              delta: 1,
+              sizeBytes: file.sizeBytes,
+              mimeType: file.mimeType,
+              s3Key: workspaceBlobKey(params.workspaceId, file.sha256),
+            });
+          }
+        }
+
+        await applyDeltas(tx, params.workspaceId, normalizeBlobRefDeltas(deltas));
 
         if (licenseTargetPath && licenseSha256 && params.licenseBuffer) {
           await tx
@@ -935,6 +995,138 @@ async function promoteFileToLibraryOrProject(
               updatedAt: now,
             }),
           });
+
+        const nextRevision = computeProjectRevision(
+          nextFiles.map((file) => ({
+            path: file.path,
+            size: file.sizeBytes,
+            hash: file.sha256,
+          })),
+        );
+
+        const maxVerRow = await tx
+          .select({ maxVer: sql<number>`COALESCE(MAX(${projectVersions.versionNumber}), 0)` })
+          .from(projectVersions)
+          .where(
+            and(
+              eq(projectVersions.workspaceId, params.workspaceId),
+              eq(projectVersions.projectId, params.targetProjectId),
+            ),
+          );
+        const currentVersionNumber = Number(lockedProject[0].currentVersionNumber ?? 0);
+        const nextVersionNumber = Math.max(currentVersionNumber, Number(maxVerRow[0]?.maxVer ?? 0)) + 1;
+
+        const maxSeqRow = await tx
+          .select({ maxSeq: sql<number>`COALESCE(MAX(${projectHistoryEntries.seq}), 0)` })
+          .from(projectHistoryEntries)
+          .where(
+            and(
+              eq(projectHistoryEntries.workspaceId, params.workspaceId),
+              eq(projectHistoryEntries.projectId, params.targetProjectId),
+            ),
+          );
+        const currentHistorySeq = Number(lockedProject[0].currentHistorySeq ?? 0);
+        const nextHistorySeq = Math.max(currentHistorySeq, Number(maxSeqRow[0]?.maxSeq ?? 0)) + 1;
+
+        const parentRows =
+          currentHistorySeq > 0
+            ? await tx
+                .select({ id: projectHistoryEntries.id })
+                .from(projectHistoryEntries)
+                .where(
+                  and(
+                    eq(projectHistoryEntries.workspaceId, params.workspaceId),
+                    eq(projectHistoryEntries.projectId, params.targetProjectId),
+                    eq(projectHistoryEntries.seq, currentHistorySeq),
+                  ),
+                )
+                .limit(1)
+            : [];
+        const parentEntryId = parentRows[0]?.id ?? null;
+
+        const summary = `Import asset ${params.name || path.posix.basename(committedProjectPath)}`.slice(0, 256);
+        const versionRequestId = params.requestId
+          ? `${params.requestId}:${params.jobId}`.slice(0, 128)
+          : null;
+        const projectVersionId = randomUUID();
+
+        await tx.insert(projectVersions).values(
+          asInsert(projectVersions, {
+            id: projectVersionId,
+            workspaceId: params.workspaceId,
+            projectId: params.targetProjectId,
+            versionNumber: nextVersionNumber,
+            revision: nextRevision,
+            source: 'agent',
+            summary,
+            requestId: versionRequestId,
+            pinned: false,
+            createdAt: now,
+          }),
+        );
+
+        const snapshotValues = nextFiles.map((file) =>
+          asInsert(projectVersionFiles, {
+            versionId: projectVersionId,
+            workspaceId: params.workspaceId,
+            projectId: params.targetProjectId!,
+            path: file.path,
+            blobScope: file.blobScope,
+            sha256: file.sha256,
+            sizeBytes: file.sizeBytes,
+            mimeType: file.mimeType,
+          }),
+        );
+        if (snapshotValues.length > 0) {
+          await tx.insert(projectVersionFiles).values(snapshotValues);
+        }
+
+        await tx
+          .delete(projectHistoryEntries)
+          .where(
+            and(
+              eq(projectHistoryEntries.workspaceId, params.workspaceId),
+              eq(projectHistoryEntries.projectId, params.targetProjectId),
+              eq(projectHistoryEntries.undone, true),
+              gt(projectHistoryEntries.seq, currentHistorySeq),
+            ),
+          );
+
+        await tx.insert(projectHistoryEntries).values(
+          asInsert(projectHistoryEntries, {
+            id: randomUUID(),
+            workspaceId: params.workspaceId,
+            projectId: params.targetProjectId,
+            seq: nextHistorySeq,
+            versionId: projectVersionId,
+            parentEntryId,
+            actorKind: 'agent',
+            actorName: 'media-ingest',
+            label: summary,
+            windowId: null,
+            pinned: false,
+            undone: false,
+            startedAt: now,
+            endedAt: now,
+          }),
+        );
+
+        await tx
+          .update(projects)
+          .set(
+            asUpdate(projects, {
+              revision: nextRevision,
+              currentVersionId: projectVersionId,
+              currentVersionNumber: nextVersionNumber,
+              currentHistorySeq: nextHistorySeq,
+              updatedAt: now,
+            }),
+          )
+          .where(and(eq(projects.id, params.targetProjectId), eq(projects.workspaceId, params.workspaceId)));
+
+        committedProjectRevision = nextRevision;
+        committedProjectVersionId = projectVersionId;
+        committedProjectVersionNumber = nextVersionNumber;
       } else {
         // Library asset creation or new version append (requires probed media info).
         if (!probed) {
@@ -942,7 +1134,7 @@ async function promoteFileToLibraryOrProject(
             status: 400,
           });
         }
-        await applyDeltas(tx, params.workspaceId, deltas);
+        await applyDeltas(tx, params.workspaceId, normalizeBlobRefDeltas(deltas));
 
         let assetId = params.targetAssetId;
         if (assetId) {
@@ -1039,6 +1231,11 @@ async function promoteFileToLibraryOrProject(
         ...(uploadedThumbKey ? { thumbnailKey: uploadedThumbKey } : {}),
         ...(committedProjectPath ? { projectPath: committedProjectPath } : {}),
         ...(committedLicensePath ? { licenseProjectPath: committedLicensePath } : {}),
+        ...(committedProjectRevision ? { projectRevision: committedProjectRevision } : {}),
+        ...(committedProjectVersionId ? { projectVersionId: committedProjectVersionId } : {}),
+        ...(committedProjectVersionNumber !== undefined
+          ? { projectVersionNumber: committedProjectVersionNumber }
+          : {}),
       };
 
       if (params.uploadId) {
@@ -1078,6 +1275,9 @@ async function promoteFileToLibraryOrProject(
         versionId: createdVersionId,
         projectPath: committedProjectPath,
         licenseProjectPath: committedLicensePath,
+        projectRevision: committedProjectRevision,
+        projectVersionId: committedProjectVersionId,
+        projectVersionNumber: committedProjectVersionNumber,
         resultPayload,
       };
     }),
@@ -1104,7 +1304,7 @@ async function promoteFileToLibraryOrProject(
       type: 'file-change',
       workspaceId: params.workspaceId,
       projectId: params.targetProjectId,
-      revision: sha256,
+      revision: committed.projectRevision ?? sha256,
       paths: changedPaths,
       affectsPreview: true,
       ts: Date.now(),
@@ -1123,6 +1323,9 @@ async function promoteFileToLibraryOrProject(
     thumbnailKey: uploadedThumbKey,
     projectPath: committed.projectPath,
     licenseProjectPath: committed.licenseProjectPath,
+    projectRevision: committed.projectRevision,
+    projectVersionId: committed.projectVersionId,
+    projectVersionNumber: committed.projectVersionNumber,
   };
 }
 
@@ -1293,7 +1496,7 @@ export async function handleUrlFetchJob(
       .where(and(eq(jobs.id, payload.jobId), eq(jobs.workspaceId, payload.workspaceId)));
 
     const fetchedPath = path.join(workDir, 'fetched.bin');
-    await fetchToFile(validatedUrl, fetchedPath, {
+    const fetched = await fetchToFile(validatedUrl, fetchedPath, {
       maxBytes: MAX_ASSET_BYTES,
       maxRedirects: DEFAULT_MAX_REDIRECTS,
       idleTimeoutMs: DEFAULT_FETCH_IDLE_TIMEOUT_MS,
@@ -1301,14 +1504,22 @@ export async function handleUrlFetchJob(
       allowDohFakeIpFallback: deps.allowDohFakeIpFallback ?? false,
     });
 
+    if (payload.expectedSha256 && fetched.sha256 !== payload.expectedSha256) {
+      throw new CloudError('INVALID_ARGUMENT', 'Downloaded object SHA-256 does not match expectedSha256', {
+        status: 400,
+      });
+    }
+
+    const isProjectAsset = Boolean(payload.targetProjectId && payload.targetPath);
     return await promoteFileToLibraryOrProject(deps, {
       jobId: payload.jobId,
       workspaceId: payload.workspaceId,
       filePath: fetchedPath,
       name: payload.name,
-      purpose: 'library_asset',
+      purpose: isProjectAsset ? 'project_asset' : 'library_asset',
       targetAssetId: payload.targetAssetId,
       targetProjectId: payload.targetProjectId,
+      targetPath: isProjectAsset ? payload.targetPath : undefined,
       parentVersionId: payload.parentVersionId,
       requestId: payload.requestId,
       expectedModality: payload.expectedModality,
