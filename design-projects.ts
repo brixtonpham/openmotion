@@ -12,11 +12,31 @@ import http, { type IncomingMessage, type ServerResponse } from 'node:http';
 import path from 'node:path';
 import { constants } from 'node:fs';
 import { promisify } from 'node:util';
-import { atomicJson, jsonFile } from './phase1-versions.ts';
-import { withProcessLock } from './shared/process-lock.ts';
 import { readProjectZip } from './shared/project-zip.ts';
 import { zip } from './scripts/zip.mjs';
-import { browserExecutable } from './browser.ts';
+import { browserExecutable } from './shared/browser-executable.ts';
+
+async function jsonFile<T>(filename: string, fallback: T): Promise<T> {
+  try { return JSON.parse(await readFile(filename, 'utf8')) as T; }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return fallback; throw error; }
+}
+async function atomicJson(filename: string, value: unknown): Promise<void> {
+  await mkdir(path.dirname(filename), { recursive: true, mode: 0o700 });
+  const temp = `${filename}.${randomUUID()}.tmp`;
+  try { await writeFile(temp, JSON.stringify(value, null, 2), { mode: 0o600, flag: 'wx' }); await rename(temp, filename); }
+  finally { await rm(temp, { force: true }); }
+}
+const designLocks = new Map<string, Promise<unknown>>();
+async function withProcessLock<T>(lockPath: string, task: () => Promise<T>): Promise<T> {
+  const prev = designLocks.get(lockPath) ?? Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const next = prev.then(() => gate);
+  designLocks.set(lockPath, next);
+  await prev;
+  try { return await task(); }
+  finally { release(); if (designLocks.get(lockPath) === next) designLocks.delete(lockPath); }
+}
 import { validateReviewAnnotation } from './shared/review-comments.ts';
 import { designCatalog } from './shared/design-catalog.ts';
 import {

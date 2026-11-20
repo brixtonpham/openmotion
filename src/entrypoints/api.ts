@@ -1,0 +1,2329 @@
+import { createHash, randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
+import { createRequire } from 'node:module';
+import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { HeadBucketCommand } from '@aws-sdk/client-s3';
+import { serve, type ServerType } from '@hono/node-server';
+import { and, desc, eq, inArray, sql } from 'drizzle-orm';
+import { Hono, type Context } from 'hono';
+import type { ContentfulStatusCode } from 'hono/utils/http-status';
+import type { Redis } from 'ioredis';
+import {
+  catalogEntry,
+  catalogPoster,
+  catalogShowcase,
+  catalogStyleCover,
+  readBrandCatalog,
+} from '../../gateway/brand-catalog.ts';
+import { publicDesignFiles, resolveDesignSystemFile } from '../../packages/design-system/index.js';
+import { compositionCanvasSource, type CanvasFit, type CanvasRatio } from '../../shared/composition-canvas.ts';
+import {
+  agentGuide,
+  buildCloudIntegrationInfo,
+  integrationConfig,
+  integrationHost,
+} from '../../shared/integration.ts';
+import { loadLibrarySkills, skillNextStep } from '../../shared/library-skill-catalog.ts';
+import { phase1McpCapabilities, phase1Tools } from '../../shared/phase1-tools.ts';
+import { isUuid, validateStableRequestId } from '../../shared/project-validation.ts';
+import { loadCaptionSourceOperations } from '../../shared/transcript-captions.ts';
+import { VERSION } from '../../shared/version.ts';
+import {
+  providerSettingsPreview,
+  sessionPath,
+  templateLibraryPreview,
+} from '../../shared/workspace-url.ts';
+import {
+  InMemoryAuthCache,
+  OidcService,
+  buildOAuth21Config,
+  createAuthMiddleware,
+  createAuthRoutes,
+  createDevTenantProvisioner,
+  createPgAuthStore,
+  createRedisAuthCache,
+  getAuthContext,
+  oidcConfigFromAppConfig,
+  type AuthEnv,
+  type AuthKeyValueCache,
+  type AuthMiddlewareDeps,
+  type AuthStore,
+} from '../auth/index.ts';
+import type { AuthContext } from '../contracts/auth.ts';
+import { CloudError, featureDeferredP2, isCloudError } from '../contracts/errors.ts';
+import type { StoragePort } from '../contracts/storage.ts';
+import { createDbHandle, type Database, type DbHandle } from '../db/client.ts';
+import { asInsert, asUpdate } from '../db/helpers.ts';
+import { jobs } from '../db/schema/jobs.ts';
+import { getConfig, type AppConfig } from '../infra/config.ts';
+import { createLogger, type Logger } from '../infra/logger.ts';
+import { QueueService } from '../infra/queues.ts';
+import {
+  HotTextCache,
+  RateLimiter,
+  RedisEventBus,
+  cancelChannel,
+  createRedisClient,
+} from '../infra/redis.ts';
+import { ShutdownCoordinator } from '../infra/shutdown.ts';
+import { StorageService } from '../infra/storage.ts';
+import {
+  CloudImportAssetsService,
+  InMemoryMcpSessionStore,
+  McpToolDispatcher,
+  RedisMcpSessionStore,
+  createMcpHttpRoutes,
+  createPgImportAssetsStore,
+  type McpDomainPorts,
+  type McpEventBusPort,
+  type McpSessionStore,
+} from '../mcp/index.ts';
+import { createAccountRoutes } from '../routes/account.ts';
+import { createArchivesRouter } from '../routes/archives.ts';
+import { createAssetRoutes } from '../routes/assets.ts';
+import { createCatalogRoutes } from '../routes/catalog.ts';
+import { createExportRoutes } from '../routes/exports.ts';
+import { createModelRoutes, type MediaJobPort } from '../routes/models.ts';
+import { createProjectsRouter } from '../routes/projects.ts';
+import { createSessionsRouter } from '../routes/sessions.ts';
+import { AssetLibraryService } from '../services/asset-library-service.ts';
+import { AssetNamesService } from '../services/asset-names-service.ts';
+import { CatalogService } from '../services/catalog-service.ts';
+import { ExportService } from '../services/export-service.ts';
+import { createPlatformModelGateway, type PlatformModelGateway } from '../services/model-gateway.ts';
+import { ProjectArchiveService } from '../services/project-archive-service.ts';
+import {
+  ProjectFilesService,
+  type HotTextCachePort,
+  type ProjectFileOp,
+} from '../services/project-files-service.ts';
+import { VersionHistoryService } from '../services/version-history-service.ts';
+import { WelcomeBootstrapService } from '../services/welcome-bootstrap.ts';
+import { WorkRoundsService } from '../services/work-rounds-service.ts';
+import { WorkspaceService } from '../services/workspace-service.ts';
+import {
+  createDisklessStudioApp,
+  type StudioEventBusPort,
+  type StudioQueuesPort,
+} from '../studio/index.ts';
+
+const DEFAULT_RUNTIME_ROOT = fileURLToPath(new URL('../../', import.meta.url));
+const MAX_ACTIVE_MEDIA_GENERATIONS = 20;
+const WELCOME_CACHE_LIMIT = 10_000;
+
+const STATIC_MIME_TYPES: Readonly<Record<string, string>> = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.map': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+  '.gif': 'image/gif',
+  '.ico': 'image/x-icon',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+  '.ttf': 'font/ttf',
+  '.otf': 'font/otf',
+  '.mp4': 'video/mp4',
+  '.webm': 'video/webm',
+  '.m4a': 'audio/mp4',
+  '.txt': 'text/plain; charset=utf-8',
+  '.md': 'text/markdown; charset=utf-8',
+};
+
+const ACTIVE_JOB_STATES = ['queued', 'running', 'cancelling'] as const;
+
+export type ApiQueuesPort = StudioQueuesPort &
+  Pick<QueueService, 'enqueueMediaIngest' | 'enqueueMediaGenerate' | 'enqueueRenderExport' | 'renderExport'>;
+
+export type ApiEventBusPort = StudioEventBusPort &
+  McpEventBusPort & {
+    checkHealth?: () => Promise<boolean>;
+  };
+
+export interface CreateApiAppDeps {
+  readonly config: AppConfig;
+  readonly db: Database;
+  readonly storage: StoragePort;
+  readonly queues: ApiQueuesPort;
+  readonly eventBus: ApiEventBusPort;
+  readonly hotTextCache?: HotTextCachePort;
+  readonly rateLimiter?: RateLimiter;
+  readonly authStore?: AuthStore;
+  readonly authCache?: AuthKeyValueCache;
+  readonly oidc?: OidcService;
+  readonly gateway?: PlatformModelGateway;
+  readonly mcpSessionStore?: McpSessionStore;
+  readonly welcomeBootstrap?: WelcomeBootstrapService;
+  readonly disableWelcomeBootstrap?: boolean;
+  readonly requireBearerOnDevMcp?: boolean;
+  readonly logger?: Logger;
+  readonly runtimeRoot?: string;
+  readonly fontsDir?: string;
+  readonly checkDbHealth?: () => Promise<boolean>;
+  readonly checkRedisHealth?: () => Promise<boolean>;
+  readonly checkStorageHealth?: () => Promise<boolean>;
+}
+
+export interface ApiAppServices {
+  readonly authStore: AuthStore;
+  readonly gateway: PlatformModelGateway;
+  readonly catalog: CatalogService;
+  readonly welcomeBootstrap: WelcomeBootstrapService;
+  readonly files: ProjectFilesService;
+  readonly history: VersionHistoryService;
+  readonly workspace: WorkspaceService;
+  readonly assetNames: AssetNamesService;
+  readonly workRounds: WorkRoundsService;
+  readonly archives: ProjectArchiveService;
+  readonly assets: AssetLibraryService;
+  readonly exports: ExportService;
+  readonly importAssets: CloudImportAssetsService;
+  readonly mediaJobs: MediaJobPort;
+  readonly mcpDispatcher: McpToolDispatcher;
+}
+
+export interface ApiServerHandle {
+  readonly app: Hono<AuthEnv>;
+  readonly services: ApiAppServices;
+  readonly server: ServerType;
+  readonly shutdown: ShutdownCoordinator;
+  readonly port: number;
+  readonly host: string;
+  close(reason?: string): Promise<boolean>;
+}
+
+// ---------------------------------------------------------------------------
+// Read-Only Static Asset Helpers (Design System, Studio SPA, MCP UI, GSAP)
+// ---------------------------------------------------------------------------
+
+function resolveSafeSubpath(rootDir: string, relativePath: string): string | null {
+  const cleaned = relativePath.replace(/^\/+/, '');
+  if (!cleaned || cleaned.includes('\\') || /[\x00-\x1f]/.test(cleaned)) {
+    return null;
+  }
+  const parts = cleaned.split('/');
+  if (parts.some((p) => !p || p === '.' || p === '..')) {
+    return null;
+  }
+  const resolvedRoot = path.resolve(rootDir);
+  const resolvedTarget = path.resolve(resolvedRoot, cleaned);
+  if (resolvedTarget !== resolvedRoot && !resolvedTarget.startsWith(resolvedRoot + path.sep)) {
+    return null;
+  }
+  return resolvedTarget;
+}
+
+async function readStaticResponse(
+  filePath: string,
+  options: { cacheControl?: string; corsAll?: boolean; headOnly?: boolean } = {},
+): Promise<Response | null> {
+  const mimeType = STATIC_MIME_TYPES[path.extname(filePath).toLowerCase()];
+  if (!mimeType) return null;
+  try {
+    const bytes = await readFile(filePath);
+    const headers = new Headers({
+      'Content-Type': mimeType,
+      'Content-Length': String(bytes.byteLength),
+      'X-Content-Type-Options': 'nosniff',
+    });
+    if (options.cacheControl) headers.set('Cache-Control', options.cacheControl);
+    if (options.corsAll) headers.set('Access-Control-Allow-Origin', '*');
+    return new Response(options.headOnly ? null : new Uint8Array(bytes), {
+      status: 200,
+      headers,
+    });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+/**
+ * Pure read-only static handler for `/design-system/*`, `/web/design-system/*`,
+ * `/favicon.svg`, `/editor-assets/*`, `/guide-assets/*`, `/web/catalog/*`,
+ * `/web/inline-video.html`, `/mcp-ui/template-recommendations/*`, and `/api/vendor/gsap/*`.
+ */
+export async function serveStaticAsset(
+  pathname: string,
+  runtimeRoot = DEFAULT_RUNTIME_ROOT,
+  headOnly = false,
+): Promise<Response | null> {
+  // 1. Design system package assets (supports both `/design-system/*` and `/web/design-system/*`).
+  const designFile = resolveDesignSystemFile(pathname);
+  if (designFile) {
+    const target = resolveSafeSubpath(path.join(runtimeRoot, 'packages/design-system'), designFile);
+    if (!target) return null;
+    return readStaticResponse(target, {
+      corsAll: /\.(?:ttf|woff2?)$/i.test(designFile),
+      cacheControl: 'public, max-age=300',
+      headOnly,
+    });
+  }
+
+  // 2. Favicon
+  if (pathname === '/favicon.svg') {
+    return readStaticResponse(path.join(runtimeRoot, 'packages/design-system/brand/favicon.svg'), {
+      cacheControl: 'public, max-age=3600',
+      headOnly,
+    });
+  }
+
+  // 3. Built Studio assets
+  if (/^\/editor-assets\/[a-zA-Z0-9_.-]+$/.test(pathname) || /^\/guide-assets\/viewer\.(js|css)$/.test(pathname)) {
+    const target = resolveSafeSubpath(path.join(runtimeRoot, 'studio/build'), pathname);
+    if (!target) return null;
+    const response = await readStaticResponse(target, {
+      cacheControl: 'public, max-age=31536000, immutable',
+      headOnly,
+    });
+    if (response) return response;
+    return new Response('Studio bundle asset not found. Run npm run build:studio.', {
+      status: 503,
+      headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+    });
+  }
+
+  // 4. Web catalog static metadata & covers + inline-video player assets
+  if (
+    /^\/web\/catalog\/(?:hyperframes|template-frames|provenance|covers)\.json$/.test(pathname) ||
+    /^\/web\/catalog\/(?:template-frames|covers)\/[a-f0-9]{24}\.(?:jpg|webp)$/.test(pathname) ||
+    pathname === '/web/inline-video.html' ||
+    pathname === '/web/inline-video.css' ||
+    pathname === '/web/inline-video.js' ||
+    pathname === '/web/inline-video-notices.txt' ||
+    pathname === '/web/final-video-component.js'
+  ) {
+    const target = resolveSafeSubpath(runtimeRoot, pathname);
+    if (!target) return null;
+    return readStaticResponse(target, { cacheControl: 'public, max-age=300', headOnly });
+  }
+
+  // 5. MCP Apps template-recommendations bundle
+  if (pathname.startsWith('/mcp-ui/template-recommendations/')) {
+    const sub = pathname.slice('/mcp-ui/template-recommendations/'.length);
+    if (/^(?:build|assets|project-previews)\//.test(sub) || sub === 'inline.fragment.html') {
+      const target = resolveSafeSubpath(path.join(runtimeRoot, 'mcp-ui/template-recommendations'), sub);
+      if (!target) return null;
+      return readStaticResponse(target, { cacheControl: 'public, max-age=3600', headOnly });
+    }
+  }
+
+  return null;
+}
+
+async function readGsapFile(runtimeRoot: string, fileName = 'gsap.min.js'): Promise<Buffer | null> {
+  if (!/^[a-zA-Z0-9._-]+$/.test(fileName) || fileName.includes('..')) return null;
+  try {
+    const req = createRequire(path.resolve(runtimeRoot, 'package.json'));
+    const gsapRoot = path.dirname(req.resolve('gsap/package.json'));
+    const target = resolveSafeSubpath(path.join(gsapRoot, 'dist'), fileName);
+    if (!target) return null;
+    return await readFile(target);
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Media Generation Job Port (PG `jobs` + BullMQ `media-generate` + Cancel Bus)
+// ---------------------------------------------------------------------------
+
+function createCloudMediaJobsPort(deps: {
+  db: Database;
+  queues: Pick<QueueService, 'enqueueMediaGenerate'>;
+  eventBus: Pick<RedisEventBus, 'publish'>;
+  assets: AssetLibraryService;
+}): MediaJobPort & {
+  handleMediaAction(auth: AuthContext, args: Record<string, unknown>): Promise<Record<string, unknown>>;
+} {
+  const serializeJob = (row: typeof jobs.$inferSelect): Record<string, unknown> => {
+    const input = (row.inputPayload ?? {}) as Record<string, unknown>;
+    const result = (row.resultJson ?? {}) as Record<string, unknown>;
+    return {
+      id: row.id,
+      jobId: row.id,
+      workspaceId: row.workspaceId,
+      projectId: row.projectId ?? null,
+      kind: row.kind,
+      state: row.state,
+      stage: row.stage ?? row.state,
+      progress: Number(row.progress ?? 0),
+      provider: 'opendesign',
+      modality: input.modality ?? null,
+      mode: input.mode ?? null,
+      model: input.modelId ?? null,
+      prompt: input.prompt ?? null,
+      remoteId: row.remoteId ?? null,
+      savePending: row.savePending,
+      requestId: row.requestId ?? null,
+      ...(row.resultJson ? { result } : {}),
+      ...(typeof result.assetId === 'string' ? { assetId: result.assetId } : {}),
+      ...(typeof result.versionId === 'string' ? { versionId: result.versionId } : {}),
+      ...(row.errorCode ? { errorCode: row.errorCode } : {}),
+      ...(row.errorMessage ? { error: row.errorMessage } : {}),
+      createdAt: row.createdAt.toISOString(),
+      updatedAt: row.updatedAt.toISOString(),
+      ...(row.terminalAt ? { terminalAt: row.terminalAt.toISOString() } : {}),
+    };
+  };
+
+  const submitGeneration = async (
+    auth: AuthContext,
+    input: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> => {
+    const modality = input.modality;
+    if (modality !== 'image' && modality !== 'video' && modality !== 'audio') {
+      throw new CloudError('INVALID_ARGUMENT', 'modality must be image, video, or audio', {
+        status: 400,
+        applied: false,
+      });
+    }
+    const prompt = typeof input.prompt === 'string' ? input.prompt.trim() : '';
+    if (!prompt || prompt.length > 20_000) {
+      throw new CloudError('INVALID_ARGUMENT', 'prompt must contain 1-20000 characters', {
+        status: 400,
+        applied: false,
+      });
+    }
+    const rawModel = typeof input.model === 'string' ? input.model.trim() : typeof input.modelId === 'string' ? input.modelId.trim() : '';
+    if (!rawModel) {
+      throw new CloudError('INVALID_ARGUMENT', 'model is required', { status: 400, applied: false });
+    }
+    const modelId = rawModel.replace(/^opendesign:/, '');
+    const mode =
+      input.mode === 'text-to-image' ||
+      input.mode === 'text-to-video' ||
+      input.mode === 'text-to-audio' ||
+      input.mode === 'text-to-speech'
+        ? input.mode
+        : modality === 'image'
+          ? 'text-to-image'
+          : modality === 'video'
+            ? 'text-to-video'
+            : 'text-to-audio';
+
+    const requestId =
+      typeof input.requestId === 'string' && input.requestId.trim()
+        ? validateStableRequestId(input.requestId)
+        : randomUUID();
+    const projectId = typeof input.projectId === 'string' && isUuid(input.projectId) ? input.projectId : null;
+    const assetName =
+      typeof input.name === 'string' && input.name.trim()
+        ? input.name.trim().slice(0, 200)
+        : prompt.slice(0, 80);
+    const parameters =
+      input.parameters && typeof input.parameters === 'object' && !Array.isArray(input.parameters)
+        ? (input.parameters as Record<string, unknown>)
+        : {};
+
+    const rawRefs = Array.isArray(input.references) ? input.references : [];
+    const resolvedRefs =
+      rawRefs.length > 0
+        ? await deps.assets.resolveReferences(
+            auth,
+            rawRefs
+              .filter((r): r is Record<string, unknown> => Boolean(r && typeof r === 'object'))
+              .map((r) => ({
+                assetId: String(r.assetId ?? ''),
+                versionId: String(r.versionId ?? ''),
+                role:
+                  r.role === 'first_frame' || r.role === 'last_frame' || r.role === 'reference'
+                    ? r.role
+                    : undefined,
+              })),
+          )
+        : [];
+
+    const requestHash = createHash('sha256')
+      .update(JSON.stringify({ modality, mode, modelId, prompt, parameters, projectId, resolvedRefs }))
+      .digest('hex');
+
+    // Check existing idempotency key first
+    const [existing] = await deps.db
+      .select()
+      .from(jobs)
+      .where(
+        and(
+          eq(jobs.workspaceId, auth.workspaceId),
+          eq(jobs.kind, 'media_generate'),
+          eq(jobs.idempotencyKey, requestId),
+        ),
+      )
+      .limit(1);
+
+    if (existing) {
+      if (existing.requestHash && existing.requestHash !== requestHash) {
+        throw new CloudError(
+          'REQUEST_ID_CONFLICT',
+          'requestId was already used for a different generation request',
+          { status: 409, applied: false },
+        );
+      }
+      return { job: serializeJob(existing), replayed: true };
+    }
+
+    const activeRows = await deps.db
+      .select({ id: jobs.id })
+      .from(jobs)
+      .where(
+        and(
+          eq(jobs.workspaceId, auth.workspaceId),
+          eq(jobs.kind, 'media_generate'),
+          inArray(jobs.state, [...ACTIVE_JOB_STATES]),
+        ),
+      );
+    if (activeRows.length >= MAX_ACTIVE_MEDIA_GENERATIONS) {
+      throw new CloudError(
+        'RATE_LIMITED',
+        `Workspace already has ${MAX_ACTIVE_MEDIA_GENERATIONS} active media generation jobs.`,
+        { status: 429, applied: false },
+      );
+    }
+
+    const jobId = randomUUID();
+    const inputPayload: Record<string, unknown> = {
+      modality,
+      mode,
+      modelId,
+      prompt,
+      parameters,
+      assetName,
+      ...(typeof input.assetId === 'string' && isUuid(input.assetId) ? { assetId: input.assetId } : {}),
+      ...(typeof input.parentVersionId === 'string' && isUuid(input.parentVersionId)
+        ? { parentVersionId: input.parentVersionId }
+        : {}),
+      references: resolvedRefs,
+      ...(auth.externalWorkspaceId ? { externalWorkspaceId: auth.externalWorkspaceId } : {}),
+      externalUserId: auth.userId,
+    };
+
+    const [inserted] = await deps.db
+      .insert(jobs)
+      .values(
+        asInsert(jobs, {
+          id: jobId,
+          workspaceId: auth.workspaceId,
+          projectId,
+          kind: 'media_generate',
+          state: 'queued',
+          stage: 'queued',
+          requestId,
+          idempotencyKey: requestId,
+          requestHash,
+          inputPayload,
+        }),
+      )
+      .returning();
+
+    try {
+      await deps.queues.enqueueMediaGenerate('generate_media', {
+        jobId,
+        workspaceId: auth.workspaceId,
+      });
+    } catch (error) {
+      await deps.db
+        .update(jobs)
+        .set(
+          asUpdate(jobs, {
+            state: 'failed',
+            stage: 'failed',
+            failureStage: 'enqueue',
+            errorCode: 'QUEUE_ENQUEUE_FAILED',
+            errorMessage: error instanceof Error ? error.message.slice(0, 500) : 'Failed to enqueue media generation',
+            terminalAt: sql`now()`,
+            updatedAt: sql`now()`,
+          }),
+        )
+        .where(and(eq(jobs.workspaceId, auth.workspaceId), eq(jobs.id, jobId)));
+      throw new CloudError('SERVICE_UNAVAILABLE', 'Could not enqueue media generation job', {
+        status: 503,
+        applied: false,
+      });
+    }
+
+    return { job: serializeJob(inserted), replayed: false };
+  };
+
+  const listJobs = async (
+    auth: AuthContext,
+    query: { projectId?: string; limit?: number; offset?: number },
+  ): Promise<Record<string, unknown>> => {
+    const limit = Math.min(Math.max(1, query.limit ?? 50), 100);
+    const offset = Math.max(0, query.offset ?? 0);
+    const predicate =
+      query.projectId && isUuid(query.projectId)
+        ? and(
+            eq(jobs.workspaceId, auth.workspaceId),
+            eq(jobs.kind, 'media_generate'),
+            eq(jobs.projectId, query.projectId),
+          )
+        : and(eq(jobs.workspaceId, auth.workspaceId), eq(jobs.kind, 'media_generate'));
+
+    const rows = await deps.db
+      .select()
+      .from(jobs)
+      .where(predicate)
+      .orderBy(desc(jobs.createdAt))
+      .limit(limit)
+      .offset(offset);
+
+    return {
+      jobs: rows.map(serializeJob),
+      total: rows.length,
+      offset,
+      limit,
+    };
+  };
+
+  const getJob = async (auth: AuthContext, jobId: string): Promise<Record<string, unknown>> => {
+    if (!isUuid(jobId)) {
+      throw new CloudError('NOT_FOUND', `Media job '${jobId}' not found`, { status: 404, applied: false });
+    }
+    const [row] = await deps.db
+      .select()
+      .from(jobs)
+      .where(and(eq(jobs.workspaceId, auth.workspaceId), eq(jobs.id, jobId), eq(jobs.kind, 'media_generate')))
+      .limit(1);
+    if (!row) {
+      throw new CloudError('NOT_FOUND', `Media job '${jobId}' not found`, { status: 404, applied: false });
+    }
+    return { job: serializeJob(row) };
+  };
+
+  const cancelJob = async (auth: AuthContext, jobId: string): Promise<Record<string, unknown>> => {
+    if (!isUuid(jobId)) {
+      throw new CloudError('NOT_FOUND', `Media job '${jobId}' not found`, { status: 404, applied: false });
+    }
+    const [existing] = await deps.db
+      .select()
+      .from(jobs)
+      .where(and(eq(jobs.workspaceId, auth.workspaceId), eq(jobs.id, jobId), eq(jobs.kind, 'media_generate')))
+      .limit(1);
+    if (!existing) {
+      throw new CloudError('NOT_FOUND', `Media job '${jobId}' not found`, { status: 404, applied: false });
+    }
+    if (['completed', 'failed', 'cancelled'].includes(existing.state)) {
+      return { job: serializeJob(existing) };
+    }
+    const nextState = existing.state === 'queued' ? 'cancelled' : 'cancelling';
+    const [updated] = await deps.db
+      .update(jobs)
+      .set(
+        asUpdate(jobs, {
+          state: nextState,
+          stage: nextState,
+          ...(nextState === 'cancelled' ? { terminalAt: sql`now()` } : {}),
+          updatedAt: sql`now()`,
+        }),
+      )
+      .where(and(eq(jobs.workspaceId, auth.workspaceId), eq(jobs.id, jobId)))
+      .returning();
+
+    await deps.eventBus.publish(cancelChannel(jobId), {
+      jobId,
+      workspaceId: auth.workspaceId,
+      requestedAt: Date.now(),
+    });
+    return { job: serializeJob(updated ?? existing) };
+  };
+
+  const resumeJob = async (
+    auth: AuthContext,
+    jobId: string,
+    requestId: string,
+  ): Promise<Record<string, unknown>> => {
+    validateStableRequestId(requestId);
+    if (!isUuid(jobId)) {
+      throw new CloudError('NOT_FOUND', `Media job '${jobId}' not found`, { status: 404, applied: false });
+    }
+    const [existing] = await deps.db
+      .select()
+      .from(jobs)
+      .where(and(eq(jobs.workspaceId, auth.workspaceId), eq(jobs.id, jobId), eq(jobs.kind, 'media_generate')))
+      .limit(1);
+    if (!existing) {
+      throw new CloudError('NOT_FOUND', `Media job '${jobId}' not found`, { status: 404, applied: false });
+    }
+    if (!existing.remoteId || existing.remoteTerminal || existing.state !== 'failed') {
+      throw new CloudError(
+        'INVALID_ARGUMENT',
+        'Only failed media jobs with an active upstream remoteId can be resumed without re-submitting.',
+        { status: 409, applied: false },
+      );
+    }
+
+    const [updated] = await deps.db
+      .update(jobs)
+      .set(
+        asUpdate(jobs, {
+          state: 'queued',
+          stage: 'resuming',
+          errorCode: null,
+          errorMessage: null,
+          terminalAt: null,
+          updatedAt: sql`now()`,
+        }),
+      )
+      .where(and(eq(jobs.workspaceId, auth.workspaceId), eq(jobs.id, jobId)))
+      .returning();
+
+    await deps.queues.enqueueMediaGenerate(
+      'resume_generation',
+      {
+        jobId,
+        workspaceId: auth.workspaceId,
+        remoteId: existing.remoteId,
+      },
+      { jobId: `${jobId}__resume__${requestId}` },
+    );
+
+    return { job: serializeJob(updated ?? existing) };
+  };
+
+  const retrySaveJob = async (auth: AuthContext, jobId: string): Promise<Record<string, unknown>> => {
+    if (!isUuid(jobId)) {
+      throw new CloudError('NOT_FOUND', `Media job '${jobId}' not found`, { status: 404, applied: false });
+    }
+    const [existing] = await deps.db
+      .select()
+      .from(jobs)
+      .where(and(eq(jobs.workspaceId, auth.workspaceId), eq(jobs.id, jobId), eq(jobs.kind, 'media_generate')))
+      .limit(1);
+    if (!existing) {
+      throw new CloudError('NOT_FOUND', `Media job '${jobId}' not found`, { status: 404, applied: false });
+    }
+    if (!existing.savePending) {
+      throw new CloudError('INVALID_ARGUMENT', 'Media job does not have a pending save to retry.', {
+        status: 409,
+        applied: false,
+      });
+    }
+    await deps.queues.enqueueMediaGenerate(
+      'retry_save_generation',
+      { jobId, workspaceId: auth.workspaceId },
+      { jobId: `${jobId}__retry_save__${Date.now()}` },
+    );
+    return { job: serializeJob(existing) };
+  };
+
+  const handleMediaAction = async (
+    auth: AuthContext,
+    args: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> => {
+    const action = String(args.action ?? '');
+    switch (action) {
+      case 'generate':
+        return submitGeneration(auth, args);
+      case 'jobs':
+        return listJobs(auth, {
+          projectId: typeof args.projectId === 'string' ? args.projectId : undefined,
+          limit: typeof args.limit === 'number' ? args.limit : undefined,
+          offset: typeof args.offset === 'number' ? args.offset : undefined,
+        });
+      case 'status':
+        return getJob(auth, String(args.jobId ?? ''));
+      case 'cancel':
+        return cancelJob(auth, String(args.jobId ?? ''));
+      case 'resume':
+        return resumeJob(auth, String(args.jobId ?? ''), String(args.requestId ?? ''));
+      case 'retry_save':
+        return retrySaveJob(auth, String(args.jobId ?? ''));
+      default:
+        throw new CloudError('INVALID_ARGUMENT', `Unsupported media action '${action}'`, {
+          status: 400,
+          applied: false,
+        });
+    }
+  };
+
+  return {
+    submitGeneration,
+    listJobs,
+    getJob,
+    cancelJob,
+    resumeJob,
+    handleMediaAction,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Complete `McpDomainPorts` Adapter Wiring All 22 Registered `openmotion_*` Tools
+// ---------------------------------------------------------------------------
+
+function buildProjectPreviewHandoff(
+  publicOrigin: string,
+  project: { id: string; sessionId: string; revision: string; currentVersionId: string | null },
+  options: { embedded?: boolean; presentation?: string } = {},
+) {
+  const origin = publicOrigin.replace(/\/$/, '');
+  const embedded = options.embedded !== false;
+  const previewUrl = origin + sessionPath(project.sessionId, project.id, { openArtifact: true, embedded });
+  const sessionUrl = origin + sessionPath(project.sessionId, project.id, { openArtifact: true, embedded: false });
+  const presentation = options.presentation ?? 'foreground';
+  const background = presentation === 'background';
+
+  return {
+    previewUrl,
+    sessionUrl,
+    previewHandoff: {
+      target: 'project',
+      projectId: project.id,
+      sessionId: project.sessionId,
+      revision: project.revision,
+      versionId: project.currentVersionId,
+      previewUrl,
+      sessionUrl,
+      placement: 'right',
+      reuseExistingTab: true,
+      presentation,
+      focusPolicy: background
+        ? 'background'
+        : presentation === 'now'
+          ? 'switch_to_calling_chat'
+          : 'preserve_current_chat',
+      state: background ? 'background' : 'pending',
+      openedByHost: false,
+      hostActionRequired: !background,
+      nextAction: background
+        ? null
+        : {
+            kind: 'tool',
+            tool: 'openmotion_open_preview',
+            arguments: { projectId: project.id },
+          },
+      instructions:
+        'Follow openmotion://workflow/production/native before delivering. Open previewUrl in the host browser or present the verified export.',
+    },
+  };
+}
+
+function createMcpDomainPorts(deps: {
+  config: AppConfig;
+  runtimeRoot: string;
+  authStore: AuthStore;
+  workspace: WorkspaceService;
+  files: ProjectFilesService;
+  history: VersionHistoryService;
+  catalog: CatalogService;
+  assets: AssetLibraryService;
+  exports: ExportService;
+  workRounds: WorkRoundsService;
+  assetNames: AssetNamesService;
+  archives: ProjectArchiveService;
+  importAssets: CloudImportAssetsService;
+  gateway: PlatformModelGateway;
+  mediaJobs: MediaJobPort & {
+    handleMediaAction(auth: AuthContext, args: Record<string, unknown>): Promise<Record<string, unknown>>;
+  };
+}): McpDomainPorts {
+  let cachedCaptionOps: Awaited<ReturnType<typeof loadCaptionSourceOperations>> | null = null;
+  const getCaptionOps = async () => {
+    if (!cachedCaptionOps) {
+      cachedCaptionOps = await loadCaptionSourceOperations(deps.runtimeRoot);
+    }
+    return cachedCaptionOps;
+  };
+
+  return {
+    projects: {
+      async getProject(auth, args) {
+        const projectId = typeof args.projectId === 'string' ? args.projectId : undefined;
+        if (!projectId) {
+          const catalog = await deps.workspace.getCatalog(auth);
+          const list = args.trashed === true ? catalog.trashedProjects : catalog.projects;
+          const pageSize = 5;
+          let offset = 0;
+          if (typeof args.cursor === 'string' && args.cursor.trim()) {
+            const parsed = Number.parseInt(args.cursor, 10);
+            if (Number.isSafeInteger(parsed) && parsed >= 0) offset = parsed;
+          }
+          const slice = list.slice(offset, offset + pageSize);
+          const nextCursor = offset + pageSize < list.length ? String(offset + pageSize) : null;
+          return {
+            workspaceId: auth.workspaceId,
+            activeId: catalog.activeId,
+            trashed: args.trashed === true,
+            total: list.length,
+            projects: slice,
+            nextCursor,
+          };
+        }
+
+        const project = await deps.workspace.getProject(auth, projectId, { allowTrashed: true });
+        if (typeof args.expectedRevision === 'string' && project.revision !== args.expectedRevision) {
+          throw new CloudError('VERSION_CONFLICT', 'Project revision does not match expectedRevision', {
+            status: 409,
+            applied: false,
+            details: { currentRevision: project.revision, currentVersionId: project.currentVersionId },
+          });
+        }
+
+        const virtual = await deps.files.loadVirtualProject(auth, project.id);
+        const allFiles = virtual.listFiles();
+        const assetNames = await deps.assetNames.readAssetNames(auth, project.id, {
+          paths: allFiles.map((f) => f.path),
+        });
+
+        let fileContent: Record<string, unknown> | undefined;
+        if (args.file && typeof args.file === 'object') {
+          const fileReq = args.file as { path: string; offset?: number; length?: number };
+          const read = await deps.files.readTextFile(auth, project.id, fileReq.path);
+          if (!read) {
+            throw new CloudError('NOT_FOUND', `File '${fileReq.path}' not found in project`, {
+              status: 404,
+              applied: false,
+            });
+          }
+          const offset = Math.max(0, fileReq.offset ?? 0);
+          const length = Math.min(2 * 1024 * 1024, Math.max(1, fileReq.length ?? 200_000));
+          const sliced = read.content.slice(offset, offset + length);
+          fileContent = {
+            path: read.file.path,
+            offset,
+            length: sliced.length,
+            totalLength: read.content.length,
+            truncated: offset + sliced.length < read.content.length,
+            content: sliced,
+          };
+        }
+
+        let exportJob: Record<string, unknown> | undefined;
+        if (typeof args.exportJobId === 'string') {
+          const job = await deps.exports.getExport(auth, args.exportJobId);
+          let downloadUrl: string | undefined;
+          if (job.state === 'completed') {
+            const presigned = await deps.exports
+              .presignExportFile(auth, job.id, { disposition: 'inline' })
+              .catch(() => null);
+            downloadUrl = presigned?.url;
+          }
+          exportJob = { ...job, ...(downloadUrl ? { downloadUrl } : {}) };
+        }
+
+        let inlineWork: Record<string, unknown> | undefined;
+        if (typeof args.workId === 'string') {
+          const round = await deps.workRounds.get(auth, project.id, args.workId);
+          if (!round) {
+            throw new CloudError('NOT_FOUND', `Work round '${args.workId}' not found`, {
+              status: 404,
+              applied: false,
+            });
+          }
+          let videoUrl: string | undefined;
+          let playable = false;
+          if (round.jobId) {
+            const job = await deps.exports.getExport(auth, round.jobId).catch(() => null);
+            if (job && job.state === 'completed') {
+              playable = true;
+              if (args.includeVideo === true) {
+                const presigned = await deps.exports
+                  .presignExportFile(auth, job.id, { disposition: 'inline' })
+                  .catch(() => null);
+                videoUrl = presigned?.url;
+              }
+            }
+          }
+          inlineWork = {
+            ...round,
+            playable,
+            ...(playable ? { state: 'completed' } : {}),
+            ...(videoUrl ? { videoUrl } : {}),
+          };
+        }
+
+        return {
+          projectId: project.id,
+          sessionId: project.sessionId,
+          project,
+          revision: project.revision,
+          version: {
+            versionId: project.currentVersionId,
+            versionNumber: project.currentVersionNumber,
+          },
+          files: allFiles.map((f) => ({
+            path: f.path,
+            size: f.sizeBytes,
+            hash: f.sha256,
+            mimeType: f.mimeType,
+            isText: f.isText,
+          })),
+          assetNames: assetNames.assetNames,
+          namingLanguage: assetNames.namingLanguage,
+          ...(fileContent ? { file: fileContent } : {}),
+          ...(exportJob ? { exportJob } : {}),
+          ...(inlineWork ? { inlineWork } : {}),
+        };
+      },
+
+      async createProject(auth, args) {
+        const projectType = String(args.projectType ?? 'natural_language') as
+          | 'natural_language'
+          | 'template'
+          | 'reference_video';
+        const requestId = String(args.requestId ?? '');
+        const title = typeof args.title === 'string' ? args.title : undefined;
+        const requirements = typeof args.requirements === 'string' ? args.requirements : undefined;
+        const namingLanguage = typeof args.namingLanguage === 'string' ? args.namingLanguage : undefined;
+        const sessionId = typeof args.sessionId === 'string' && isUuid(args.sessionId) ? args.sessionId : undefined;
+
+        if (projectType === 'template') {
+          const templateId = typeof args.templateId === 'string' ? args.templateId : '';
+          if (!templateId) {
+            throw new CloudError('INVALID_ARGUMENT', 'templateId is required when projectType=template', {
+              status: 400,
+              applied: false,
+            });
+          }
+          const cloned = await deps.catalog.cloneTemplateToProject(auth, {
+            templateId,
+            title,
+            sessionId,
+            requirements,
+            namingLanguage,
+            requestId,
+          });
+          return {
+            projectId: cloned.projectId,
+            sessionId: cloned.sessionId,
+            title: cloned.title,
+            templateId: cloned.templateId,
+            revision: cloned.revision,
+            version: {
+              versionId: cloned.versionId,
+              versionNumber: cloned.versionNumber,
+            },
+            replayed: false,
+            ...buildProjectPreviewHandoff(deps.config.APP_PUBLIC_ORIGIN, {
+              id: cloned.projectId,
+              sessionId: cloned.sessionId,
+              revision: cloned.revision,
+              currentVersionId: cloned.versionId,
+            }),
+          };
+        }
+
+        const created = await deps.workspace.createProject(auth, {
+          title,
+          projectType,
+          requirements,
+          namingLanguage,
+          sessionId,
+          requestId,
+          sourceMeta:
+            args.referenceVideoId || args.referenceUrl
+              ? {
+                  ...(args.referenceVideoId ? { referenceVideoId: args.referenceVideoId } : {}),
+                  ...(args.referenceUrl ? { referenceUrl: args.referenceUrl } : {}),
+                }
+              : null,
+        });
+
+        return {
+          projectId: created.projectId,
+          sessionId: created.sessionId,
+          title: created.title,
+          revision: created.revision,
+          version: {
+            versionId: created.versionId,
+            versionNumber: created.versionNumber,
+          },
+          replayed: created.replayed,
+          ...buildProjectPreviewHandoff(deps.config.APP_PUBLIC_ORIGIN, {
+            id: created.projectId,
+            sessionId: created.sessionId,
+            revision: created.revision,
+            currentVersionId: created.versionId,
+          }),
+        };
+      },
+
+      async editProject(auth, args) {
+        const projectId = String(args.projectId ?? '');
+        const requestId = String(args.requestId ?? '');
+        const expectedRevision = String(args.expectedRevision ?? '');
+        const expectedVersionId = String(args.expectedVersionId ?? '');
+        const ops: ProjectFileOp[] = [];
+
+        if (Array.isArray(args.files)) {
+          for (const item of args.files) {
+            if (item && typeof item === 'object') {
+              const rec = item as { path: string; content: string };
+              ops.push({
+                op: 'upsert_text',
+                path: rec.path,
+                content: rec.content,
+                stampHfIds: rec.path.endsWith('.html'),
+              });
+            }
+          }
+        }
+
+        if (args.canvas && typeof args.canvas === 'object') {
+          const canvas = args.canvas as { compositionPath: string; ratio: CanvasRatio; fit: CanvasFit };
+          const existing = await deps.files.readTextFile(auth, projectId, canvas.compositionPath);
+          if (!existing) {
+            throw new CloudError('NOT_FOUND', `Composition '${canvas.compositionPath}' not found`, {
+              status: 404,
+              applied: false,
+            });
+          }
+          const captionOps = await getCaptionOps();
+          const reframed = compositionCanvasSource(
+            existing.content,
+            {
+              parseHTML: captionOps.parseHTML,
+              rewriteStyles: (source, aliases) => {
+                let next = source;
+                for (const [from, to] of aliases) {
+                  next = next.replaceAll(`[${from}]`, `[${to}]`).replaceAll(`[${from}=`, `[${to}=`);
+                }
+                return next;
+              },
+            },
+            { ratio: canvas.ratio, fit: canvas.fit },
+          );
+          ops.push({
+            op: 'upsert_text',
+            path: canvas.compositionPath,
+            content: reframed.content,
+            stampHfIds: true,
+          });
+        }
+
+        let committed = null;
+        if (ops.length > 0 || args.requirements !== undefined || args.namingLanguage !== undefined) {
+          committed = await deps.files.commitChanges(auth, {
+            projectId,
+            ops,
+            expectedRevision,
+            expectedVersionId,
+            requestId,
+            idempotencyScope: 'phase1:motion_edit_project',
+            source: 'agent',
+            summary: typeof args.summary === 'string' ? args.summary : 'Agent project edit',
+            actorKind: 'agent',
+            projectUpdates: {
+              ...(typeof args.requirements === 'string' ? { requirements: args.requirements } : {}),
+              ...(typeof args.namingLanguage === 'string' ? { namingLanguage: args.namingLanguage } : {}),
+            },
+          });
+        } else if (expectedRevision !== undefined || expectedVersionId !== undefined) {
+          // Enforce optimistic concurrency even on metadata-only (`assetNames`) or no-op edits.
+          const current = await deps.workspace.getProject(auth, projectId);
+          if (expectedRevision !== undefined && current.revision !== expectedRevision) {
+            throw new CloudError(
+              'VERSION_CONFLICT',
+              `Revision conflict: expected ${expectedRevision}, current is ${current.revision}.`,
+              {
+                status: 409,
+                applied: false,
+                details: {
+                  expectedRevision,
+                  currentRevision: current.revision,
+                  currentVersionId: current.currentVersionId,
+                },
+              },
+            );
+          }
+          if (expectedVersionId !== undefined && current.currentVersionId !== expectedVersionId) {
+            throw new CloudError(
+              'VERSION_CONFLICT',
+              `Version conflict: expected ${expectedVersionId}, current is ${current.currentVersionId ?? 'none'}.`,
+              {
+                status: 409,
+                applied: false,
+                details: {
+                  expectedVersionId,
+                  currentVersionId: current.currentVersionId,
+                  currentRevision: current.revision,
+                },
+              },
+            );
+          }
+        }
+
+        let assetNamesResult: { revision: string; versionId: string | null } | null = null;
+        if (Array.isArray(args.assetNames) && args.assetNames.length > 0) {
+          assetNamesResult = await deps.assetNames.updateAssetNames(auth, projectId, {
+            assetNames: args.assetNames as Array<{ path: string; name: string }>,
+            namingLanguage: typeof args.namingLanguage === 'string' ? args.namingLanguage : undefined,
+            expectedRevision: committed ? committed.revision : expectedRevision,
+            requestId: `${requestId}:asset-names`,
+          });
+        }
+
+        const project = await deps.workspace.getProject(auth, projectId);
+        return {
+          projectId: project.id,
+          sessionId: project.sessionId,
+          revision: assetNamesResult?.revision ?? committed?.revision ?? project.revision,
+          version: {
+            versionId: assetNamesResult?.versionId ?? committed?.versionId ?? project.currentVersionId,
+            versionNumber: project.currentVersionNumber,
+          },
+          changedFiles: committed?.changedPaths ?? (assetNamesResult ? ['motion-assets.json'] : []),
+          replayed: committed?.replayed ?? false,
+          ...buildProjectPreviewHandoff(deps.config.APP_PUBLIC_ORIGIN, project, {
+            presentation: typeof args.presentation === 'string' ? args.presentation : undefined,
+          }),
+        };
+      },
+
+      async openPreview(auth, args) {
+        const origin = deps.config.APP_PUBLIC_ORIGIN.replace(/\/$/, '');
+        if (args.target === 'templates') {
+          return templateLibraryPreview(origin, {
+            embedded: typeof args.embedded === 'boolean' ? args.embedded : undefined,
+            presentation: typeof args.presentation === 'string' ? args.presentation : undefined,
+          });
+        }
+        if (args.target === 'providers') {
+          return providerSettingsPreview(origin, {
+            embedded: typeof args.embedded === 'boolean' ? args.embedded : undefined,
+            presentation: typeof args.presentation === 'string' ? args.presentation : undefined,
+            entry: typeof args.entry === 'string' ? args.entry : undefined,
+          });
+        }
+
+        const action = typeof args.action === 'string' ? args.action : 'open';
+        const projectId = typeof args.projectId === 'string' ? args.projectId : '';
+        if (!projectId) {
+          const catalog = await deps.workspace.getCatalog(auth);
+          if (!catalog.activeId) {
+            throw new CloudError('PROJECT_NOT_FOUND', 'No active project in workspace; specify projectId', {
+              status: 404,
+              applied: false,
+            });
+          }
+          const active = await deps.workspace.getProject(auth, catalog.activeId);
+          return {
+            projectId: active.id,
+            sessionId: active.sessionId,
+            revision: active.revision,
+            versionId: active.currentVersionId,
+            ...buildProjectPreviewHandoff(origin, active, {
+              embedded: typeof args.embedded === 'boolean' ? args.embedded : undefined,
+              presentation: typeof args.presentation === 'string' ? args.presentation : undefined,
+            }),
+          };
+        }
+
+        if (action === 'begin') {
+          const round = await deps.workRounds.create(auth, {
+            projectId,
+            mode: args.mode === 'create' ? 'create' : 'modify',
+          });
+          return { projectId, workId: round.id, workRound: round };
+        }
+        if (action === 'complete_generation') {
+          const workId = String(args.workId ?? '');
+          const round = await deps.workRounds.markSaved(auth, projectId, workId, {
+            versionId: typeof args.expectedVersionId === 'string' ? args.expectedVersionId : undefined,
+            revision: typeof args.expectedRevision === 'string' ? args.expectedRevision : undefined,
+          });
+          return { projectId, workId: round.id, workRound: round };
+        }
+        if (action === 'record_display') {
+          const display = (args.display ?? {}) as Record<string, unknown>;
+          return (await deps.workspace.recordPreviewDisplay(auth, projectId, display)) as unknown as Record<string, unknown>;
+        }
+        if (action === 'record_review') {
+          const review = (args.review ?? {}) as Record<string, unknown>;
+          return (await deps.workspace.recordReview(auth, projectId, review)) as unknown as Record<string, unknown>;
+        }
+
+        const selected = await deps.workspace.selectProject(auth, projectId);
+        return {
+          projectId: selected.id,
+          sessionId: selected.sessionId,
+          revision: selected.revision,
+          versionId: selected.currentVersionId,
+          ...buildProjectPreviewHandoff(origin, selected, {
+            embedded: typeof args.embedded === 'boolean' ? args.embedded : undefined,
+            presentation: typeof args.presentation === 'string' ? args.presentation : undefined,
+          }),
+        };
+      },
+
+      async manageProject(auth, args) {
+        const action = String(args.action ?? '');
+        const projectId = String(args.projectId ?? '');
+        if (action === 'duplicate') {
+          const dup = await deps.archives.duplicateProject(auth, projectId, {
+            title: typeof args.title === 'string' ? args.title : undefined,
+            requestId: typeof args.requestId === 'string' ? args.requestId : undefined,
+          });
+          return dup as unknown as Record<string, unknown>;
+        }
+        if (action === 'info') {
+          const project = await deps.workspace.getProject(auth, projectId, { allowTrashed: true });
+          return {
+            projectId: project.id,
+            title: project.title,
+            trashed: project.trashed,
+            revision: project.revision,
+            location: { available: false, reason: 'cloud' },
+            project,
+          };
+        }
+        const res = await deps.workspace.manageProject(auth, {
+          action: action as 'rename' | 'trash' | 'restore' | 'delete' | 'reveal' | 'comments',
+          projectId,
+          title: typeof args.title === 'string' ? args.title : undefined,
+          expectedTitle: typeof args.expectedTitle === 'string' ? args.expectedTitle : undefined,
+          requestId: typeof args.requestId === 'string' ? args.requestId : undefined,
+        });
+        return res as unknown as Record<string, unknown>;
+      },
+    },
+
+    versions: {
+      async listVersions(auth, args) {
+        const projectId = String(args.projectId ?? '');
+        const cursorRaw = typeof args.cursor === 'string' ? Number.parseInt(args.cursor, 10) : undefined;
+        const page = await deps.history.listVersions(auth, projectId, {
+          limit: 5,
+          cursorVersionNumber: cursorRaw && Number.isSafeInteger(cursorRaw) ? cursorRaw : undefined,
+        });
+        return page as unknown as Record<string, unknown>;
+      },
+
+      async restoreVersion(auth, args) {
+        const projectId = String(args.projectId ?? '');
+        const restored = await deps.history.restoreVersion(auth, projectId, {
+          targetVersionId: String(args.versionId ?? ''),
+          expectedRevision: String(args.expectedRevision ?? ''),
+          expectedVersionId: String(args.expectedVersionId ?? ''),
+          requestId: String(args.requestId ?? ''),
+          actorKind: 'agent',
+        });
+        const project = await deps.workspace.getProject(auth, projectId);
+        return {
+          ...restored,
+          version: {
+            versionId: restored.versionId,
+            versionNumber: restored.versionNumber,
+          },
+          ...buildProjectPreviewHandoff(deps.config.APP_PUBLIC_ORIGIN, project, {
+            presentation: typeof args.presentation === 'string' ? args.presentation : undefined,
+          }),
+        };
+      },
+    },
+
+    exports: {
+      async exportRequest(auth, args) {
+        const projectId = String(args.projectId ?? '');
+        if (args.action === 'record_review') {
+          const review = (args.review ?? {}) as Record<string, unknown>;
+          return (await deps.workspace.recordReview(auth, projectId, review)) as unknown as Record<string, unknown>;
+        }
+        const started = await deps.exports.startExport(auth, projectId, {
+          expectedRevision: typeof args.expectedRevision === 'string' ? args.expectedRevision : undefined,
+          expectedVersionId: typeof args.versionId === 'string' ? args.versionId : undefined,
+          requestId: String(args.requestId ?? ''),
+          compositionPath: typeof args.compositionPath === 'string' ? args.compositionPath : undefined,
+          workId: typeof args.workId === 'string' ? args.workId : undefined,
+          phase1: true,
+        });
+        return started as unknown as Record<string, unknown>;
+      },
+
+      async exportCancel(auth, args) {
+        const job = await deps.exports.cancelExport(auth, String(args.jobId ?? ''));
+        return { projectId: args.projectId, job };
+      },
+    },
+
+    catalog: {
+      async listTemplates(_auth, _args) {
+        const page = await deps.catalog.listTemplates({ category: 'all', offset: 0, limit: 500 });
+        return {
+          source: 'cloud-catalog-cas',
+          catalogVersion: page.catalogVersion,
+          total: page.total,
+          templates: page.items,
+        };
+      },
+
+      async getTemplate(_auth, args) {
+        const detail = await deps.catalog.getTemplate(String(args.templateId ?? ''));
+        return detail as unknown as Record<string, unknown>;
+      },
+
+      async listSkills(_auth, _args) {
+        const skills = await loadLibrarySkills(deps.runtimeRoot, false);
+        const skillVersion = createHash('sha256')
+          .update(JSON.stringify(skills.map((s) => ({ id: s.id, files: s.files }))))
+          .digest('hex')
+          .slice(0, 16);
+        return {
+          source: 'library-skills',
+          skillVersion,
+          total: skills.length,
+          skills: skills.map(({ instructions: _inst, ...summary }) => summary),
+        };
+      },
+
+      async getSkill(_auth, args) {
+        const skillId = String(args.skillId ?? '');
+        const skills = await loadLibrarySkills(deps.runtimeRoot, false);
+        const found = skills.find((s) => s.id === skillId);
+        if (!found) {
+          throw new CloudError('NOT_FOUND', `Library skill '${skillId}' not found`, {
+            status: 404,
+            applied: false,
+          });
+        }
+        return {
+          ...found,
+          nextStep: skillNextStep,
+          motionDocument: { path: 'SKILL.md', content: found.instructions },
+        };
+      },
+    },
+
+    assets: {
+      async handleAssetsUse(auth, args) {
+        const action = String(args.action ?? '');
+
+        if (action === 'transcript') {
+          const transcript = (args.transcript ?? {}) as Record<string, unknown>;
+          const command = String(transcript.command ?? '');
+          const projectId = String(transcript.projectId ?? args.projectId ?? '');
+          const compositionPath = String(transcript.compositionPath ?? 'index.html');
+          if (!projectId) {
+            throw new CloudError('INVALID_ARGUMENT', 'projectId is required for transcript operations', {
+              status: 400,
+              applied: false,
+            });
+          }
+          const captionOps = await getCaptionOps();
+          const current = await deps.files.readTextFile(auth, projectId, compositionPath);
+          if (!current) {
+            throw new CloudError('NOT_FOUND', `Composition '${compositionPath}' not found`, {
+              status: 404,
+              applied: false,
+            });
+          }
+          if (command === 'caption_tracks') {
+            return { projectId, compositionPath, tracks: captionOps.captionTracks(current.content) };
+          }
+          if (command === 'caption_export') {
+            const format = transcript.format === 'vtt' ? 'vtt' : 'srt';
+            const trackId = typeof transcript.transcriptId === 'string' ? transcript.transcriptId : undefined;
+            const exported = captionOps.exportCaptionSource(current.content, format, trackId);
+            return { projectId, compositionPath, format, ...exported };
+          }
+          if (command === 'caption_add') {
+            const trackId = typeof transcript.transcriptId === 'string' ? transcript.transcriptId : randomUUID();
+            const added = captionOps.manualCaptionSource(current.content, trackId, {
+              segments: Array.isArray(transcript.segments) ? (transcript.segments as never[]) : undefined,
+              subtitles: typeof transcript.subtitles === 'string' ? transcript.subtitles : undefined,
+              timelineStart: typeof transcript.timelineStart === 'number' ? transcript.timelineStart : undefined,
+              textKind: transcript.textKind === 'text' ? 'text' : 'caption',
+              captionSettings:
+                transcript.captionSettings && typeof transcript.captionSettings === 'object'
+                  ? (transcript.captionSettings as Record<string, unknown>)
+                  : undefined,
+            });
+            const committed = await deps.files.commitChanges(auth, {
+              projectId,
+              ops: [{ op: 'upsert_text', path: compositionPath, content: added.content, stampHfIds: true }],
+              expectedRevision: typeof transcript.expectedRevision === 'string' ? transcript.expectedRevision : undefined,
+              requestId: typeof transcript.requestId === 'string' ? transcript.requestId : undefined,
+              source: 'agent',
+              summary: `Added caption track to ${compositionPath}`,
+              actorKind: 'agent',
+            });
+            return { projectId, compositionPath, trackId, count: added.count, revision: committed.revision };
+          }
+          if (command === 'caption_update' || command === 'caption_toggle') {
+            const trackId = String(transcript.transcriptId ?? '');
+            const remove = transcript.remove === true;
+            const patch =
+              command === 'caption_toggle'
+                ? { visible: Boolean(transcript.visible) }
+                : ((transcript.captionSettings ?? {}) as Record<string, unknown>);
+            const updated = captionOps.updateCaptionTrackSource(current.content, trackId, patch, remove);
+            const committed = await deps.files.commitChanges(auth, {
+              projectId,
+              ops: [{ op: 'upsert_text', path: compositionPath, content: updated.content, stampHfIds: true }],
+              expectedRevision: typeof transcript.expectedRevision === 'string' ? transcript.expectedRevision : undefined,
+              requestId: typeof transcript.requestId === 'string' ? transcript.requestId : undefined,
+              source: 'agent',
+              summary: `Updated caption track ${trackId}`,
+              actorKind: 'agent',
+            });
+            return { projectId, compositionPath, trackId, count: updated.count, revision: committed.revision };
+          }
+          throw featureDeferredP2(`transcript.${command || 'unknown'}`);
+        }
+
+        if (action === 'list') {
+          const list = await deps.assets.listAssets(auth, {
+            modality: typeof args.modality === 'string' ? (args.modality as 'image' | 'video' | 'audio') : undefined,
+            source: typeof args.source === 'string' ? (args.source as 'upload' | 'generated') : undefined,
+            query: typeof args.query === 'string' ? args.query : undefined,
+            trash: args.trash === true,
+            offset: typeof args.offset === 'number' ? args.offset : undefined,
+            limit: typeof args.limit === 'number' ? args.limit : undefined,
+          });
+          return list as unknown as Record<string, unknown>;
+        }
+
+        if (action === 'get') {
+          const detail = await deps.assets.getAsset(
+            auth,
+            String(args.assetId ?? ''),
+            typeof args.versionId === 'string' ? args.versionId : undefined,
+          );
+          return detail as unknown as Record<string, unknown>;
+        }
+
+        if (action === 'rename') {
+          const asset = await deps.assets.updateAsset(auth, String(args.assetId ?? ''), {
+            name: String(args.name ?? ''),
+          });
+          return { asset };
+        }
+
+        if (action === 'trash' || action === 'restore') {
+          const asset = await deps.assets.updateAsset(auth, String(args.assetId ?? ''), {
+            trashed: action === 'trash',
+          });
+          return { asset };
+        }
+
+        if (action === 'delete') {
+          const res = await deps.assets.deleteAsset(auth, String(args.assetId ?? ''), { permanent: true });
+          return res as unknown as Record<string, unknown>;
+        }
+
+        if (action === 'delete_version') {
+          const res = await deps.assets.deleteAssetVersion(
+            auth,
+            String(args.assetId ?? ''),
+            String(args.versionId ?? ''),
+          );
+          return res as unknown as Record<string, unknown>;
+        }
+
+        if (['generate', 'jobs', 'status', 'cancel', 'resume', 'retry_save'].includes(action)) {
+          return deps.mediaJobs.handleMediaAction(auth, args);
+        }
+
+        if (action === 'read') {
+          const assetId = String(args.assetId ?? '');
+          const versionId = String(args.versionId ?? '');
+          const presigned = await deps.assets.presignAssetVersionGet(
+            auth,
+            { assetId, versionId },
+            { allowTrash: true },
+          );
+          return {
+            assetId,
+            versionId,
+            mimeType: presigned.metadata.mimeType,
+            bytes: presigned.metadata.sizeBytes,
+            sha256: presigned.metadata.sha256,
+            url: presigned.url,
+            metadata: presigned.metadata.metadata,
+          };
+        }
+
+        throw new CloudError('INVALID_ARGUMENT', `Unsupported asset action '${action}'`, {
+          status: 400,
+          applied: false,
+        });
+      },
+    },
+
+    archive: {
+      async handleProjectArchive(auth, args) {
+        const action = String(args.action ?? '');
+        const requestId = String(args.requestId ?? randomUUID());
+        if (action === 'export') {
+          const res = await deps.archives.exportProjects(auth, {
+            requestId,
+            projectIds: Array.isArray(args.projectIds) ? (args.projectIds as string[]) : undefined,
+            all: args.all === true,
+            expectedRevisions:
+              args.expectedRevisions && typeof args.expectedRevisions === 'object'
+                ? (args.expectedRevisions as Record<string, string>)
+                : undefined,
+          });
+          return res as unknown as Record<string, unknown>;
+        }
+        throw new CloudError(
+          'INVALID_ARGUMENT',
+          'LOCAL_PATH_UNSUPPORTED_IN_CLOUD: Upload project archives via POST /motion-api/project-archives/import in cloud deployments.',
+          { status: 400, applied: false, details: { legacyCode: 'LOCAL_PATH_UNSUPPORTED_IN_CLOUD' } },
+        );
+      },
+    },
+
+    mediaJobs: deps.mediaJobs,
+    importAssets: deps.importAssets,
+    gateway: deps.gateway,
+    async getWorkspaceDefaultModels(workspaceId) {
+      const ws = await deps.authStore.findWorkspaceById(workspaceId);
+      return (ws?.defaultModels ?? {}) as Record<string, string | undefined>;
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Main Stateless Hono `api` App Factory (Testable Without Opening Sockets)
+// ---------------------------------------------------------------------------
+
+export function createApiApp(deps: CreateApiAppDeps): { app: Hono<AuthEnv>; services: ApiAppServices } {
+  const { config, db, storage, queues, eventBus } = deps;
+  const logger = deps.logger ?? createLogger({ level: config.LOG_LEVEL, bindings: { service: 'api', role: 'api' } });
+  const runtimeRoot = deps.runtimeRoot ?? DEFAULT_RUNTIME_ROOT;
+  const authStore = deps.authStore ?? createPgAuthStore(db);
+  const authCache = deps.authCache ?? new InMemoryAuthCache();
+  const oidc =
+    deps.oidc ??
+    (config.AUTH_MODE === 'oidc' ? new OidcService(oidcConfigFromAppConfig(config), authCache) : undefined);
+  const oauth21 = buildOAuth21Config(config);
+  const gateway =
+    deps.gateway ??
+    createPlatformModelGateway(config, {
+      opendesign: { cache: authCache },
+    });
+
+  const catalog = new CatalogService({
+    db,
+    storage,
+    textCache: deps.hotTextCache instanceof HotTextCache ? deps.hotTextCache : undefined,
+    logger,
+    presignGetTtlSec: config.S3_PRESIGN_GET_TTL_SEC,
+  });
+  const welcomeBootstrap = deps.welcomeBootstrap ?? new WelcomeBootstrapService({ db, catalog, logger });
+
+  const files = new ProjectFilesService({
+    db,
+    storage,
+    hotTextCache: deps.hotTextCache,
+    eventBus,
+  });
+  const history = new VersionHistoryService({
+    db,
+    storage,
+    hotTextCache: deps.hotTextCache,
+    eventBus,
+  });
+  const workspace = new WorkspaceService({
+    db,
+    storage,
+    files,
+    hotTextCache: deps.hotTextCache,
+  });
+  const assetNames = new AssetNamesService({ db, files });
+  const workRounds = new WorkRoundsService(db);
+  const archives = new ProjectArchiveService({ db, storage, workspace, files });
+  const assets = new AssetLibraryService({
+    db,
+    storage,
+    queues,
+    presignPutTtlSec: config.S3_PRESIGN_PUT_TTL_SEC,
+    presignGetTtlSec: config.S3_PRESIGN_GET_TTL_SEC,
+  });
+  const exportsService = new ExportService({
+    db,
+    storage,
+    queues,
+    eventBus,
+    presignGetTtlSec: config.S3_PRESIGN_GET_TTL_SEC,
+  });
+  const importAssets = new CloudImportAssetsService({
+    store: createPgImportAssetsStore(db),
+    storage,
+    queues,
+    config,
+  });
+  const mediaJobs = createCloudMediaJobsPort({ db, queues, eventBus, assets });
+
+  const mcpDispatcher = new McpToolDispatcher(
+    config,
+    createMcpDomainPorts({
+      config,
+      runtimeRoot,
+      authStore,
+      workspace,
+      files,
+      history,
+      catalog,
+      assets,
+      exports: exportsService,
+      workRounds,
+      assetNames,
+      archives,
+      importAssets,
+      gateway,
+      mediaJobs,
+    }),
+  );
+
+  const services: ApiAppServices = {
+    authStore,
+    gateway,
+    catalog,
+    welcomeBootstrap,
+    files,
+    history,
+    workspace,
+    assetNames,
+    workRounds,
+    archives,
+    assets,
+    exports: exportsService,
+    importAssets,
+    mediaJobs,
+    mcpDispatcher,
+  };
+
+  const authDeps: AuthMiddlewareDeps = {
+    config,
+    store: authStore,
+    cache: authCache,
+    oidc,
+    oauth21,
+    requireBearerOnDevMcp: deps.requireBearerOnDevMcp,
+  };
+  const authMiddleware = createAuthMiddleware(authDeps);
+
+  // Bounded per-process cache of workspaces confirmed welcome-bootstrapped in PG.
+  const bootstrappedWorkspaces = new Set<string>();
+  const ensureWelcomeOnce = async (auth: AuthContext): Promise<void> => {
+    if (deps.disableWelcomeBootstrap) return;
+    if (bootstrappedWorkspaces.has(auth.workspaceId)) return;
+    try {
+      await welcomeBootstrap.ensureWelcomeProject(auth);
+      if (bootstrappedWorkspaces.size >= WELCOME_CACHE_LIMIT) {
+        bootstrappedWorkspaces.clear();
+      }
+      bootstrappedWorkspaces.add(auth.workspaceId);
+    } catch (error) {
+      if (
+        isCloudError(error) &&
+        (error.code === 'NOT_FOUND' ||
+          error.code === 'TEMPLATE_NOT_COPYABLE' ||
+          error.code === 'TEMPLATE_MEDIA_UNAVAILABLE')
+      ) {
+        logger.warn('Welcome template not yet synced in catalog; skipping first-access bootstrap', {
+          workspaceId: auth.workspaceId,
+          code: error.code,
+        });
+        return;
+      }
+      logger.warn('First-access welcome bootstrap failed (non-fatal)', {
+        workspaceId: auth.workspaceId,
+        error,
+      });
+    }
+  };
+
+  const authWithWelcome = async (c: Context<AuthEnv>, next: () => Promise<void>) => {
+    let ranNext = false;
+    const response = await authMiddleware(c, async () => {
+      const auth = c.get('auth');
+      if (auth) {
+        await ensureWelcomeOnce(auth);
+      }
+      ranNext = true;
+      await next();
+    });
+    if (!ranNext && response) return response;
+  };
+
+  const app = new Hono<AuthEnv>();
+
+  app.onError((error, c) => {
+    if (isCloudError(error)) {
+      return c.json(error.toJSON(), error.status as ContentfulStatusCode);
+    }
+    logger.error('Unhandled API error', { error, method: c.req.method, path: c.req.path });
+    return c.json({ code: 'INTERNAL_ERROR', error: 'Internal server error' }, 500);
+  });
+
+  // -------------------------------------------------------------------------
+  // 1. Unauthenticated Health Probes (`/api/health/live`, `/api/health/ready`, `/api/health`)
+  // -------------------------------------------------------------------------
+
+  const checkReadiness = async () => {
+    const errors: string[] = [];
+    const checkPg = async (): Promise<boolean> => {
+      try {
+        if (deps.checkDbHealth) return await deps.checkDbHealth();
+        await db.execute(sql`SELECT 1`);
+        return true;
+      } catch (error) {
+        errors.push(`postgres: ${error instanceof Error ? error.message : String(error)}`);
+        return false;
+      }
+    };
+    const checkRedis = async (): Promise<boolean> => {
+      try {
+        if (deps.checkRedisHealth) return await deps.checkRedisHealth();
+        if (eventBus.checkHealth) return await eventBus.checkHealth();
+        return true;
+      } catch (error) {
+        errors.push(`redis: ${error instanceof Error ? error.message : String(error)}`);
+        return false;
+      }
+    };
+    const checkS3 = async (): Promise<boolean> => {
+      try {
+        if (deps.checkStorageHealth) return await deps.checkStorageHealth();
+        if (storage instanceof StorageService) {
+          await storage.internalClient.send(new HeadBucketCommand({ Bucket: storage.bucket }));
+          return true;
+        }
+        await storage.headObject('catalog/blobs/' + '0'.repeat(64));
+        return true;
+      } catch (error) {
+        errors.push(`storage: ${error instanceof Error ? error.message : String(error)}`);
+        return false;
+      }
+    };
+
+    const [postgres, redis, s3] = await Promise.all([checkPg(), checkRedis(), checkS3()]);
+    const ok = postgres && redis && s3;
+    return {
+      ok,
+      status: ok ? 'ready' : 'not_ready',
+      version: VERSION,
+      checks: { postgres, redis, storage: s3 },
+      ...(errors.length > 0 ? { errors } : {}),
+    };
+  };
+
+  app.get('/api/health/live', (c) => {
+    return c.json({ ok: true, status: 'live', service: 'api', version: VERSION, ts: Date.now() }, 200);
+  });
+
+  app.get('/api/health/ready', async (c) => {
+    const report = await checkReadiness();
+    return c.json(report, report.ok ? 200 : 503);
+  });
+
+  app.get('/api/health', async (c) => {
+    const report = await checkReadiness();
+    return c.json(
+      {
+        ...report,
+        mcp: phase1McpCapabilities,
+      },
+      report.ok ? 200 : 503,
+    );
+  });
+
+  // -------------------------------------------------------------------------
+  // 2. Auth & OAuth 2.1 Routes (`/auth/*`, `/.well-known/*`, `/oauth/*`, `/motion-api/tokens*`)
+  // -------------------------------------------------------------------------
+
+  app.route('/', createAuthRoutes(authDeps));
+
+  // -------------------------------------------------------------------------
+  // 3. Streamable HTTP MCP (`/mcp` — Strict Bearer-Only Auth + 10 MiB Limit)
+  // -------------------------------------------------------------------------
+
+  const mcpSessionStore = deps.mcpSessionStore ?? new InMemoryMcpSessionStore();
+  app.route(
+    '/',
+    createMcpHttpRoutes({
+      config,
+      auth: authDeps,
+      dispatcher: mcpDispatcher,
+      sessionStore: mcpSessionStore,
+      eventBus,
+      rateLimiter: deps.rateLimiter,
+    }),
+  );
+
+  // -------------------------------------------------------------------------
+  // 4. Static Design System, Studio Assets, MCP UI & Read-Only Vendor GSAP
+  // -------------------------------------------------------------------------
+
+  const handleStaticPath = async (c: Context) => {
+    const response = await serveStaticAsset(new URL(c.req.url).pathname, runtimeRoot, c.req.method === 'HEAD');
+    if (response) return response;
+    return c.notFound();
+  };
+
+  app.get('/design-system', handleStaticPath);
+  app.get('/design-system/*', handleStaticPath);
+  app.get('/web/design-system/*', handleStaticPath);
+  app.get('/favicon.svg', handleStaticPath);
+  app.get('/editor-assets/*', handleStaticPath);
+  app.get('/guide-assets/*', handleStaticPath);
+  app.get('/web/catalog/*', handleStaticPath);
+  app.get('/web/inline-video.html', handleStaticPath);
+  app.get('/web/inline-video.css', handleStaticPath);
+  app.get('/web/inline-video.js', handleStaticPath);
+  app.get('/web/inline-video-notices.txt', handleStaticPath);
+  app.get('/web/final-video-component.js', handleStaticPath);
+  app.get('/mcp-ui/template-recommendations/*', handleStaticPath);
+
+  // -------------------------------------------------------------------------
+  // 5. Template Catalog Routes (Mounted at BOTH `/api` and `/motion-api`)
+  //    Read-only catalog discovery is public; clone/open require authenticated workspace.
+  // -------------------------------------------------------------------------
+
+  app.use('/api/templates/:id/clone', authWithWelcome);
+  app.use('/api/templates/:id/open', authWithWelcome);
+  app.use('/motion-api/templates/:id/clone', authWithWelcome);
+  app.use('/motion-api/templates/:id/open', authWithWelcome);
+
+  app.route('/api', createCatalogRoutes({ catalog, logger, basePath: '' }));
+  app.route('/motion-api', createCatalogRoutes({ catalog, logger, basePath: '' }));
+
+  // -------------------------------------------------------------------------
+  // 6. Authenticated Cloud Integration, Runtime, Connect & Telemetry Endpoints
+  // -------------------------------------------------------------------------
+
+  const buildIntegrationPayload = (auth: AuthContext) =>
+    buildCloudIntegrationInfo({
+      publicOrigin: config.APP_PUBLIC_ORIGIN,
+      version: VERSION,
+      workspaceId: auth.workspaceId,
+      authMode: config.AUTH_MODE,
+      oauth2Enabled: true,
+      patEnabled: true,
+      authorizationServerUrl: oauth21.issuer,
+      resourceMetadataUrl: oauth21.resourceMetadataUrl,
+      tools: phase1Tools.map((tool) => ({ name: tool.name, description: tool.description })),
+    });
+
+  app.get('/motion-api/integration', authWithWelcome, (c) => {
+    return c.json(buildIntegrationPayload(getAuthContext(c)));
+  });
+  app.get('/api/integration', authWithWelcome, (c) => {
+    return c.json(buildIntegrationPayload(getAuthContext(c)));
+  });
+
+  app.get('/connect/config', authWithWelcome, (c) => {
+    const info = buildIntegrationPayload(getAuthContext(c));
+    const host = integrationHost(c.req.query('host') ?? null);
+    const configFile = integrationConfig(info, host);
+    return new Response(configFile.text, {
+      status: 200,
+      headers: {
+        'Content-Type': configFile.contentType,
+        'Content-Disposition': `attachment; filename="${configFile.filename}"`,
+        'Cache-Control': 'no-store',
+      },
+    });
+  });
+
+  app.get('/connect/guide', authWithWelcome, (c) => {
+    const info = buildIntegrationPayload(getAuthContext(c));
+    const host = integrationHost(c.req.query('host') ?? null);
+    return new Response(agentGuide(info, host), {
+      status: 200,
+      headers: {
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Cache-Control': 'no-store',
+      },
+    });
+  });
+
+  app.get('/motion-api/runtime', authMiddleware, (c) => {
+    return c.json({
+      ready: true,
+      managed: false,
+      mode: 'cloud-container',
+      capabilities: { media: true, export: true },
+    });
+  });
+
+  app.get('/motion-api/tracking', authMiddleware, (c) => {
+    return c.json({ enabled: false, locked: true, reason: 'cloud' });
+  });
+  app.post('/motion-api/tracking', authMiddleware, (c) => {
+    return c.json({ ok: true, accepted: false }, 202);
+  });
+  app.post('/motion-api/diagnostics', authMiddleware, (c) => {
+    return c.json({ ok: true, mode: 'cloud-container', version: VERSION });
+  });
+  app.post('/motion-api/diagnostics/events', authMiddleware, (c) => {
+    return c.json({ ok: true }, 202);
+  });
+
+  // -------------------------------------------------------------------------
+  // 7. Authenticated Product Routes (`/motion-api/*`)
+  // -------------------------------------------------------------------------
+
+  // Note: In Hono, `/prefix/*` matches both `/prefix` and `/prefix/...`, so register once per prefix.
+  app.use('/motion-api/projects/*', authWithWelcome);
+  app.use('/motion-api/project/*', authWithWelcome);
+  app.use('/motion-api/sessions/*', authWithWelcome);
+  app.use('/motion-api/project-archives/*', authWithWelcome);
+  app.use('/motion-api/assets/*', authWithWelcome);
+  app.use('/motion-api/exports/*', authWithWelcome);
+  app.use('/motion-api/render/*', authWithWelcome);
+  app.use('/motion-api/models/*', authWithWelcome);
+  app.use('/motion-api/account/*', authWithWelcome);
+
+  app.route('/', createProjectsRouter({ workspace, files, history, assetNames, workRounds, archives }));
+  app.route('/', createSessionsRouter({ workspace }));
+  app.route('/', createArchivesRouter({ archives }));
+  app.route('/motion-api/assets', createAssetRoutes({ assetService: assets }));
+  app.route('/motion-api', createExportRoutes({ exportService: exportsService }));
+  app.route('/motion-api/models', createModelRoutes({ gateway, authStore, mediaJobs }));
+  app.route('/motion-api/account', createAccountRoutes({ config, authStore, gateway, cache: authCache }));
+
+  // -------------------------------------------------------------------------
+  // 8. Explicit P2 Deferred Routes (`501 FEATURE_DEFERRED_P2`)
+  //    Static read-only Brand Kit catalog JSON/SVG remains accessible with zero disk writes.
+  // -------------------------------------------------------------------------
+
+  const sendDeferredP2 = (feature: string) => (c: Context) => {
+    return c.json(featureDeferredP2(feature).toJSON(), 501);
+  };
+
+  app.all('/motion-api/design', authMiddleware, sendDeferredP2('design_studio'));
+  app.all('/motion-api/design/*', authMiddleware, sendDeferredP2('design_studio'));
+
+  app.get('/motion-api/brand-kits/catalog', async (c) => {
+    try {
+      const brandCatalog = await readBrandCatalog();
+      return c.json(brandCatalog, 200);
+    } catch {
+      return c.json({ schemaVersion: 1, repository: '', revision: '', entries: [] }, 200);
+    }
+  });
+
+  app.get('/motion-api/brand-kits/catalog/assets/gsap.min.js', async (c) => {
+    const bytes = await readGsapFile(runtimeRoot, 'gsap.min.js');
+    if (!bytes) return c.notFound();
+    return new Response(new Uint8Array(bytes), {
+      status: 200,
+      headers: {
+        'Content-Type': 'text/javascript; charset=utf-8',
+        'Cache-Control': 'public, max-age=86400, immutable',
+        'X-Content-Type-Options': 'nosniff',
+      },
+    });
+  });
+
+  app.get('/motion-api/brand-kits/catalog/:id/:asset', async (c) => {
+    const id = c.req.param('id');
+    const asset = c.req.param('asset');
+    if (asset === 'import') {
+      return c.json(featureDeferredP2('brand_kit_website_capture').toJSON(), 501);
+    }
+    try {
+      const entry = await catalogEntry(id);
+      if (asset === 'style-cover.svg' || asset === 'cover') {
+        return new Response(catalogStyleCover(entry), {
+          status: 200,
+          headers: {
+            'Content-Type': 'image/svg+xml',
+            'Cache-Control': 'public, max-age=3600',
+            'X-Content-Type-Options': 'nosniff',
+            'Content-Security-Policy': "sandbox; default-src 'none'",
+          },
+        });
+      }
+      if (asset === 'poster.svg') {
+        return new Response(catalogPoster(entry), {
+          status: 200,
+          headers: {
+            'Content-Type': 'image/svg+xml',
+            'Cache-Control': 'public, max-age=3600',
+            'X-Content-Type-Options': 'nosniff',
+            'Content-Security-Policy': "sandbox; default-src 'none'",
+          },
+        });
+      }
+      if (asset === 'showcase') {
+        const nonce = randomUUID().replace(/-/g, '');
+        return new Response(catalogShowcase(entry, c.req.query('detail') === '1', nonce), {
+          status: 200,
+          headers: {
+            'Content-Type': 'text/html; charset=utf-8',
+            'Cache-Control': 'public, max-age=3600',
+            'X-Content-Type-Options': 'nosniff',
+            'Content-Security-Policy': `sandbox allow-scripts; default-src 'none'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'`,
+          },
+        });
+      }
+      return c.notFound();
+    } catch {
+      return c.notFound();
+    }
+  });
+
+  app.all('/motion-api/brand-kits', authMiddleware, sendDeferredP2('brand_kit_website_capture'));
+  app.all('/motion-api/brand-kits/*', authMiddleware, sendDeferredP2('brand_kit_website_capture'));
+
+  const handleTranscriptsRoute = sendDeferredP2('transcription');
+  app.all('/motion-api/transcripts', authMiddleware, handleTranscriptsRoute);
+  app.all('/motion-api/transcripts/*', authMiddleware, handleTranscriptsRoute);
+  app.all('/motion-api/projects/:id/transcripts', authMiddleware, handleTranscriptsRoute);
+  app.all('/motion-api/projects/:id/transcripts/*', authMiddleware, handleTranscriptsRoute);
+
+  app.all('/motion-api/review-comments', authMiddleware, sendDeferredP2('review_comments'));
+  app.all('/motion-api/review-comments/*', authMiddleware, sendDeferredP2('review_comments'));
+  app.all('/motion-api/projects/:id/review-comments', authMiddleware, sendDeferredP2('review_comments'));
+  app.all('/motion-api/projects/:id/review-comments/*', authMiddleware, sendDeferredP2('review_comments'));
+
+  // -------------------------------------------------------------------------
+  // 9. Diskless Studio Hono Router (`src/studio/index.ts`)
+  //    Authenticated for tenant/project/render/font/event/env endpoints;
+  //    `/api/runtime.js`, `/api/vendor/*`, `/__hyperframes_config` remain readable.
+  // -------------------------------------------------------------------------
+
+  app.use('/api/projects/*', authWithWelcome);
+  app.use('/api/render/*', authWithWelcome);
+  app.use('/api/media-jobs/*', authWithWelcome);
+  app.use('/api/fonts/*', authMiddleware);
+  app.use('/api/events', authWithWelcome);
+  app.use('/api/environment/ffmpeg', authMiddleware);
+  app.use('/api/open-in-desktop', authMiddleware);
+  app.use('/api/assets/global', authMiddleware);
+  app.use('/api/registry/blocks', authMiddleware);
+
+  const detectedFontsDir =
+    deps.fontsDir ?? (existsSync('/app/fonts') ? '/app/fonts' : undefined);
+
+  const studioApp = createDisklessStudioApp({
+    db,
+    storage,
+    hotTextCache: deps.hotTextCache,
+    eventBus,
+    queues,
+    workspace,
+    files,
+    history,
+    assetNames,
+    workRounds,
+    fontsDir: detectedFontsDir,
+    runtimeRoot,
+    studioVersion: VERSION,
+  });
+  app.route('/', studioApp);
+
+  // -------------------------------------------------------------------------
+  // 10. Built Studio SPA Static Assets & `index.html` Fallback (Non-API Routes)
+  // -------------------------------------------------------------------------
+
+  const isReservedApiPrefix = (pathname: string): boolean =>
+    pathname === '/mcp' ||
+    pathname.startsWith('/api/') ||
+    pathname === '/api' ||
+    pathname.startsWith('/motion-api/') ||
+    pathname === '/motion-api' ||
+    pathname.startsWith('/auth/') ||
+    pathname.startsWith('/oauth/') ||
+    pathname.startsWith('/.well-known/') ||
+    pathname === '/__hyperframes_config';
+
+  app.get('*', async (c) => {
+    const pathname = new URL(c.req.url).pathname;
+    if (isReservedApiPrefix(pathname)) {
+      return c.json({ code: 'NOT_FOUND', error: `Route not found: ${pathname}` }, 404);
+    }
+
+    const headOnly = c.req.method === 'HEAD';
+    const studioBuildDir = path.join(runtimeRoot, 'studio/build');
+
+    // Attempt exact static file under studio/build first (e.g. /assets/*, /manifest.json).
+    if (pathname !== '/' && path.extname(pathname)) {
+      const resolved = resolveSafeSubpath(studioBuildDir, pathname);
+      if (resolved) {
+        const asset = await readStaticResponse(resolved, {
+          cacheControl: 'public, max-age=3600',
+          headOnly,
+        });
+        if (asset) return asset;
+      }
+      return c.notFound();
+    }
+
+    // SPA index.html fallback for client-side routes.
+    const indexResponse = await readStaticResponse(path.join(studioBuildDir, 'index.html'), {
+      cacheControl: 'no-cache',
+      headOnly,
+    });
+    if (indexResponse) return indexResponse;
+
+    return new Response('OpenMotion Studio has not been built yet. Run npm run build:studio.', {
+      status: 503,
+      headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+    });
+  });
+
+  return { app, services };
+}
+
+// ---------------------------------------------------------------------------
+// Production / Dev Runtime Server Bootstrap & Graceful Shutdown
+// ---------------------------------------------------------------------------
+
+export interface StartApiServerOptions {
+  readonly config?: AppConfig;
+  readonly logger?: Logger;
+  readonly installSignals?: boolean;
+  readonly onShutdownComplete?: (clean: boolean) => void;
+}
+
+export async function startApiServer(options: StartApiServerOptions = {}): Promise<ApiServerHandle> {
+  const config = options.config ?? getConfig();
+  const logger =
+    options.logger ??
+    createLogger({ level: config.LOG_LEVEL, bindings: { service: 'api', role: config.WORKER_ROLE } });
+
+  const shutdown = new ShutdownCoordinator({ logger, timeoutMs: 30_000 });
+
+  const dbHandle: DbHandle = createDbHandle({
+    connectionString: config.DATABASE_URL,
+    max: config.PG_POOL_MAX,
+  });
+  shutdown.register('postgres', () => dbHandle.close());
+
+  const storage = new StorageService({
+    bucket: config.S3_BUCKET,
+    region: config.S3_REGION,
+    endpoint: config.S3_ENDPOINT,
+    publicEndpoint: config.S3_PUBLIC_ENDPOINT,
+    accessKeyId: config.S3_ACCESS_KEY_ID,
+    secretAccessKey: config.S3_SECRET_ACCESS_KEY,
+    forcePathStyle: config.S3_FORCE_PATH_STYLE,
+    defaultPresignPutTtlSec: config.S3_PRESIGN_PUT_TTL_SEC,
+    defaultPresignGetTtlSec: config.S3_PRESIGN_GET_TTL_SEC,
+    publicOrigin: config.APP_PUBLIC_ORIGIN,
+  });
+  shutdown.register('storage', () => {
+    storage.close();
+  });
+
+  const redisCmd: Redis = createRedisClient(config.REDIS_URL, 'command');
+  shutdown.register('redis-cmd', async () => {
+    await redisCmd.quit();
+  });
+
+  const redisCache: Redis =
+    config.REDIS_CACHE_URL && config.REDIS_CACHE_URL !== config.REDIS_URL
+      ? createRedisClient(config.REDIS_CACHE_URL, 'command')
+      : redisCmd;
+  if (redisCache !== redisCmd) {
+    shutdown.register('redis-cache', async () => {
+      await redisCache.quit();
+    });
+  }
+
+  const eventBus = new RedisEventBus(config.REDIS_URL);
+  shutdown.register('redis-event-bus', () => eventBus.close());
+
+  const queues = new QueueService(config.REDIS_URL);
+  shutdown.register('bullmq-queues', () => queues.close());
+
+  const hotTextCache = new HotTextCache(redisCache, config.REDIS_CACHE_TTL_SEC);
+  const rateLimiter = new RateLimiter(redisCmd);
+  const authStore = createPgAuthStore(dbHandle.db);
+  const authCache = createRedisAuthCache(redisCmd);
+  const mcpSessionStore = new RedisMcpSessionStore(redisCmd);
+
+  const { app, services } = createApiApp({
+    config,
+    db: dbHandle.db,
+    storage,
+    queues,
+    eventBus,
+    hotTextCache,
+    rateLimiter,
+    authStore,
+    authCache,
+    mcpSessionStore,
+    logger,
+    checkDbHealth: () => dbHandle.checkHealth(),
+    checkRedisHealth: async () => (await redisCmd.ping()) === 'PONG',
+  });
+
+  // In AUTH_MODE=dev, eagerly provision the dev tenant & welcome project (non-fatal if catalog isn't synced yet).
+  if (config.AUTH_MODE === 'dev') {
+    try {
+      const provisionDev = createDevTenantProvisioner(authStore, config);
+      const devAuth = await provisionDev();
+      await services.welcomeBootstrap.ensureWelcomeProject(devAuth).catch((error) => {
+        logger.warn('Startup dev welcome bootstrap skipped', { error });
+      });
+    } catch (error) {
+      logger.warn('Startup dev tenant pre-provisioning skipped', { error });
+    }
+  }
+
+  const server = await new Promise<ServerType>((resolve, reject) => {
+    let resolved = false;
+    const instance = serve(
+      {
+        fetch: app.fetch,
+        hostname: config.BIND_HOST,
+        port: config.PORT,
+      },
+      () => {
+        resolved = true;
+        resolve(instance);
+      },
+    );
+    instance.once('error', (error) => {
+      if (!resolved) reject(error);
+    });
+  });
+
+  shutdown.register('http-server', async () => {
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => (error ? reject(error) : resolve()));
+    });
+  });
+
+  if (options.installSignals !== false) {
+    shutdown.installSignalHandlers(options.onShutdownComplete);
+  }
+
+  logger.info('OpenMotion cloud API server listening', {
+    host: config.BIND_HOST,
+    port: config.PORT,
+    publicOrigin: config.APP_PUBLIC_ORIGIN,
+    authMode: config.AUTH_MODE,
+    modelGatewayMode: config.MODEL_GATEWAY_MODE,
+    version: VERSION,
+    designSystemFiles: publicDesignFiles.length,
+  });
+
+  return {
+    app,
+    services,
+    server,
+    shutdown,
+    port: config.PORT,
+    host: config.BIND_HOST,
+    close: (reason = 'manual') => shutdown.shutdown(reason),
+  };
+}
+
+function isDirectEntry(): boolean {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  return import.meta.url === pathToFileURL(path.resolve(entry)).href;
+}
+
+if (isDirectEntry()) {
+  startApiServer({ installSignals: true }).catch((error) => {
+    const logger = createLogger({ level: 'error', bindings: { service: 'api-entrypoint' } });
+    logger.error('Fatal API server startup failure', { error });
+    process.exit(1);
+  });
+}

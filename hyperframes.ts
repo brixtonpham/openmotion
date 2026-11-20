@@ -265,8 +265,7 @@ async function installed(root: string) {
 
 // Packaged plugins have no node_modules. Install the locked runtime in the writable
 // data directory; never alter the plugin cache or the user's global npm packages.
-export async function ensureRuntime(dataDirectory: string, prepareNative = true): Promise<string> {
-  if (prepareNative) await (await import('./scripts/npm-runtime.mjs')).ensureNativeRuntime(pluginRoot);
+export async function ensureRuntime(dataDirectory: string, _prepareNative = true): Promise<string> {
   if (await installed(pluginRoot)) return pluginRoot;
   const lockfile = await readFile(path.join(pluginRoot, 'package-lock.json'));
   const { createHash } = await import('node:crypto');
