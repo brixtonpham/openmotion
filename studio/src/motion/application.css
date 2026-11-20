@@ -59,10 +59,7 @@
   position: relative;
   width: 30px;
   height: 30px;
-  border: 1px solid color-mix(in srgb, var(--motion-black-friday-ink-light) 18%, transparent);
   border-radius: var(--motion-radius-step-9) !important;
-  background: transparent;
-  color: color-mix(in srgb, var(--motion-black-friday-ink-light) 72%, transparent);
   box-sizing: border-box;
   transition: background var(--motion-duration-fast) var(--motion-ease-out), border-color var(--motion-duration-fast) var(--motion-ease-out), color var(--motion-duration-fast) var(--motion-ease-out);
 }
@@ -75,7 +72,7 @@
 }
 [data-motion-studio] .om-app-header .om-account-trigger:is(:hover, :focus-visible, [aria-expanded="true"]) .om-default-avatar-icon-outline { display: none; }
 [data-motion-studio] .om-app-header .om-account-trigger:is(:hover, :focus-visible, [aria-expanded="true"]) .om-default-avatar-icon-solid { display: block; }
-[data-motion-studio][data-theme="paper"] .om-app-header :is(.motion-github-link, .om-account-trigger .om-avatar) { border-color: var(--color-border-input); color: var(--motion-dim); }
+[data-motion-studio][data-theme="paper"] .om-app-header .motion-github-link { border-color: var(--color-border-input); color: var(--motion-dim); }
 [data-motion-studio][data-theme="paper"] .om-app-header .motion-github-link:is(:hover, :focus-visible),
 [data-motion-studio][data-theme="paper"] .om-app-header .om-account-trigger:is(:hover, :focus-visible, [aria-expanded="true"]) .om-avatar { background: var(--color-hover); border-color: var(--motion-border-strong); color: var(--motion-strong); }
 .om-account-menu { width: 258px; max-width: calc(100vw - 24px); }
@@ -191,7 +188,8 @@
 .om-endpoint-preview { overflow-wrap: anywhere; margin: 0; }
 .om-dialog-actions { display: flex; justify-content: flex-end; gap: var(--motion-space-8); padding-top: var(--motion-space-12); border-top: 1px solid var(--motion-border-subtle); }
 .om-account-identity { display: grid; justify-items: center; gap: var(--motion-space-8); text-align: center; padding-block: var(--motion-space-8); }
-.om-account-identity .om-avatar { width: 56px; height: 56px; border-radius: var(--motion-radius-full); margin-bottom: var(--motion-space-4); }
+.om-account-identity .om-avatar { width: 56px; height: 56px; margin-bottom: var(--motion-space-4); }
+.om-account-identity .om-avatar:not(.om-account-guest-avatar) { border-radius: var(--motion-radius-full); }
 .om-account-summary { display: flex; gap: var(--motion-space-24); align-items: center; }
 .om-account-summary > div:first-child { flex: 1; display: grid; justify-items: start; gap: var(--motion-space-12); }
 .om-account-callout { display: flex; align-items: center; gap: var(--motion-space-16); padding: var(--motion-space-12) var(--motion-space-16); }
@@ -674,8 +672,29 @@
 .om-plan-guide .om-plan-name { font-size: var(--motion-text-display-sm); }
 .om-plan-guide > p { margin: 0; }
 .om-plan-guide .om-settings-actions { margin-top: var(--motion-space-4); }
+.om-plan-guide[data-guide="sign-in"] { container: sign-in-guide / inline-size; }
+.om-plan-guide[data-guide="sign-in"] > .om-settings-actions { flex-wrap: nowrap; gap: var(--motion-space-12) var(--motion-space-16); }
+.om-plan-guide[data-guide="sign-in"] > .om-settings-actions > button { flex: none; }
 .om-account-capabilities { display: flex; flex-wrap: wrap; gap: var(--motion-space-8); margin: 0; padding: 0; list-style: none; }
 .om-account-capabilities li { display: inline-flex; align-items: center; gap: var(--motion-space-6); padding: var(--motion-space-4) var(--motion-space-12); border: 1px solid var(--motion-border-subtle); border-radius: var(--motion-radius-full); font-size: var(--motion-text-sm); }
 .om-account-capabilities svg { color: var(--motion-accent); }
 .om-account-offer { display: flex; flex-wrap: wrap; align-items: center; gap: var(--motion-space-6); margin: 0; font-size: var(--motion-text-sm); }
 .om-account-offer svg, .om-account-offer strong { color: var(--motion-accent); }
+.om-account-offer-callout { position: relative; min-width: 0; padding: var(--motion-space-8) var(--motion-space-12); }
+.om-account-offer-callout::before {
+  content: "";
+  position: absolute;
+  inset-block-start: 50%;
+  inset-inline-start: calc(-1 * var(--motion-space-4));
+  width: var(--motion-space-8);
+  height: var(--motion-space-8);
+  transform: translateY(-50%) rotate(45deg);
+}
+@container sign-in-guide (max-width: 450px) {
+  .om-plan-guide[data-guide="sign-in"] > .om-settings-actions { flex-direction: column; align-items: flex-start; }
+  .om-account-offer-callout::before {
+    inset-block-start: calc(-1 * var(--motion-space-4));
+    inset-inline-start: var(--motion-space-16);
+    transform: rotate(45deg);
+  }
+}

@@ -3,6 +3,7 @@ import { IconButton } from 'open-design-ui/icon-button';
 import * as tracking from './pageTracking';
 import { Tooltip } from "../components/ui/Tooltip";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
+import { designSystemAsset, providerIcons } from '../../../packages/design-system/index.js';
 import type { AccountSummary } from '../../../shared/provider-directory';
 import { RemixIcon } from '../icons/RemixIcons';
 import { useI18n } from '../i18n/I18n';
@@ -48,22 +49,24 @@ export function upgradePlan(account: AccountSummary | null | undefined): 'free' 
   return plan === 'free' || plan === 'go' ? plan : undefined;
 }
 
-function GuideExtras() {
+function GuideCapabilities() {
+  const { t } = useI18n();
+  return <ul className="om-account-capabilities" aria-label={t('Multimodal')}>{MULTIMODAL_CAPABILITIES.map(item => <li key={item.label}><RemixIcon name={item.icon} size={16} />{t(item.label)}</li>)}</ul>;
+}
+
+function GuideOffer({ callout = false }: { callout?: boolean }) {
   const { t } = useI18n(), offer = activeAccountOffer();
-  return <>
-    <ul className="om-account-capabilities" aria-label={t('Multimodal')}>{MULTIMODAL_CAPABILITIES.map(item => <li key={item.label}><RemixIcon name={item.icon} size={16} />{t(item.label)}</li>)}</ul>
-    {offer && <p className="om-account-offer"><RemixIcon name="sparkling-fill" size={15} /><strong>{t(offer.title)}</strong><span>{t(offer.detail)}</span></p>}
-  </>;
+  return offer && <p className={callout ? 'om-account-offer om-account-offer-callout' : 'om-account-offer'}><RemixIcon name="sparkling-fill" size={15} /><strong>{t(offer.title)}</strong><span>{t(offer.detail)}</span></p>;
 }
 
 /** Signed-out guide shared by the account page and the OpenDesign provider: what signing in unlocks. */
 export function SignInGuide({ action }: { action: ReactNode }) {
   const { t } = useI18n();
   return <section className="om-card om-plan-guide" data-guide="sign-in">
-    <div className="om-plan-guide-head"><h2 className="om-title">{t('Sign in to start multimodal generation')}</h2><span className="om-badge" data-active="true">{t('Plus and above')}</span></div>
-    <p className="om-muted">{t('Sign in, then upgrade to Plus to generate images, video, voiceovers and music right in OpenMotion. No API keys to set up.')}</p>
-    <GuideExtras />
-    <div className="om-settings-actions">{action}</div>
+    <div className="om-plan-guide-head"><h2 className="om-title">{t('Sign in to start multimodal generation')}</h2><span className="om-badge">{t('Plus and above')}</span></div>
+    <p className="om-muted" data-quiet>{t('Sign in, then upgrade to Plus to generate images, video, voiceovers and music right in OpenMotion. No API keys to set up.')}</p>
+    <GuideCapabilities />
+    <div className="om-settings-actions">{action}<GuideOffer callout /></div>
   </section>;
 }
 
@@ -73,7 +76,8 @@ export function UpgradeGuide({ plan, subscription }: { plan: 'free' | 'go'; subs
   return <section className="om-card om-plan-guide" data-guide="upgrade">
     <div className="om-plan-guide-head"><h2 className="om-title om-plan-name">{plan === 'free' ? t('Free plan') : 'Go'}</h2><span className="om-badge">{t('Current plan')}</span></div>
     <p className="om-muted">{t('Upgrade to Plus to generate images, video, voiceovers and music. Pro and Max include them too.')}</p>
-    <GuideExtras />
+    <GuideCapabilities />
+    <GuideOffer />
     <div className="om-settings-actions">{subscription.button('view_plans', true)}{subscription.button('manage_subscription')}{subscription.link}</div>
   </section>;
 }
@@ -154,7 +158,10 @@ export function AccountStatus({ account, busy, action, showToast }: { account: A
   const signedIn = account.state === 'signed-in', pending = account.state === 'authorizing', expired = account.state === 'reauth-required';
   const syncing = pending && account.syncing, failure = !pending && !signedIn ? account.errorCode : undefined;
   const retry = failure === 'setup_failed' || failure === 'connector_unavailable';
-  const signIn = <Button variant="ghost" className="om-button h-auto" data-primary disabled={busy} onClick={() => void action('login')}><RemixIcon name={retry ? 'refresh-line' : 'login-box-line'} size={17} />{t(retry ? 'Retry' : expired || failure ? 'Sign in again' : 'Sign in with OpenDesign')}</Button>;
+  const signInIcon = expired || failure
+    ? <RemixIcon name={retry ? 'refresh-line' : 'login-box-line'} size={17} />
+    : <img src={designSystemAsset(providerIcons.opendesign.file)} width={17} height={17} alt="" />;
+  const signIn = <Button variant="ghost" className="om-button h-auto" data-primary disabled={busy} onClick={() => void action('login')}>{signInIcon}{t(retry ? 'Retry' : expired || failure ? 'Sign in again' : 'Sign in with OpenDesign')}</Button>;
   // When the service cannot install the sign-in component itself, this command installs it where the service looks,
   // independent of the terminal's PATH; Retry then finds it without a restart.
   const command = failure === 'connector_unavailable' ? account.connectorInstall?.command : undefined;
@@ -185,9 +192,14 @@ export function AccountSettings({ subscription = false, openProviders }: { subsc
   const account = state.account;
   const plan = upgradePlan(account), upgradeGuide = Boolean(plan);
   const name = account?.user?.name?.trim(), email = account?.user?.email, named = Boolean(name) && name!.toLowerCase() !== email?.toLowerCase();
+  const showGuestAvatar = !signedIn;
   return <div className="om-settings-page">
     {state.error ? <SettingsError retry={() => void state.refresh(true)} /> : !account ? <SettingsLoading /> : <>
-      <div className="om-account-identity"><span className="om-avatar"><RemixIcon name="user-3-line" size={36} /></span><h1 className="om-title">{subscription ? t('Subscription & usage') : named ? name : email || t('Your OpenDesign account')}</h1><p className="om-muted">{(subscription || named) && email ? email : t('Your creative workspace, connected.')}</p></div>
+      <div className="om-account-identity">
+        <span className={showGuestAvatar ? 'om-avatar om-account-guest-avatar' : 'om-avatar'}><RemixIcon name="user-3-line" size={showGuestAvatar ? 26 : 36} /></span>
+        <h1 className="om-title">{subscription ? t('Subscription & usage') : named ? name : email || t('Your OpenDesign account')}</h1>
+        <p className="om-muted">{(subscription || named) && email ? email : t('Your creative workspace, connected.')}</p>
+      </div>
       <AccountStatus account={account} busy={busy} action={action} showToast={toast.showToast} />
       {plan && <UpgradeGuide plan={plan} subscription={subscriptionOpener} />}
       <section className="om-settings-section"><div className="om-settings-row"><h2 className="om-subtitle">{t('Subscription & usage')}</h2>{signedIn && <Tooltip label={t('Refresh account')} wrap><IconButton variant="ghost" className="motion-icon-button" aria-label={t('Refresh account')} disabled={refreshing} aria-busy={refreshing} onClick={() => void refreshUsage()} icon={<RemixIcon name={refreshing ? 'loader-4-line' : 'refresh-line'} size={17} className={refreshing ? 'animate-spin motion-reduce:animate-none' : undefined} />} /></Tooltip>}</div>
@@ -195,7 +207,7 @@ export function AccountSettings({ subscription = false, openProviders }: { subsc
         {signedIn && account.billingUnavailable && <div className="om-settings-row"><p className="om-muted">{t(account.billingError?.status === 403 ? "The billing service declined this request. Open Manage subscription to check your plan in OpenDesign." : "Couldn't load your plan and balance. Account models are unaffected and can be used as usual.")}</p><Button variant="ghost" className="om-button h-auto" disabled={refreshing} aria-busy={refreshing} onClick={() => void refreshUsage()}><RemixIcon name={refreshing ? 'loader-4-line' : 'refresh-line'} size={15} className={refreshing ? 'animate-spin motion-reduce:animate-none' : undefined} />{t('Refresh')}</Button></div>}
         {signedIn && !upgradeGuide && <>{subscriptionOpener.button('manage_subscription')}{subscriptionOpener.link}</>}
       </section>
-      <section className="om-card om-settings-row"><div><h2 className="om-subtitle">{t('Your models, your choice')}</h2><p className="om-muted">{t('Use account models or connect your own API keys. Choose a default for each capability.')}</p></div><Button variant="ghost" className="om-button h-auto" onClick={openProviders}>{t('Model providers')}<RemixIcon name="arrow-right-line" size={15} /></Button></section>
+      <section className="om-card om-settings-row"><div><h2 className="om-subtitle">{t('Your models, your choice')}</h2><p className="om-muted" data-quiet>{t('Use account models or connect your own API keys. Choose a default for each capability.')}</p></div><Button variant="ghost" className="om-button h-auto" onClick={openProviders}>{t('Model providers')}<RemixIcon name="arrow-right-line" size={15} /></Button></section>
     </>}
     <StudioToastViewport {...toast} />
   </div>;
