@@ -16,13 +16,18 @@ const optionalNonEmptyString = z.preprocess((value) => {
 }, z.string().min(1).optional());
 
 const optionalUrl = z.preprocess((value) => {
-  if (typeof value === 'string' && value.trim() === '') return undefined;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return trimmed === '' ? undefined : trimmed;
+  }
   return value;
 }, z.string().url().optional());
 
 const rawConfigSchema = z.object({
   // Core service
   APP_PUBLIC_ORIGIN: z.string().url().default('http://127.0.0.1:4173'),
+  PREVIEW_PUBLIC_ORIGIN: optionalUrl,
+  PREVIEW_TOKEN_TTL_SEC: z.coerce.number().int().positive().default(900),
   PORT: z.coerce.number().int().min(1).max(65535).default(4173),
   BIND_HOST: z.string().min(1).default('0.0.0.0'),
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
@@ -48,6 +53,7 @@ const rawConfigSchema = z.object({
   S3_FORCE_PATH_STYLE: booleanEnv.default(true),
   S3_PRESIGN_PUT_TTL_SEC: z.coerce.number().int().min(30).max(86_400).default(900),
   S3_PRESIGN_GET_TTL_SEC: z.coerce.number().int().min(30).max(86_400).default(300),
+  S3_PRESIGN_CACHE_WINDOW_SEC: z.coerce.number().int().positive().default(3600),
 
   // Auth & sessions
   AUTH_MODE: z.enum(['oidc', 'dev']).default('oidc'),
@@ -83,10 +89,11 @@ const rawConfigSchema = z.object({
   OPENDESIGN_BILLING_SYNC_ENABLED: booleanEnv.default(false),
   ALLOW_DOH_FAKEIP_FALLBACK: booleanEnv.default(false),
 
-  // Worker tuning & GC
+  // Worker tuning, history coalescing & GC
   MEDIA_CONCURRENCY: z.coerce.number().int().min(1).max(100).default(20),
   RENDER_CONCURRENCY: z.coerce.number().int().min(1).max(4).default(1),
-  BLOB_GC_GRACE_SECONDS: z.coerce.number().int().min(0).default(86_400),
+  BLOB_GC_GRACE_SECONDS: z.coerce.number().int().min(0).default(604_800),
+  HISTORY_COALESCE_WINDOW_MS: z.coerce.number().int().min(0).default(4000),
 });
 
 export type AppConfig = z.infer<typeof rawConfigSchema>;

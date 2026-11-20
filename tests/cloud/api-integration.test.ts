@@ -14,6 +14,11 @@ import {
   createBrowserSession,
   createPat,
 } from '../../src/auth/index.ts';
+import {
+  resolvePreviewTokenSecret,
+  signPreviewToken,
+  verifyPreviewToken,
+} from '../../src/auth/preview-token.ts';
 import { DEFAULT_PAT_SCOPES, type AuthContext } from '../../src/contracts/auth.ts';
 import { CloudError } from '../../src/contracts/errors.ts';
 import type { RenderWorkerHealth } from '../../src/contracts/events.ts';
@@ -28,6 +33,7 @@ import type { Database } from '../../src/db/client.ts';
 import * as schema from '../../src/db/schema/index.ts';
 import {
   createApiApp,
+  resolveApiCorsAllowedOrigins,
   type ApiEventBusPort,
   type ApiQueuesPort,
   type CreateApiAppDeps,
@@ -1718,5 +1724,293 @@ describe('Cloud API Entrypoint — Studio UI Wiring Parity (/preview/open, Works
     const motionHealthRes = await app.request('/motion-api/health');
     assert.equal(motionHealthRes.status, 200);
     assert.ok(((await motionHealthRes.json()) as { version?: string }).version);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 7. Comment c5 — Cookie-less Preview Subdomain Isolation & Unified Config
+// ---------------------------------------------------------------------------
+
+describe('Cloud API Entrypoint — Unified Config & Cookie-less Preview Subdomain Isolation (c5)', () => {
+  it('validates c1/c2/c3/c4/c5 config defaults, trimming, bounds, and S3 CORS origin inclusion', () => {
+    const defaults = makeConfig();
+    assert.equal(defaults.BLOB_GC_GRACE_SECONDS, 604_800);
+    assert.equal(defaults.S3_PRESIGN_CACHE_WINDOW_SEC, 3600);
+    assert.equal(defaults.PREVIEW_PUBLIC_ORIGIN, undefined);
+    assert.equal(defaults.PREVIEW_TOKEN_TTL_SEC, 900);
+    assert.equal(defaults.HISTORY_COALESCE_WINDOW_MS, 4000);
+    assert.deepEqual(resolveApiCorsAllowedOrigins(defaults), ['https://motion.example.test']);
+
+    const configured = makeConfig({
+      PREVIEW_PUBLIC_ORIGIN: '  https://preview.openmotion.test  ',
+      PREVIEW_TOKEN_TTL_SEC: '600',
+      S3_PRESIGN_CACHE_WINDOW_SEC: '1800',
+      HISTORY_COALESCE_WINDOW_MS: '0',
+    });
+    assert.equal(configured.PREVIEW_PUBLIC_ORIGIN, 'https://preview.openmotion.test');
+    assert.equal(configured.PREVIEW_TOKEN_TTL_SEC, 600);
+    assert.equal(configured.S3_PRESIGN_CACHE_WINDOW_SEC, 1800);
+    assert.equal(configured.HISTORY_COALESCE_WINDOW_MS, 0);
+    assert.deepEqual(resolveApiCorsAllowedOrigins(configured), [
+      'https://motion.example.test',
+      'https://preview.openmotion.test',
+    ]);
+
+    assert.throws(() => makeConfig({ S3_PRESIGN_CACHE_WINDOW_SEC: '0' }), /INVALID_CONFIG/);
+    assert.throws(() => makeConfig({ PREVIEW_TOKEN_TTL_SEC: '0' }), /INVALID_CONFIG/);
+    assert.throws(() => makeConfig({ PREVIEW_PUBLIC_ORIGIN: 'not-a-url' }), /INVALID_CONFIG/);
+    assert.throws(() => makeConfig({ HISTORY_COALESCE_WINDOW_MS: '-1' }), /INVALID_CONFIG/);
+  });
+
+  it('enforces strict preview host isolation (403 PREVIEW_ORIGIN_ISOLATED), ignores cookies, and validates scoped preview tokens', async () => {
+    const fixture = createApiFixture({
+      config: {
+        AUTH_MODE: 'oidc',
+        APP_PUBLIC_ORIGIN: 'https://motion.example.test',
+        PREVIEW_PUBLIC_ORIGIN: 'https://preview.openmotion.test',
+        PREVIEW_TOKEN_TTL_SEC: '900',
+        TRUST_PROXY_HOPS: '1',
+      },
+    });
+    const { app, config, authStore, pgClient } = fixture;
+
+    const userId = randomUUID();
+    const workspaceId = randomUUID();
+    authStore.seedWorkspace({
+      workspaceId,
+      userId,
+      oidcSub: 'oidc-preview-isolation-1',
+      email: 'preview@example.test',
+      displayName: 'Preview Creator',
+      role: 'owner',
+      slug: 'preview-ws',
+      name: 'Preview Workspace',
+    });
+    pgClient.seed('workspaces', {
+      id: workspaceId,
+      slug: 'preview-ws',
+      name: 'Preview Workspace',
+      owner_user_id: userId,
+      active_project_id: null,
+      default_models: {},
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+
+    const browserSession = await createBrowserSession(authStore, { userId, workspaceId });
+    const cookieHeader = `${SESSION_COOKIE_NAME}=${browserSession.token}`;
+    const mainMutateHeaders = {
+      Cookie: cookieHeader,
+      Origin: 'https://motion.example.test',
+      'Content-Type': 'application/json',
+    };
+
+    // /__hyperframes_config exposes previewOrigin on main host
+    const cfgRes = await app.request('/__hyperframes_config');
+    assert.equal(cfgRes.status, 200);
+    const cfgBody = (await cfgRes.json()) as { previewOrigin: string | null };
+    assert.equal(cfgBody.previewOrigin, 'https://preview.openmotion.test');
+
+    // Create two projects on the main origin
+    const createA = await app.request('/motion-api/projects', {
+      method: 'POST',
+      headers: mainMutateHeaders,
+      body: JSON.stringify({ title: 'Project Alpha' }),
+    });
+    assert.equal(createA.status, 201);
+    const projectA = ((await createA.json()) as { projectId: string }).projectId;
+
+    const createB = await app.request('/motion-api/projects', {
+      method: 'POST',
+      headers: mainMutateHeaders,
+      body: JSON.stringify({ title: 'Project Beta' }),
+    });
+    assert.equal(createB.status, 201);
+    const projectB = ((await createB.json()) as { projectId: string }).projectId;
+
+    // Mint a project-scoped preview token on the main origin
+    const tokenRes = await app.request(`/api/projects/${projectA}/preview-token`, {
+      method: 'POST',
+      headers: mainMutateHeaders,
+    });
+    assert.equal(tokenRes.status, 200);
+    assert.equal(tokenRes.headers.get('cache-control'), 'no-store');
+    const minted = (await tokenRes.json()) as {
+      token: string;
+      expiresAt: string;
+      previewOrigin: string | null;
+      previewUrl: string;
+    };
+    assert.equal(minted.previewOrigin, 'https://preview.openmotion.test');
+    assert.ok(minted.previewUrl.startsWith(`https://preview.openmotion.test/api/projects/${projectA}/preview?pt=`));
+    assert.ok(Date.parse(minted.expiresAt) > Date.now());
+
+    // Unit-check token payload verification directly
+    const secret = resolvePreviewTokenSecret(config);
+    const decoded = verifyPreviewToken(minted.token, secret, { expectedProjectId: projectA });
+    assert.ok(decoded);
+    assert.equal(decoded.typ, 'om_preview');
+    assert.equal(decoded.wid, workspaceId);
+    assert.equal(decoded.pid, projectA);
+    assert.equal(verifyPreviewToken(minted.token, secret, { expectedProjectId: projectB }), null);
+
+    // 1. Preview host IMMEDIATELY REJECTS /motion-api/*, /auth/*, /oauth/*, /mcp, files, preview-token & mutations with 403 PREVIEW_ORIGIN_ISOLATED
+    const blockedRequests: Array<{ method: string; path: string; hostHeader: Record<string, string> }> = [
+      { method: 'GET', path: '/motion-api/projects', hostHeader: { Host: 'preview.openmotion.test' } },
+      { method: 'GET', path: '/auth/me', hostHeader: { Host: 'preview.openmotion.test' } },
+      { method: 'POST', path: '/oauth/token', hostHeader: { Host: 'preview.openmotion.test' } },
+      { method: 'POST', path: '/mcp', hostHeader: { 'X-Forwarded-Host': 'preview.openmotion.test' } },
+      { method: 'GET', path: `/api/projects/${projectA}/files/index.html`, hostHeader: { Host: 'preview.openmotion.test' } },
+      { method: 'POST', path: `/api/projects/${projectA}/preview-token`, hostHeader: { Host: 'preview.openmotion.test' } },
+      { method: 'DELETE', path: `/api/projects/${projectA}/preview`, hostHeader: { Host: 'preview.openmotion.test' } },
+    ];
+    for (const entry of blockedRequests) {
+      const res = await app.request(entry.path, {
+        method: entry.method,
+        headers: {
+          ...entry.hostHeader,
+          Cookie: cookieHeader,
+        },
+      });
+      assert.equal(res.status, 403, `expected 403 on preview host for ${entry.method} ${entry.path}`);
+      const body = (await res.json()) as { code: string };
+      assert.equal(body.code, 'PREVIEW_ORIGIN_ISOLATED');
+      assert.equal(
+        res.headers.get('content-security-policy'),
+        "frame-ancestors 'self' https://motion.example.test;",
+      );
+      assert.equal(res.headers.get('referrer-policy'), 'no-referrer');
+      assert.equal(res.headers.get('x-content-type-options'), 'nosniff');
+      assert.equal(res.headers.get('set-cookie'), null);
+    }
+
+    // 2. Preview host IGNORES browser session cookies on /api/projects/:id/preview (requires scoped preview token!)
+    const cookieOnlyPreview = await app.request(`/api/projects/${projectA}/preview`, {
+      headers: {
+        Host: 'preview.openmotion.test',
+        Cookie: cookieHeader,
+      },
+    });
+    assert.equal(cookieOnlyPreview.status, 401);
+
+    // 3. Valid scoped preview token via ?pt=... AND X-OpenMotion-Preview-Token succeeds on preview host with security headers
+    const viaQuery = await app.request(
+      `/api/projects/${projectA}/preview?pt=${encodeURIComponent(minted.token)}`,
+      { headers: { Host: 'preview.openmotion.test' } },
+    );
+    assert.equal(viaQuery.status, 200);
+    assert.equal(
+      viaQuery.headers.get('content-security-policy'),
+      "frame-ancestors 'self' https://motion.example.test;",
+    );
+    assert.equal(viaQuery.headers.get('referrer-policy'), 'no-referrer');
+    assert.equal(viaQuery.headers.get('x-content-type-options'), 'nosniff');
+    assert.equal(viaQuery.headers.get('set-cookie'), null);
+    assert.match(await viaQuery.text(), /Project Alpha/);
+
+    const viaHeader = await app.request(`/api/projects/${projectA}/preview`, {
+      headers: {
+        'X-Forwarded-Host': 'preview.openmotion.test',
+        'X-OpenMotion-Preview-Token': minted.token,
+      },
+    });
+    assert.equal(viaHeader.status, 200);
+
+    // 4. Cross-project preview token is rejected (401)
+    const crossProject = await app.request(
+      `/api/projects/${projectB}/preview?pt=${encodeURIComponent(minted.token)}`,
+      { headers: { Host: 'preview.openmotion.test' } },
+    );
+    assert.equal(crossProject.status, 401);
+
+    // 5. Expired preview token is rejected (401)
+    const expired = signPreviewToken(
+      { workspaceId, projectId: projectA, ttlSec: 60, nowMs: Date.now() - 120_000 },
+      secret,
+    );
+    const expiredRes = await app.request(
+      `/api/projects/${projectA}/preview?pt=${encodeURIComponent(expired.token)}`,
+      { headers: { Host: 'preview.openmotion.test' } },
+    );
+    assert.equal(expiredRes.status, 401);
+
+    // 6. Preview token is NEVER accepted as a Bearer token on main-origin /motion-api/* or /mcp
+    const mainApiWithPreviewToken = await app.request('/motion-api/projects', {
+      headers: { Authorization: `Bearer ${minted.token}` },
+    });
+    assert.equal(mainApiWithPreviewToken.status, 401);
+
+    const mcpWithPreviewToken = await app.request('/mcp', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${minted.token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }),
+    });
+    assert.equal(mcpWithPreviewToken.status, 401);
+
+    // 7. Read-only runtime/vendor/fonts/health/OPTIONS routes remain reachable on the preview host
+    for (const allowedPath of [
+      '/api/runtime.js',
+      '/api/vendor/gsap/gsap.min.js',
+      '/api/fonts',
+      '/api/health/live',
+    ]) {
+      const res = await app.request(allowedPath, {
+        headers: { Host: 'preview.openmotion.test' },
+      });
+      assert.equal(res.status, 200, `expected 200 on preview host for ${allowedPath}`);
+      assert.equal(res.headers.get('referrer-policy'), 'no-referrer');
+      assert.equal(res.headers.get('x-content-type-options'), 'nosniff');
+    }
+
+    const optRes = await app.request(`/api/projects/${projectA}/preview`, {
+      method: 'OPTIONS',
+      headers: {
+        Host: 'preview.openmotion.test',
+        Origin: 'https://motion.example.test',
+      },
+    });
+    assert.equal(optRes.status, 204);
+    assert.equal(optRes.headers.get('access-control-allow-origin'), 'https://motion.example.test');
+    assert.equal(optRes.headers.get('access-control-allow-credentials'), null);
+
+    // 8. Even in AUTH_MODE=dev, preview host never falls back to dev_bypass without a valid preview token
+    const devIsolated = createApiFixture({
+      config: {
+        AUTH_MODE: 'dev',
+        APP_PUBLIC_ORIGIN: 'https://motion.example.test',
+        PREVIEW_PUBLIC_ORIGIN: 'https://preview.openmotion.test',
+      },
+    });
+    const devProjRes = await devIsolated.app.request('/motion-api/projects', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'Dev Isolated' }),
+    });
+    const devProjId = ((await devProjRes.json()) as { projectId: string }).projectId;
+    const devUnauthPreview = await devIsolated.app.request(`/api/projects/${devProjId}/preview`, {
+      headers: { Host: 'preview.openmotion.test' },
+    });
+    assert.equal(devUnauthPreview.status, 401);
+
+    // 9. When PREVIEW_PUBLIC_ORIGIN is unset (local Compose dev), /__hyperframes_config reports previewOrigin: null and single-host preview works seamlessly
+    const localDev = createApiFixture({ config: { AUTH_MODE: 'dev' } });
+    const localCfg = (await (await localDev.app.request('/__hyperframes_config')).json()) as {
+      previewOrigin: string | null;
+    };
+    assert.equal(localCfg.previewOrigin, null);
+    const localProjId = (
+      (await (
+        await localDev.app.request('/motion-api/projects', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ title: 'Single Host Local' }),
+        })
+      ).json()) as { projectId: string }
+    ).projectId;
+    const localPreview = await localDev.app.request(`/api/projects/${localProjId}/preview`);
+    assert.equal(localPreview.status, 200);
   });
 });

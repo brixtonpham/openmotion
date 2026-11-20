@@ -9,7 +9,7 @@ import { applyWorkspaceBlobRefDeltas, type BlobRefDelta } from '../db/cas.ts';
 import type { Database, DbExecutor } from '../db/client.ts';
 import { asInsert, asUpdate } from '../db/helpers.ts';
 import { catalogTemplateFiles, workspaceBlobs } from '../db/schema/blobs-assets.ts';
-import { idempotencyReceipts } from '../db/schema/jobs.ts';
+import { idempotencyReceipts, jobs } from '../db/schema/jobs.ts';
 import {
   projectFiles,
   projectHistoryEntries,
@@ -43,6 +43,7 @@ import {
 
 export const MAX_TEXT_FILE_BYTES = 16 * 1024 * 1024;
 export const MAX_BATCH_FILE_OPS = 256;
+export const DEFAULT_HISTORY_COALESCE_WINDOW_MS = 4000;
 const GC_RETRY_ATTEMPTS = 3;
 
 export interface HotTextCachePort {
@@ -61,6 +62,10 @@ export interface ProjectFilesServiceDeps {
   readonly storage: StoragePort;
   readonly hotTextCache?: HotTextCachePort;
   readonly eventBus?: EventBusPort;
+  /** Coalesce rapid interactive Studio edits within this window (ms). Set 0 to disable coalescing. Defaults to 4000ms. */
+  readonly historyCoalesceWindowMs?: number;
+  /** Optional clock provider for deterministic tests. Defaults to `() => new Date()`. */
+  readonly now?: () => Date;
 }
 
 export type ProjectFileOp =
@@ -107,6 +112,7 @@ export interface CommitProjectFilesInput {
   readonly filePreconditions?: readonly FilePrecondition[];
   readonly requestId?: string;
   readonly idempotencyScope?: string;
+  readonly origin?: 'studio' | 'mcp' | 'agent' | 'import' | 'system';
   readonly source?: ProjectVersionSource;
   readonly summary?: string;
   readonly actorKind?: HistoryActorKind;
@@ -135,6 +141,7 @@ export interface CommitProjectFilesResult {
   readonly affectsPreview: boolean;
   readonly affectedCompositions: string[];
   readonly replayed: boolean;
+  readonly coalesced?: boolean;
 }
 
 export interface ReadTextFileResult {
@@ -264,12 +271,19 @@ export class ProjectFilesService {
   private readonly storage: StoragePort;
   private readonly hotTextCache?: HotTextCachePort;
   private readonly eventBus?: EventBusPort;
+  private readonly historyCoalesceWindowMs: number;
+  private readonly nowFn: () => Date;
 
   constructor(deps: ProjectFilesServiceDeps) {
     this.db = deps.db;
     this.storage = deps.storage;
     this.hotTextCache = deps.hotTextCache;
     this.eventBus = deps.eventBus;
+    this.historyCoalesceWindowMs = Math.max(
+      0,
+      Math.floor(deps.historyCoalesceWindowMs ?? DEFAULT_HISTORY_COALESCE_WINDOW_MS),
+    );
+    this.nowFn = deps.now ?? (() => new Date());
   }
 
   /**
@@ -932,18 +946,164 @@ export class ProjectFilesService {
       const hasFileChanges = changedPaths.size > 0 || deletedPaths.size > 0;
       const hasProjectUpdates = Boolean(input.projectUpdates && Object.keys(input.projectUpdates).length > 0);
       const shouldCreateVersion = !input.skipVersion && (hasFileChanges || Boolean(input.forceVersion));
+      const now = this.nowFn();
+      const actor = actorDefaults(ctx, input.actorKind, input.actorName);
+      const safeWindowId = input.windowId && isUuid(input.windowId) ? input.windowId : null;
+      const effectiveSource: ProjectVersionSource = input.source ?? 'studio';
+      const summary = (
+        input.summary?.trim() ||
+        buildAutoSummary([...changedPaths], [...deletedPaths])
+      ).slice(0, 256);
 
-      // 6. Compute net workspace CAS blob refcount deltas across live project_files + new version snapshot.
+      // 5b. High-frequency Studio edit-window coalescing check (c2):
+      // Coalesce rapid interactive Studio edits into the unpinned, non-export-referenced head version
+      // using delta project_version_files upserts/deletes instead of duplicating all N project files.
+      let coalesceTarget: {
+        versionId: string;
+        historyEntryId: string;
+        touchedVersionFiles: Map<string, { blobScope: BlobScope; sha256: string }>;
+      } | null = null;
+
+      const isInteractiveStudioEdit =
+        effectiveSource === 'studio' &&
+        (input.origin === undefined || input.origin === 'studio') &&
+        input.actorKind !== 'agent' &&
+        input.actorKind !== 'system' &&
+        !input.forceVersion;
+
+      if (
+        shouldCreateVersion &&
+        hasFileChanges &&
+        this.historyCoalesceWindowMs > 0 &&
+        isInteractiveStudioEdit &&
+        currentVersionId !== null &&
+        project.currentHistorySeq > 0
+      ) {
+        const headVersionRows = await tx
+          .select()
+          .from(projectVersions)
+          .where(
+            and(
+              eq(projectVersions.workspaceId, ctx.workspaceId),
+              eq(projectVersions.projectId, project.id),
+              eq(projectVersions.id, currentVersionId),
+            ),
+          )
+          .limit(1);
+        const headEntryRows = await tx
+          .select()
+          .from(projectHistoryEntries)
+          .where(
+            and(
+              eq(projectHistoryEntries.workspaceId, ctx.workspaceId),
+              eq(projectHistoryEntries.projectId, project.id),
+              eq(projectHistoryEntries.seq, project.currentHistorySeq),
+            ),
+          )
+          .limit(1);
+        const maxSeqRows = await tx
+          .select({ maxSeq: sql<number>`COALESCE(MAX(${projectHistoryEntries.seq}), 0)` })
+          .from(projectHistoryEntries)
+          .where(
+            and(
+              eq(projectHistoryEntries.workspaceId, ctx.workspaceId),
+              eq(projectHistoryEntries.projectId, project.id),
+            ),
+          );
+
+        const headVersion = headVersionRows[0];
+        const headEntry = headEntryRows[0];
+        const maxHistorySeq = Number(maxSeqRows[0]?.maxSeq ?? 0);
+
+        if (
+          headVersion &&
+          headEntry &&
+          headEntry.versionId === currentVersionId &&
+          !headVersion.pinned &&
+          !headEntry.pinned &&
+          !headEntry.undone &&
+          headVersion.source === 'studio' &&
+          headVersion.revision.trim() === currentRevision &&
+          project.currentHistorySeq === maxHistorySeq &&
+          headEntry.actorKind === actor.actorKind &&
+          headEntry.actorName === actor.actorName &&
+          (safeWindowId === null || headEntry.windowId === safeWindowId)
+        ) {
+          const headReferenceMs = Math.min(headEntry.startedAt.getTime(), headEntry.endedAt.getTime());
+          const elapsedMs = now.getTime() - headReferenceMs;
+          if (elapsedMs >= 0 && elapsedMs <= this.historyCoalesceWindowMs) {
+            // Guarantee frozen export / worker snapshots are strictly immutable:
+            // never mutate a version referenced by any `jobs` row (`version_id` or `input_payload.versionId`).
+            const projectJobs = await tx
+              .select({
+                id: jobs.id,
+                versionId: jobs.versionId,
+                inputPayload: jobs.inputPayload,
+              })
+              .from(jobs)
+              .where(and(eq(jobs.workspaceId, ctx.workspaceId), eq(jobs.projectId, project.id)));
+
+            const referencedByJob = projectJobs.some((job) => {
+              if (job.versionId === currentVersionId) return true;
+              const payload = job.inputPayload as Record<string, unknown> | null | undefined;
+              return typeof payload?.versionId === 'string' && payload.versionId === currentVersionId;
+            });
+
+            if (!referencedByJob) {
+              const touchedPaths = [...new Set([...changedPaths, ...deletedPaths])];
+              const existingVerFiles =
+                touchedPaths.length > 0
+                  ? await tx
+                      .select({
+                        path: projectVersionFiles.path,
+                        blobScope: projectVersionFiles.blobScope,
+                        sha256: projectVersionFiles.sha256,
+                      })
+                      .from(projectVersionFiles)
+                      .where(
+                        and(
+                          eq(projectVersionFiles.workspaceId, ctx.workspaceId),
+                          eq(projectVersionFiles.versionId, currentVersionId),
+                          inArray(projectVersionFiles.path, touchedPaths),
+                        ),
+                      )
+                  : [];
+
+              const touchedVersionFiles = new Map<string, { blobScope: BlobScope; sha256: string }>();
+              for (const row of existingVerFiles) {
+                touchedVersionFiles.set(row.path, {
+                  blobScope: row.blobScope,
+                  sha256: row.sha256.trim(),
+                });
+              }
+
+              coalesceTarget = {
+                versionId: currentVersionId,
+                historyEntryId: headEntry.id,
+                touchedVersionFiles,
+              };
+            }
+          }
+        }
+      }
+
+      // 6. Compute net workspace CAS blob refcount deltas across live project_files + version snapshot (or coalesced delta).
       const deltas: BlobRefDelta[] = [];
 
       if (hasFileChanges) {
-        for (const oldFile of currentByPath.values()) {
-          if (oldFile.blobScope === 'workspace') {
+        for (const filePath of deletedPaths) {
+          const oldFile = currentByPath.get(filePath);
+          if (oldFile && oldFile.blobScope === 'workspace') {
             deltas.push({ sha256: oldFile.sha256, delta: -1 });
           }
         }
-        for (const newFile of nextByPath.values()) {
-          if (newFile.blobScope === 'workspace') {
+        for (const filePath of changedPaths) {
+          const oldFile = currentByPath.get(filePath);
+          if (oldFile && oldFile.blobScope === 'workspace') {
+            deltas.push({ sha256: oldFile.sha256, delta: -1 });
+          }
+          const newFile = nextByPath.get(filePath);
+          if (newFile && newFile.blobScope === 'workspace') {
             deltas.push({
               sha256: newFile.sha256,
               delta: 1,
@@ -957,16 +1117,42 @@ export class ProjectFilesService {
       }
 
       if (shouldCreateVersion) {
-        for (const newFile of nextByPath.values()) {
-          if (newFile.blobScope === 'workspace') {
-            deltas.push({
-              sha256: newFile.sha256,
-              delta: 1,
-              sizeBytes: newFile.sizeBytes,
-              mimeType: newFile.mimeType,
-              s3Key: workspaceBlobKey(ctx.workspaceId, newFile.sha256),
-              metadata: metadataBySha.get(newFile.sha256),
-            });
+        if (coalesceTarget) {
+          for (const filePath of deletedPaths) {
+            const oldVer = coalesceTarget.touchedVersionFiles.get(filePath);
+            if (oldVer && oldVer.blobScope === 'workspace') {
+              deltas.push({ sha256: oldVer.sha256, delta: -1 });
+            }
+          }
+          for (const filePath of changedPaths) {
+            const oldVer = coalesceTarget.touchedVersionFiles.get(filePath);
+            if (oldVer && oldVer.blobScope === 'workspace') {
+              deltas.push({ sha256: oldVer.sha256, delta: -1 });
+            }
+            const newFile = nextByPath.get(filePath);
+            if (newFile && newFile.blobScope === 'workspace') {
+              deltas.push({
+                sha256: newFile.sha256,
+                delta: 1,
+                sizeBytes: newFile.sizeBytes,
+                mimeType: newFile.mimeType,
+                s3Key: workspaceBlobKey(ctx.workspaceId, newFile.sha256),
+                metadata: metadataBySha.get(newFile.sha256),
+              });
+            }
+          }
+        } else {
+          for (const newFile of nextByPath.values()) {
+            if (newFile.blobScope === 'workspace') {
+              deltas.push({
+                sha256: newFile.sha256,
+                delta: 1,
+                sizeBytes: newFile.sizeBytes,
+                mimeType: newFile.mimeType,
+                s3Key: workspaceBlobKey(ctx.workspaceId, newFile.sha256),
+                metadata: metadataBySha.get(newFile.sha256),
+              });
+            }
           }
         }
       }
@@ -976,7 +1162,6 @@ export class ProjectFilesService {
       }
 
       // 7. Persist live project_files diff.
-      const now = new Date();
       if (deletedPaths.size > 0) {
         await tx
           .delete(projectFiles)
@@ -1032,9 +1217,87 @@ export class ProjectFilesService {
       let nextVersionId = currentVersionId;
       let nextVersionNumber = project.currentVersionNumber;
       let nextHistorySeq = project.currentHistorySeq;
+      let coalesced = false;
 
-      // 9. Append immutable project_versions + project_version_files + project_history_entries.
-      if (shouldCreateVersion) {
+      // 9. Coalesce in-place (delta only) OR append brand-new immutable snapshot.
+      if (shouldCreateVersion && coalesceTarget) {
+        if (deletedPaths.size > 0) {
+          await tx
+            .delete(projectVersionFiles)
+            .where(
+              and(
+                eq(projectVersionFiles.workspaceId, ctx.workspaceId),
+                eq(projectVersionFiles.versionId, coalesceTarget.versionId),
+                inArray(projectVersionFiles.path, [...deletedPaths]),
+              ),
+            );
+        }
+
+        for (const filePath of changedPaths) {
+          const entry = nextByPath.get(filePath);
+          if (!entry) continue;
+          await tx
+            .insert(projectVersionFiles)
+            .values(
+              asInsert(projectVersionFiles, {
+                versionId: coalesceTarget.versionId,
+                workspaceId: ctx.workspaceId,
+                projectId: project.id,
+                path: entry.path,
+                blobScope: entry.blobScope,
+                sha256: entry.sha256,
+                sizeBytes: entry.sizeBytes,
+                mimeType: entry.mimeType,
+              }),
+            )
+            .onConflictDoUpdate({
+              target: [projectVersionFiles.versionId, projectVersionFiles.path],
+              set: asUpdate(projectVersionFiles, {
+                blobScope: entry.blobScope,
+                sha256: entry.sha256,
+                sizeBytes: entry.sizeBytes,
+                mimeType: entry.mimeType,
+              }),
+            });
+        }
+
+        await tx
+          .update(projectVersions)
+          .set(
+            asUpdate(projectVersions, {
+              revision: nextRevision,
+              summary,
+              createdAt: now,
+            }),
+          )
+          .where(
+            and(
+              eq(projectVersions.workspaceId, ctx.workspaceId),
+              eq(projectVersions.projectId, project.id),
+              eq(projectVersions.id, coalesceTarget.versionId),
+            ),
+          );
+
+        await tx
+          .update(projectHistoryEntries)
+          .set(
+            asUpdate(projectHistoryEntries, {
+              label: summary,
+              endedAt: now,
+              ...(safeWindowId ? { windowId: safeWindowId } : {}),
+            }),
+          )
+          .where(
+            and(
+              eq(projectHistoryEntries.workspaceId, ctx.workspaceId),
+              eq(projectHistoryEntries.projectId, project.id),
+              eq(projectHistoryEntries.id, coalesceTarget.historyEntryId),
+            ),
+          );
+
+        nextVersionId = coalesceTarget.versionId;
+        coalesced = true;
+      } else if (shouldCreateVersion) {
         const maxVerRow = await tx
           .select({ maxVer: sql<number>`COALESCE(MAX(${projectVersions.versionNumber}), 0)` })
           .from(projectVersions)
@@ -1073,11 +1336,6 @@ export class ProjectFilesService {
             : [];
         const parentEntryId = parentRows[0]?.id ?? null;
 
-        const summary = (
-          input.summary?.trim() ||
-          buildAutoSummary([...changedPaths], [...deletedPaths])
-        ).slice(0, 256);
-
         const insertedVersions = await tx
           .insert(projectVersions)
           .values(
@@ -1086,7 +1344,7 @@ export class ProjectFilesService {
               projectId: project.id,
               versionNumber: nextVersionNumber,
               revision: nextRevision,
-              source: input.source ?? 'studio',
+              source: effectiveSource,
               summary,
               requestId: input.requestId ?? null,
               pinned: false,
@@ -1129,8 +1387,6 @@ export class ProjectFilesService {
             ),
           );
 
-        const actor = actorDefaults(ctx, input.actorKind, input.actorName);
-        const safeWindowId = input.windowId && isUuid(input.windowId) ? input.windowId : null;
         await tx.insert(projectHistoryEntries).values(
           asInsert(projectHistoryEntries, {
             workspaceId: ctx.workspaceId,
@@ -1198,6 +1454,7 @@ export class ProjectFilesService {
         affectsPreview: impact.affectsPreview,
         affectedCompositions: impact.affectedCompositions,
         replayed: false,
+        coalesced,
       };
 
       // 11. Persist idempotency receipt on commit.

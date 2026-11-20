@@ -14,7 +14,69 @@ import {
   PRESIGNED_REDIRECT_HEADERS,
   formatVersionFromSha256,
 } from '../etag.ts';
+import { assertTenantScopedKey } from '../../infra/storage.ts';
 import { normalizeSafeProjectPath } from '../../services/project-files-service.ts';
+
+/**
+ * Frozen metadata contract written by `worker-media` (`generate_preview_proxy`) onto `workspace_blobs.metadata`.
+ */
+export interface PreviewProxyMetadata {
+  readonly status: 'ready' | 'failed';
+  readonly s3Key: string;
+  readonly mimeType: string;
+  readonly sizeBytes: number;
+  readonly width?: number;
+  readonly height?: number;
+  readonly codec?: string;
+  readonly generatedAt: string;
+}
+
+function resolveReadyPreviewProxy(
+  workspaceId: string,
+  metadata: unknown,
+): PreviewProxyMetadata | null {
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return null;
+  const raw = (metadata as { previewProxy?: unknown }).previewProxy;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const candidate = raw as Partial<PreviewProxyMetadata>;
+  if (candidate.status !== 'ready') return null;
+  if (typeof candidate.s3Key !== 'string') return null;
+
+  const expectedPrefix = `workspaces/${workspaceId}/derived/`;
+  if (!candidate.s3Key.startsWith(expectedPrefix)) return null;
+
+  try {
+    assertTenantScopedKey(workspaceId, candidate.s3Key, { allowCatalog: false });
+  } catch {
+    return null;
+  }
+
+  if (typeof candidate.mimeType !== 'string' || !candidate.mimeType.trim()) return null;
+  if (
+    typeof candidate.sizeBytes !== 'number' ||
+    !Number.isFinite(candidate.sizeBytes) ||
+    candidate.sizeBytes < 0
+  ) {
+    return null;
+  }
+
+  return {
+    status: 'ready',
+    s3Key: candidate.s3Key,
+    mimeType: candidate.mimeType,
+    sizeBytes: candidate.sizeBytes,
+    ...(typeof candidate.width === 'number' ? { width: candidate.width } : {}),
+    ...(typeof candidate.height === 'number' ? { height: candidate.height } : {}),
+    ...(typeof candidate.codec === 'string' ? { codec: candidate.codec } : {}),
+    generatedAt: typeof candidate.generatedAt === 'string' ? candidate.generatedAt : '',
+  };
+}
+
+function isOriginalTrackRequested(query: (key: string) => string | undefined): boolean {
+  const original = query('original');
+  const raw = query('raw');
+  return original === '1' || original === 'true' || raw === '1' || raw === 'true';
+}
 
 function parseVariablesQuery(raw: string | undefined): Record<string, unknown> | null {
   if (!raw) return null;
@@ -163,7 +225,9 @@ export function createStudioPreviewRoutes(deps: DisklessStudioDeps): Hono<{ Vari
         c.header('Accept-Ranges', 'bytes');
         return c.body(null, 200);
       }
-      return c.redirect(`/api/projects/${encodeURIComponent(projectId)}/preview`, 302);
+      const pt = c.req.query('pt');
+      const suffix = pt ? `?pt=${encodeURIComponent(pt)}` : '';
+      return c.redirect(`/api/projects/${encodeURIComponent(projectId)}/preview${suffix}`, 302);
     }
     const safePath = normalizeSafeProjectPath(rawPath);
 
@@ -174,20 +238,44 @@ export function createStudioPreviewRoutes(deps: DisklessStudioDeps): Hono<{ Vari
         : c.json({ error: 'Preview asset not found', path: safePath }, 404);
     }
 
-    const etag = formatVersionFromSha256(file.sha256);
+    const forceOriginal = isOriginalTrackRequested((key) => c.req.query(key));
+    const readyProxy =
+      !file.isText && file.blobScope === 'workspace' && !forceOriginal
+        ? resolveReadyPreviewProxy(auth.workspaceId, file.metadata)
+        : null;
+
+    const etag = readyProxy
+      ? `"sha256:${file.sha256}:proxy"`
+      : formatVersionFromSha256(file.sha256);
 
     if (c.req.method === 'HEAD') {
+      if (readyProxy) {
+        c.header('Content-Type', readyProxy.mimeType);
+        c.header('Content-Length', String(readyProxy.sizeBytes));
+        c.header('ETag', etag);
+        c.header('Accept-Ranges', 'bytes');
+        c.header('Cache-Control', PRESIGNED_REDIRECT_HEADERS['Cache-Control']);
+        c.header('Vary', PRESIGNED_REDIRECT_HEADERS.Vary);
+        c.header('X-OpenMotion-Media-Track', 'proxy');
+        return c.body(null, 200);
+      }
       c.header('Content-Type', file.mimeType);
       c.header('Content-Length', String(file.sizeBytes));
       c.header('ETag', etag);
       c.header('Accept-Ranges', 'bytes');
       c.header('Cache-Control', PRESIGNED_REDIRECT_HEADERS['Cache-Control']);
       c.header('Vary', PRESIGNED_REDIRECT_HEADERS.Vary);
+      if (!file.isText) {
+        c.header('X-OpenMotion-Media-Track', 'original');
+      }
       return c.body(null, 200);
     }
 
     if (c.req.header('if-none-match')?.trim() === etag) {
       c.header('ETag', etag);
+      if (!file.isText) {
+        c.header('X-OpenMotion-Media-Track', readyProxy ? 'proxy' : 'original');
+      }
       return c.body(null, 304);
     }
 
@@ -198,6 +286,22 @@ export function createStudioPreviewRoutes(deps: DisklessStudioDeps): Hono<{ Vari
       c.header('ETag', etag);
       c.header('Cache-Control', 'no-cache');
       return c.body(content, 200);
+    }
+
+    if (readyProxy) {
+      const proxyUrl = await deps.storage.presignGet(readyProxy.s3Key, {
+        expiresInSec: 300,
+        responseContentType: readyProxy.mimeType,
+      });
+      return new Response(null, {
+        status: 302,
+        headers: {
+          Location: proxyUrl,
+          ETag: etag,
+          ...PRESIGNED_REDIRECT_HEADERS,
+          'X-OpenMotion-Media-Track': 'proxy',
+        },
+      });
     }
 
     const presigned = await deps.files.presignFileGet(auth, projectId, safePath, {
@@ -214,6 +318,7 @@ export function createStudioPreviewRoutes(deps: DisklessStudioDeps): Hono<{ Vari
         Location: presigned.url,
         ETag: etag,
         ...PRESIGNED_REDIRECT_HEADERS,
+        'X-OpenMotion-Media-Track': 'original',
       },
     });
   });
