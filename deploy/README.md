@@ -1,6 +1,6 @@
 # OpenMotion Cloud & Container Deployment
 
-OpenMotion runs as a container-first, stateless cloud stack backed by **PostgreSQL 17**, **Redis 7** (`noeviction` for BullMQ), and **S3-compatible object storage** (MinIO locally; AWS S3, Cloudflare R2, or RustFS in production).
+OpenMotion runs as a container-first, stateless cloud stack backed by **PostgreSQL 17**, **Redis 7** (`noeviction` for BullMQ), and **S3-compatible object storage** (RustFS locally, S3/R2 in cloud).
 
 ## Container Architecture
 
@@ -31,7 +31,7 @@ docker compose -f deploy/docker-compose.yml up -d --build
 
 Startup runs three one-shot bootstrap services automatically before `api` starts:
 
-1. `s3-init` (`scripts/init-s3.ts`): Creates the `openmotion` bucket in MinIO and applies the canonical S3 CORS policy via `PutBucketCorsCommand` (`GET`, `HEAD`, `PUT` + `Range`/`ETag`/`Content-Range` headers) required for direct browser uploads and `302` presigned media playback.
+1. `s3-init` (`scripts/init-s3.ts`): Creates the `openmotion` bucket in RustFS and applies the canonical S3 CORS policy via `PutBucketCorsCommand` (`GET`, `HEAD`, `PUT` + `Range`/`ETag`/`Content-Range` headers) required for direct browser uploads and `302` presigned media playback.
 2. `db-migrate` (`src/db/migrate.ts`): Applies Drizzle SQL migrations under a PostgreSQL advisory lock.
 3. `catalog-sync` (`scripts/sync-catalog-cas.ts`): Ingests template blobs into `catalog/blobs/{sha256}` and upserts `catalog_templates` metadata.
 
@@ -41,8 +41,8 @@ Startup runs three one-shot bootstrap services automatically before `api` starts
 | --- | --- | --- |
 | OpenMotion Studio & API | `http://127.0.0.1:4173` | Runs with `AUTH_MODE=dev`, `MODEL_GATEWAY_MODE=mock`, and a read-only root filesystem (`tmpfs: /tmp:size=64m`). |
 | Remote MCP (Streamable HTTP) | `http://127.0.0.1:4173/mcp` | Authenticate with `Authorization: Bearer <DEV_PAT>` in local dev mode. |
-| MinIO S3 API | `http://127.0.0.1:9000` | Signed into browser presigned URLs via `S3_PUBLIC_ENDPOINT`. Internal containers talk to `http://s3:9000`. |
-| MinIO Console | `http://127.0.0.1:9001` | Sign in with `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` from `deploy/.env`. |
+| RustFS S3 API | `http://127.0.0.1:9000` | Signed into browser presigned URLs via `S3_PUBLIC_ENDPOINT`. Internal containers talk to `http://s3:9000`. |
+| RustFS Console | `http://127.0.0.1:9001` | Sign in with `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` from `deploy/.env`. |
 | PostgreSQL 17 | `127.0.0.1:5432` | Database `openmotion` (credentials in `deploy/.env`). |
 
 Stop containers while keeping volumes (`pg_data`, `redis_data`, `s3_data`):
