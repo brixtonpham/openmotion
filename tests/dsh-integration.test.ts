@@ -303,6 +303,50 @@ test('DSH installation recovers when bundled CLI rejects read-only --dump-config
       const actionCardsEntries = composed.filter((row: { id?: string }) => row.id === 'action-cards');
       assert.equal(actionCardsEntries.length, 1);
       assert.equal(actionCardsEntries[0].config?.queuedMessageLimit, 1);
+
+      // Incompatible profile-local card bundles must be skipped unless explicitly exempted for the runtime version.
+      const compatProfileDir = path.join(dshHome, 'profiles', 'desktop-compat');
+      const localBundleDir = path.join(compatProfileDir, 'node_modules', 'dsh-test-future-cards');
+      await mkdir(localBundleDir, { recursive: true });
+      await writeFile(path.join(localBundleDir, 'package.json'), JSON.stringify({
+        name: 'dsh-test-future-cards',
+        version: '1.0.0',
+        engines: { dsh: '>=99.0.0' },
+        dsh: { bundle: { patch: './bundle.patch.yml' } },
+      }, null, 2) + '\n');
+      await writeFile(path.join(localBundleDir, 'bundle.patch.yml'), [
+        '- insert:',
+        '    - id: action-cards',
+        '      name: "@deepseek-ai/dsh-action-cards"',
+        '    - id: client-ui-action-cards',
+        '      name: "@deepseek-ai/dsh-client-ui-action-cards"',
+        '',
+      ].join('\n'));
+      await writeFile(path.join(compatProfileDir, 'package.json'), JSON.stringify({
+        name: 'dsh-profile-desktop-compat',
+        private: true,
+        dsh: { profile: { bundles: ['dsh-test-future-cards'] } },
+      }, null, 2) + '\n');
+      await writeFile(path.join(compatProfileDir, 'cordis.patch.yml'), '[]\n');
+
+      const skippedIncompatible = await composeProfileModules(compatProfileDir, dshHome, dshIntegrationDir);
+      assert(!skippedIncompatible.includes('@deepseek-ai/dsh-action-cards'));
+      assert(!skippedIncompatible.includes('@deepseek-ai/dsh-client-ui-action-cards'));
+      const patchWhenIncompatible = await workspacePatch('[]\n', root, data, process.execPath, skippedIncompatible);
+      assert(patchWhenIncompatible.includes('@deepseek-ai/dsh-action-cards'));
+      assert(patchWhenIncompatible.includes('@deepseek-ai/dsh-client-ui-action-cards'));
+
+      const dshPkg = JSON.parse(await readFile(installAnchor, 'utf8')) as { version: string };
+      await writeFile(
+        path.join(compatProfileDir, appBoot.PROFILE_COMPATIBILITY_FILENAME),
+        JSON.stringify({ 'dsh-test-future-cards@1.0.0': [dshPkg.version] }, null, 2) + '\n',
+      );
+      const includedExempted = await composeProfileModules(compatProfileDir, dshHome, dshIntegrationDir);
+      assert(includedExempted.includes('@deepseek-ai/dsh-action-cards'));
+      assert(includedExempted.includes('@deepseek-ai/dsh-client-ui-action-cards'));
+      const patchWhenExempted = await workspacePatch('[]\n', root, data, process.execPath, includedExempted);
+      assert(!patchWhenExempted.includes('@deepseek-ai/dsh-action-cards'));
+      assert(!patchWhenExempted.includes('@deepseek-ai/dsh-client-ui-action-cards'));
     } finally {
       await rm(dshHome, { recursive: true, force: true });
     }

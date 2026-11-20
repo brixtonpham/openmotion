@@ -104,6 +104,7 @@ export async function composeProfileModules(
   const appBoot = await import(pathToFileURL(appBootPath).href);
   const manifest = appBoot.readProfileManifest("dsh", profileDirectory);
   const bundles: string[] = manifest.dsh?.profile?.bundles ?? [];
+  const exemptions = bundles.length === 0 ? {} : appBoot.readProfileVersionExemptions(profileDirectory);
   const layers: unknown[][] = [];
   for (const packageName of bundles) {
     try {
@@ -112,6 +113,8 @@ export async function composeProfileModules(
       const bundle = bundleManifest.dsh?.bundle;
       if (!bundle) continue;
       appBoot.assertBundlePlatform(bundle.platforms, process.platform);
+      const issue = appBoot.evaluatePluginCompatibility(bundleManifest, exemptions);
+      if (issue !== undefined && !issue.exempted) continue;
       const patchPaths: string[] = appBoot.bundlePatchPaths(packageDir, bundle);
       layers.push(patchPaths.flatMap((patchPath: string) => appBoot.loadOverlayPatches("dsh", patchPath)));
     } catch {
