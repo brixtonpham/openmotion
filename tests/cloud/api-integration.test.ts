@@ -787,6 +787,7 @@ describe('Cloud API Entrypoint — Auth Isolation & First-Access Welcome Bootstr
     for (const url of [
       '/motion-api/projects',
       '/api/projects',
+      `/api/media-jobs/${randomUUID()}/progress`,
       '/motion-api/models',
       '/motion-api/account/summary',
       '/motion-api/integration',
@@ -1031,6 +1032,53 @@ describe('Cloud API Entrypoint — End-to-End Product, Studio & Streamable HTTP 
     assert.notEqual(editStructured.revision, created.revision);
     assert.ok(editStructured.version.versionNumber >= 2);
 
+    // 6b. Regression: openmotion_edit_project MUST enforce optimistic locking on assetNames-only edits
+    const staleRevAssetNames = await callMcp(41, 'tools/call', {
+      name: 'openmotion_edit_project',
+      arguments: {
+        projectId,
+        requestId: 'req-e2e-asset-names-stale-rev',
+        expectedRevision: '0'.repeat(64),
+        expectedVersionId: editStructured.version.versionId,
+        assetNames: [{ path: 'assets/hero.png', name: 'Hero Frame' }],
+      },
+    });
+    assert.equal(staleRevAssetNames.result?.isError, true);
+    assert.equal(
+      (staleRevAssetNames.result?.structuredContent as { error: { code: string } }).error.code,
+      'VERSION_CONFLICT',
+    );
+
+    const staleVerAssetNames = await callMcp(42, 'tools/call', {
+      name: 'openmotion_edit_project',
+      arguments: {
+        projectId,
+        requestId: 'req-e2e-asset-names-stale-ver',
+        expectedRevision: editStructured.revision,
+        expectedVersionId: randomUUID(),
+        assetNames: [{ path: 'assets/hero.png', name: 'Hero Frame' }],
+      },
+    });
+    assert.equal(staleVerAssetNames.result?.isError, true);
+    assert.equal(
+      (staleVerAssetNames.result?.structuredContent as { error: { code: string } }).error.code,
+      'VERSION_CONFLICT',
+    );
+
+    const validAssetNames = await callMcp(43, 'tools/call', {
+      name: 'openmotion_edit_project',
+      arguments: {
+        projectId,
+        requestId: 'req-e2e-asset-names-ok',
+        expectedRevision: editStructured.revision,
+        expectedVersionId: editStructured.version.versionId,
+        assetNames: [{ path: 'assets/hero.png', name: 'Hero Frame' }],
+      },
+    });
+    assert.equal(validAssetNames.result?.isError, undefined);
+    const assetNamesStructured = validAssetNames.result?.structuredContent as { revision: string };
+    assert.notEqual(assetNamesStructured.revision, editStructured.revision);
+
     // 7. openmotion_get_project reads back notes.txt written via MCP
     const readRes = await callMcp(5, 'tools/call', {
       name: 'openmotion_get_project',
@@ -1197,6 +1245,53 @@ describe('Cloud API Entrypoint — Models, Account, Catalog, Integration & P2 Ro
     assert.equal(ffmpegRes.status, 200);
     const ffmpeg = (await ffmpegRes.json()) as { available: boolean; workerCount?: number };
     assert.equal(ffmpeg.available, true);
+
+    // Regression: /api/media-jobs/:jobId/progress has auth middleware wired (reaches handler -> 404, never 401)
+    const mediaJobProgress = await app.request(`/api/media-jobs/${randomUUID()}/progress`);
+    assert.equal(mediaJobProgress.status, 404);
+
+    // Regression: createApiApp wires authCache into OpenDesignModelGateway when MODEL_GATEWAY_MODE=opendesign
+    const cachedAuthCache = new InMemoryAuthCache();
+    await cachedAuthCache.set(
+      'om:gateway:models:global',
+      JSON.stringify([
+        {
+          id: 'opendesign:cached-image-1',
+          provider: 'opendesign',
+          modelId: 'cached-image-1',
+          label: 'Cached Test Image',
+          modality: 'image',
+          mode: 'text-to-image',
+          modes: ['text-to-image'],
+          supportsImageReference: false,
+          options: [],
+        },
+      ]),
+      300,
+    );
+    const liveGwFixture = createApiFixture({
+      config: {
+        AUTH_MODE: 'dev',
+        MODEL_GATEWAY_MODE: 'opendesign',
+        OPENDESIGN_API_URL: 'https://api.opendesign.invalid',
+        OPENDESIGN_S2S_API_KEY: 'ephemeral-test-s2s-key',
+      },
+      deps: {
+        gateway: undefined,
+        authCache: cachedAuthCache,
+      },
+    });
+    const cachedModelsRes = await liveGwFixture.app.request('/motion-api/models');
+    assert.equal(cachedModelsRes.status, 200);
+    const cachedModelsBody = (await cachedModelsRes.json()) as {
+      mode: string;
+      models: Array<{ id: string }>;
+    };
+    assert.equal(cachedModelsBody.mode, 'opendesign');
+    assert.deepEqual(
+      cachedModelsBody.models.map((m) => m.id),
+      ['opendesign:cached-image-1'],
+    );
 
     const desktopGet = await app.request('/api/open-in-desktop');
     assert.equal(desktopGet.status, 200);

@@ -167,14 +167,12 @@ test('the existing standalone gate rejects failed, cancelled, skipped and missin
 });
 
 const unscheduledSuites = [
-  'brand-story-tracking.test.ts',
   'install-public-skill.test.ts',
   'page-metadata.test.ts',
   'registry-material-compat.test.ts',
   'registry.test.ts',
   'studio-history-availability.test.ts',
   'template-playback.test.ts',
-  'vision-runtime-native.test.mjs',
   'vision-runtime.test.mjs',
   'workflow-layering.test.ts',
 ];

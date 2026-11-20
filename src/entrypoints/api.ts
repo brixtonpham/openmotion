@@ -1115,12 +1115,47 @@ function createMcpDomainPorts(deps: {
               ...(typeof args.namingLanguage === 'string' ? { namingLanguage: args.namingLanguage } : {}),
             },
           });
+        } else if (expectedRevision !== undefined || expectedVersionId !== undefined) {
+          // Enforce optimistic concurrency even on metadata-only (`assetNames`) or no-op edits.
+          const current = await deps.workspace.getProject(auth, projectId);
+          if (expectedRevision !== undefined && current.revision !== expectedRevision) {
+            throw new CloudError(
+              'VERSION_CONFLICT',
+              `Revision conflict: expected ${expectedRevision}, current is ${current.revision}.`,
+              {
+                status: 409,
+                applied: false,
+                details: {
+                  expectedRevision,
+                  currentRevision: current.revision,
+                  currentVersionId: current.currentVersionId,
+                },
+              },
+            );
+          }
+          if (expectedVersionId !== undefined && current.currentVersionId !== expectedVersionId) {
+            throw new CloudError(
+              'VERSION_CONFLICT',
+              `Version conflict: expected ${expectedVersionId}, current is ${current.currentVersionId ?? 'none'}.`,
+              {
+                status: 409,
+                applied: false,
+                details: {
+                  expectedVersionId,
+                  currentVersionId: current.currentVersionId,
+                  currentRevision: current.revision,
+                },
+              },
+            );
+          }
         }
 
+        let assetNamesResult: { revision: string; versionId: string | null } | null = null;
         if (Array.isArray(args.assetNames) && args.assetNames.length > 0) {
-          await deps.assetNames.updateAssetNames(auth, projectId, {
+          assetNamesResult = await deps.assetNames.updateAssetNames(auth, projectId, {
             assetNames: args.assetNames as Array<{ path: string; name: string }>,
             namingLanguage: typeof args.namingLanguage === 'string' ? args.namingLanguage : undefined,
+            expectedRevision: committed ? committed.revision : expectedRevision,
             requestId: `${requestId}:asset-names`,
           });
         }
@@ -1129,12 +1164,12 @@ function createMcpDomainPorts(deps: {
         return {
           projectId: project.id,
           sessionId: project.sessionId,
-          revision: committed?.revision ?? project.revision,
+          revision: assetNamesResult?.revision ?? committed?.revision ?? project.revision,
           version: {
-            versionId: committed?.versionId ?? project.currentVersionId,
-            versionNumber: committed?.versionNumber ?? project.currentVersionNumber,
+            versionId: assetNamesResult?.versionId ?? committed?.versionId ?? project.currentVersionId,
+            versionNumber: project.currentVersionNumber,
           },
-          changedFiles: committed?.changedPaths ?? [],
+          changedFiles: committed?.changedPaths ?? (assetNamesResult ? ['motion-assets.json'] : []),
           replayed: committed?.replayed ?? false,
           ...buildProjectPreviewHandoff(deps.config.APP_PUBLIC_ORIGIN, project, {
             presentation: typeof args.presentation === 'string' ? args.presentation : undefined,
@@ -1560,7 +1595,11 @@ export function createApiApp(deps: CreateApiAppDeps): { app: Hono<AuthEnv>; serv
     deps.oidc ??
     (config.AUTH_MODE === 'oidc' ? new OidcService(oidcConfigFromAppConfig(config), authCache) : undefined);
   const oauth21 = buildOAuth21Config(config);
-  const gateway = deps.gateway ?? createPlatformModelGateway(config);
+  const gateway =
+    deps.gateway ??
+    createPlatformModelGateway(config, {
+      opendesign: { cache: authCache },
+    });
 
   const catalog = new CatalogService({
     db,
@@ -2029,12 +2068,7 @@ export function createApiApp(deps: CreateApiAppDeps): { app: Hono<AuthEnv>; serv
   app.all('/motion-api/brand-kits', authMiddleware, sendDeferredP2('brand_kit_website_capture'));
   app.all('/motion-api/brand-kits/*', authMiddleware, sendDeferredP2('brand_kit_website_capture'));
 
-  const handleTranscriptsRoute = (c: Context) => {
-    if (!config.OPENDESIGN_ASR_URL) {
-      return c.json(featureDeferredP2('transcription').toJSON(), 501);
-    }
-    return c.json(featureDeferredP2('transcription').toJSON(), 501);
-  };
+  const handleTranscriptsRoute = sendDeferredP2('transcription');
   app.all('/motion-api/transcripts', authMiddleware, handleTranscriptsRoute);
   app.all('/motion-api/transcripts/*', authMiddleware, handleTranscriptsRoute);
   app.all('/motion-api/projects/:id/transcripts', authMiddleware, handleTranscriptsRoute);
@@ -2053,6 +2087,7 @@ export function createApiApp(deps: CreateApiAppDeps): { app: Hono<AuthEnv>; serv
 
   app.use('/api/projects/*', authWithWelcome);
   app.use('/api/render/*', authWithWelcome);
+  app.use('/api/media-jobs/*', authWithWelcome);
   app.use('/api/fonts/*', authMiddleware);
   app.use('/api/events', authWithWelcome);
   app.use('/api/environment/ffmpeg', authMiddleware);
