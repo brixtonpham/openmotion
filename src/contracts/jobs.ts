@@ -58,11 +58,13 @@ export const urlFetchPayloadSchema = z.object({
   url: z.string().url().max(2048),
   targetProjectId: uuidSchema.optional(),
   targetAssetId: uuidSchema.optional(),
+  targetPath: z.string().max(240).optional(),
   parentVersionId: uuidSchema.optional(),
   itemId: z.string().max(128).optional(),
   name: z.string().min(1).max(200),
   requestId: z.string().min(1).max(128),
   expectedModality: z.enum(['image', 'video', 'audio']).optional(),
+  expectedSha256: sha256Schema.optional(),
 });
 
 export const mediaProbePayloadSchema = z.object({

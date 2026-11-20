@@ -112,6 +112,7 @@ class InMemoryImportAssetsStore implements ImportAssetsStore {
     workspaceId: string;
     userId: string;
     targetProjectId: string;
+    targetPath: string;
     filename: string;
     expectedMimeType: string;
     expectedSha256: string | null;
@@ -742,6 +743,7 @@ describe('3-Way Cloud openmotion_import_assets & Streamable HTTP Config Contract
 
     // Simulate client PUT to staging S3
     const ticket = importStore.tickets.get(`${workspaceId}:${prepared.tickets[0].ticketId}`)!;
+    assert.equal(ticket.targetPath, 'fonts/Inter-Bold.woff2');
     stagedSizes.set(ticket.s3StagingKey, 4096);
 
     // Mode A + Mode B (valid + SSRF blocked) + Mode C (zero-copy library_asset) in one batch
@@ -823,7 +825,11 @@ describe('3-Way Cloud openmotion_import_assets & Streamable HTTP Config Contract
 
     assert.equal(enqueued.length, 2);
     assert.equal(enqueued[0].name, 'upload_commit');
+    assert.equal(enqueued[0].payload.targetPath, 'fonts/Inter-Bold.woff2');
+    assert.equal(byId.get('mode-a')?.path, 'fonts/Inter-Bold.woff2');
     assert.equal(enqueued[1].name, 'url_fetch');
+    assert.match(String(enqueued[1].payload.targetPath), /^assets\/imported\/[a-f0-9-]+\.png$/);
+    assert.equal(byId.get('mode-b-ok')?.path, enqueued[1].payload.targetPath);
     assert.equal(importStore.zeroCopyCommits.length, 1);
 
     // Idempotent replay returns cached payload without re-enqueueing

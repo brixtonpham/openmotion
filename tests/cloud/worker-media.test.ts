@@ -1,17 +1,29 @@
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { access, mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import { describe, it } from 'node:test';
 import sharp from 'sharp';
+import { computeProjectRevision } from '../../shared/project-validation.ts';
+import { PAT_SCOPES } from '../../src/contracts/auth.ts';
+import type { MediaIngestJobName, MediaIngestPayloadMap } from '../../src/contracts/jobs.ts';
 import type { StoragePort } from '../../src/contracts/storage.ts';
+import { normalizeBlobRefDeltas } from '../../src/db/cas.ts';
 import type { Database } from '../../src/db/client.ts';
 import { uploadTickets } from '../../src/db/schema/blobs-assets.ts';
 import { jobs } from '../../src/db/schema/jobs.ts';
+import {
+  projectFiles,
+  projectHistoryEntries,
+  projectVersionFiles,
+  projectVersions,
+} from '../../src/db/schema/project-files.ts';
+import { projects } from '../../src/db/schema/projects.ts';
 import { createLogger } from '../../src/infra/logger.ts';
-import { jobChannel } from '../../src/infra/redis.ts';
+import { validateMediaIngestPayload } from '../../src/infra/queues.ts';
+import { jobChannel, projectChannel } from '../../src/infra/redis.ts';
 import {
   blobDerivedPrefix,
   blobThumbnailsPrefix,
@@ -21,6 +33,12 @@ import {
   uploadStagingKey,
   workspaceBlobKey,
 } from '../../src/infra/storage.ts';
+import {
+  CloudImportAssetsService,
+  resolveProjectAssetTargetPath,
+  type ImportAssetsStore,
+  type UploadTicketRecord,
+} from '../../src/mcp/import-assets.ts';
 import {
   sweepExpiredUploads,
   sweepUnreferencedBlobs,
@@ -421,9 +439,11 @@ describe('worker-media: upload_commit, SDR PNG stripping, Upload-Before-Referenc
       const db = createFakeDb({
         selectQueue: [
           [ticketRow], // load ticket
-          [{ id: PID_A, trashed: false }], // lock parent project row FOR UPDATE
-          [], // existing font project_files
-          [], // existing license project_files
+          [{ id: PID_A, trashed: false, currentVersionNumber: 1, currentHistorySeq: 1 }], // lock parent project row FOR UPDATE
+          [], // existing project_files
+          [{ maxVer: 1 }], // MAX(project_versions.version_number)
+          [{ maxSeq: 1 }], // MAX(project_history_entries.seq)
+          [{ id: '66666666-6666-4666-8666-666666666666' }], // parent history entry
         ],
       });
 
@@ -459,11 +479,26 @@ describe('worker-media: upload_commit, SDR PNG stripping, Upload-Before-Referenc
       assert.equal(res.mimeType, 'font/woff2');
       assert.equal(res.projectPath, 'assets/fonts/Inter-Bold.woff2');
       assert.equal(res.licenseProjectPath, 'assets/fonts/OFL.txt');
+      assert.equal(res.projectVersionNumber, 2);
+      assert.equal(
+        res.projectRevision,
+        computeProjectRevision([
+          { path: 'assets/fonts/Inter-Bold.woff2', size: fontBytes.byteLength, hash: fontSha },
+          { path: 'assets/fonts/OFL.txt', size: licenseBytes.byteLength, hash: licenseSha },
+        ]),
+      );
       assert.ok(storage.objects.has(workspaceBlobKey(WID_A, fontSha)));
       assert.ok(storage.objects.has(workspaceBlobKey(WID_A, licenseSha)));
       assert.equal(storage.objects.has(mainStagingKey), false);
       assert.equal(storage.objects.has(licStagingKey), false);
       assert.equal(appliedDeltas.length, 2);
+      assert.deepEqual(
+        appliedDeltas,
+        normalizeBlobRefDeltas([
+          { sha256: fontSha, delta: 2 },
+          { sha256: licenseSha, delta: 2 },
+        ]).map(({ sha256, delta }) => ({ sha256, delta })),
+      );
 
       // Explicit rejection of purpose === 'project_archive' (must never fall through into library_asset).
       const archiveTicket = { ...ticketRow, purpose: 'project_archive', licenseS3StagingKey: null, expectedSha256: null };
@@ -1172,5 +1207,555 @@ describe('worker-media: Two-Phase CAS blob-gc & Expired Upload Sweeper', () => {
     assert.equal(updatedToExpired, true);
     assert.equal(storage.objects.has(mainKey), false);
     assert.equal(storage.objects.has(licKey), false);
+  });
+});
+
+describe('MCP CloudImportAssetsService -> worker-media end-to-end project_asset integration', () => {
+  it('commits prepare_upload + upload_ticket (image + font/license) and url imports into project_files, revision, versions, snapshots, history, and exact CAS refcounts', async () => {
+    const tmpRoot = await mkdtemp(path.join(os.tmpdir(), 'om-test-mcp-ingest-e2e-'));
+    try {
+      const storage = new InMemoryStorage();
+      const published: Array<{ channel: string; payload: unknown }> = [];
+
+      // Seed an active project with 1 workspace-scoped file (refCount=2: live + v1 snapshot)
+      // and 1 catalog-scoped file (not tracked in workspace_blobs).
+      const indexHtmlBytes = Buffer.from('<div data-composition-id="main">Hello</div>', 'utf8');
+      const indexHtmlSha = createHash('sha256').update(indexHtmlBytes).digest('hex');
+      const catalogBgSha = 'c'.repeat(64);
+      const v1Id = randomUUID();
+      const h1Id = randomUUID();
+
+      const projectFilesMap = new Map<
+        string,
+        {
+          workspaceId: string;
+          projectId: string;
+          path: string;
+          blobScope: 'workspace' | 'catalog';
+          sha256: string;
+          sizeBytes: number;
+          mimeType: string;
+          isText: boolean;
+        }
+      >([
+        [
+          'index.html',
+          {
+            workspaceId: WID_A,
+            projectId: PID_A,
+            path: 'index.html',
+            blobScope: 'workspace',
+            sha256: indexHtmlSha,
+            sizeBytes: indexHtmlBytes.byteLength,
+            mimeType: 'text/html',
+            isText: true,
+          },
+        ],
+        [
+          'assets/bg.webp',
+          {
+            workspaceId: WID_A,
+            projectId: PID_A,
+            path: 'assets/bg.webp',
+            blobScope: 'catalog',
+            sha256: catalogBgSha,
+            sizeBytes: 4096,
+            mimeType: 'image/webp',
+            isText: false,
+          },
+        ],
+      ]);
+
+      const initialRevision = computeProjectRevision(
+        [...projectFilesMap.values()].map((f) => ({ path: f.path, size: f.sizeBytes, hash: f.sha256 })),
+      );
+      const projectRow = {
+        id: PID_A,
+        workspaceId: WID_A,
+        trashed: false,
+        revision: initialRevision,
+        currentVersionId: v1Id,
+        currentVersionNumber: 1,
+        currentHistorySeq: 1,
+      };
+      const versionRows: Array<Record<string, unknown>> = [
+        {
+          id: v1Id,
+          workspaceId: WID_A,
+          projectId: PID_A,
+          versionNumber: 1,
+          revision: initialRevision,
+          source: 'baseline',
+          summary: 'Baseline',
+          requestId: null,
+        },
+      ];
+      const versionFileRows: Array<Record<string, unknown>> = [
+        {
+          versionId: v1Id,
+          workspaceId: WID_A,
+          projectId: PID_A,
+          path: 'index.html',
+          blobScope: 'workspace',
+          sha256: indexHtmlSha,
+          sizeBytes: indexHtmlBytes.byteLength,
+          mimeType: 'text/html',
+        },
+        {
+          versionId: v1Id,
+          workspaceId: WID_A,
+          projectId: PID_A,
+          path: 'assets/bg.webp',
+          blobScope: 'catalog',
+          sha256: catalogBgSha,
+          sizeBytes: 4096,
+          mimeType: 'image/webp',
+        },
+      ];
+      const historyRows: Array<Record<string, unknown>> = [
+        {
+          id: h1Id,
+          workspaceId: WID_A,
+          projectId: PID_A,
+          seq: 1,
+          versionId: v1Id,
+          parentEntryId: null,
+          actorKind: 'system',
+          actorName: 'bootstrap',
+          label: 'Baseline',
+          undone: false,
+        },
+      ];
+
+      // Workspace CAS refcounts (catalog blobs must never appear here).
+      const blobRefCounts = new Map<string, number>([[indexHtmlSha, 2]]);
+      const receipts = new Map<
+        string,
+        { inputHash: string; state: string; responsePayload: Record<string, unknown> | null }
+      >();
+      const ticketMap = new Map<string, UploadTicketRecord & { resultPayload?: Record<string, unknown> | null }>();
+      const jobMap = new Map<string, Record<string, unknown>>();
+
+      let activeTicketId: string | null = null;
+      let activeJobId: string | null = null;
+
+      // Stateful Drizzle-compatible fake DB enforcing unique constraints on versions & history.
+      const statefulDb = {
+        select(cols?: Record<string, unknown>) {
+          let targetTable: unknown;
+          const resolve = () => {
+            if (targetTable === uploadTickets) {
+              const row = activeTicketId ? ticketMap.get(activeTicketId) : undefined;
+              return Promise.resolve(row ? [row] : []);
+            }
+            if (targetTable === projects) {
+              return Promise.resolve([{ ...projectRow }]);
+            }
+            if (targetTable === projectFiles) {
+              return Promise.resolve([...projectFilesMap.values()]);
+            }
+            if (targetTable === projectVersions) {
+              const maxVer = versionRows.reduce((m, r) => Math.max(m, Number(r.versionNumber ?? 0)), 0);
+              return Promise.resolve([{ maxVer }]);
+            }
+            if (targetTable === projectHistoryEntries) {
+              if (cols && 'maxSeq' in cols) {
+                const maxSeq = historyRows.reduce((m, r) => Math.max(m, Number(r.seq ?? 0)), 0);
+                return Promise.resolve([{ maxSeq }]);
+              }
+              const parent = historyRows.find((h) => h.seq === projectRow.currentHistorySeq);
+              return Promise.resolve(parent ? [{ id: parent.id }] : []);
+            }
+            return Promise.resolve([]);
+          };
+          const chain: Record<string, unknown> = {
+            from(table: unknown) {
+              targetTable = table;
+              return chain;
+            },
+            where: () => chain,
+            limit: () => chain,
+            for: () => chain,
+            then: (ok: (v: unknown) => unknown, err?: (e: unknown) => unknown) => resolve().then(ok, err),
+          };
+          return chain;
+        },
+        insert(table: unknown) {
+          return {
+            values(rawValues: unknown) {
+              const run = () => {
+                const rows = Array.isArray(rawValues) ? rawValues : [rawValues];
+                if (table === projectFiles) {
+                  for (const row of rows as Array<Record<string, unknown>>) {
+                    projectFilesMap.set(String(row.path), {
+                      workspaceId: String(row.workspaceId),
+                      projectId: String(row.projectId),
+                      path: String(row.path),
+                      blobScope: row.blobScope as 'workspace' | 'catalog',
+                      sha256: String(row.sha256),
+                      sizeBytes: Number(row.sizeBytes),
+                      mimeType: String(row.mimeType),
+                      isText: Boolean(row.isText),
+                    });
+                  }
+                } else if (table === projectVersions) {
+                  for (const row of rows as Array<Record<string, unknown>>) {
+                    assert.equal(
+                      versionRows.some((v) => v.versionNumber === row.versionNumber),
+                      false,
+                      `Duplicate project_versions.version_number ${String(row.versionNumber)}`,
+                    );
+                    if (row.requestId) {
+                      assert.equal(
+                        versionRows.some((v) => v.requestId === row.requestId),
+                        false,
+                        `Duplicate project_versions.request_id ${String(row.requestId)}`,
+                      );
+                    }
+                    versionRows.push({ ...row });
+                  }
+                } else if (table === projectVersionFiles) {
+                  for (const row of rows as Array<Record<string, unknown>>) {
+                    versionFileRows.push({ ...row });
+                  }
+                } else if (table === projectHistoryEntries) {
+                  for (const row of rows as Array<Record<string, unknown>>) {
+                    assert.equal(
+                      historyRows.some((h) => h.seq === row.seq),
+                      false,
+                      `Duplicate project_history_entries.seq ${String(row.seq)}`,
+                    );
+                    historyRows.push({ ...row });
+                  }
+                }
+                return Promise.resolve(rows);
+              };
+              const chain: Record<string, unknown> = {
+                onConflictDoUpdate: () => chain,
+                returning: () => run(),
+                then: (ok: (v: unknown) => unknown, err?: (e: unknown) => unknown) => run().then(ok, err),
+              };
+              return chain;
+            },
+          };
+        },
+        update(table: unknown) {
+          return {
+            set(values: Record<string, unknown>) {
+              const run = () => {
+                if (table === projects) {
+                  Object.assign(projectRow, values);
+                } else if (table === uploadTickets && activeTicketId) {
+                  const row = ticketMap.get(activeTicketId);
+                  if (row) Object.assign(row, values);
+                } else if (table === jobs && activeJobId) {
+                  const row = jobMap.get(activeJobId);
+                  if (row) Object.assign(row, values);
+                }
+                return Promise.resolve([]);
+              };
+              const chain: Record<string, unknown> = {
+                where: () => chain,
+                returning: () => run(),
+                then: (ok: (v: unknown) => unknown, err?: (e: unknown) => unknown) => run().then(ok, err),
+              };
+              return chain;
+            },
+          };
+        },
+        delete() {
+          const chain: Record<string, unknown> = {
+            where: () => chain,
+            then: (ok: (v: unknown) => unknown, err?: (e: unknown) => unknown) => Promise.resolve([]).then(ok, err),
+          };
+          return chain;
+        },
+        transaction: async <T>(fn: (tx: Database) => Promise<T>): Promise<T> => fn(statefulDb as unknown as Database),
+      } as unknown as Database;
+
+      const store: ImportAssetsStore = {
+        async assertActiveProject(workspaceId, projectId) {
+          assert.equal(workspaceId, WID_A);
+          assert.equal(projectId, PID_A);
+          return { id: projectId };
+        },
+        async findReceipt(workspaceId, scope, requestId) {
+          return receipts.get(`${workspaceId}:${scope}:${requestId}`) ?? null;
+        },
+        async saveCompletedReceipt(input) {
+          receipts.set(`${input.workspaceId}:${input.scope}:${input.requestId}`, {
+            inputHash: input.inputHash,
+            state: 'completed',
+            responsePayload: input.responsePayload,
+          });
+        },
+        async insertUploadTicket(input) {
+          const rec: UploadTicketRecord = { ...input, state: 'issued' };
+          ticketMap.set(rec.id, rec);
+          return rec;
+        },
+        async findUploadTicket(_workspaceId, ticketId) {
+          return ticketMap.get(ticketId) ?? null;
+        },
+        async markUploadTicketProcessing(_workspaceId, ticketId) {
+          const rec = ticketMap.get(ticketId);
+          if (!rec || (rec.state !== 'issued' && rec.state !== 'uploaded')) return false;
+          rec.state = 'processing';
+          return true;
+        },
+        async revertUploadTicketProcessing(_workspaceId, ticketId, previousState) {
+          const rec = ticketMap.get(ticketId);
+          if (rec) rec.state = previousState;
+        },
+        async createMediaIngestJob(input) {
+          jobMap.set(input.id, { ...input, state: 'queued' });
+        },
+        async markMediaIngestJobFailed(_workspaceId, jobId, errorCode, errorMessage) {
+          const row = jobMap.get(jobId);
+          if (row) Object.assign(row, { state: 'failed', errorCode, errorMessage });
+        },
+        async commitLibraryAssetZeroCopy() {
+          throw new Error('not used');
+        },
+      };
+
+      const enqueued: Array<{ name: MediaIngestJobName; payload: MediaIngestPayloadMap[MediaIngestJobName] }> = [];
+      const importService = new CloudImportAssetsService({
+        store,
+        storage,
+        queues: {
+          async enqueueMediaIngest(name, payload) {
+            // Run the REAL BullMQ Zod payload validator to prove targetPath survives queue validation!
+            const validated = validateMediaIngestPayload(name, payload);
+            enqueued.push({ name, payload: validated });
+            return {} as never;
+          },
+        },
+        config: {
+          S3_PRESIGN_PUT_TTL_SEC: 900,
+          ALLOW_DOH_FAKEIP_FALLBACK: false,
+        },
+        urlValidation: {
+          resolveDns: true,
+          dnsLookup: async () => [{ address: '93.184.216.34', family: 4 }],
+        },
+      });
+
+      const auth = {
+        workspaceId: WID_A,
+        userId: UID_A,
+        role: 'editor' as const,
+        scopes: [...PAT_SCOPES],
+        authMode: 'dev' as const,
+        authMethod: 'pat' as const,
+      };
+
+      // Build deterministic PNG + WOFF2 + license + remote URL PNG fixtures.
+      const uploadPngBytes = await sharp({
+        create: { width: 24, height: 16, channels: 4, background: { r: 20, g: 160, b: 90, alpha: 1 } },
+      })
+        .png()
+        .toBuffer();
+      const uploadPngSha = createHash('sha256').update(uploadPngBytes).digest('hex');
+
+      const fontBytes = Buffer.concat([Buffer.from('wOF2', 'ascii'), Buffer.alloc(48, 0x55)]);
+      const fontSha = createHash('sha256').update(fontBytes).digest('hex');
+      const licenseBytes = Buffer.from('SIL Open Font License 1.1\n', 'utf8');
+      const licenseSha = createHash('sha256').update(licenseBytes).digest('hex');
+
+      const remotePngBytes = await sharp({
+        create: { width: 32, height: 20, channels: 4, background: { r: 180, g: 60, b: 220, alpha: 1 } },
+      })
+        .png()
+        .toBuffer();
+      const remotePngSha = createHash('sha256').update(remotePngBytes).digest('hex');
+
+      // Step 1: prepare_upload for an image + a WOFF2 font with companion license.
+      const prepared = await importService.prepareUpload(auth, {
+        action: 'prepare_upload',
+        projectId: PID_A,
+        requestId: 'req-e2e-prep',
+        files: [
+          {
+            itemId: 'img-1',
+            filename: 'hero.png',
+            mimeType: 'image/png',
+            bytes: uploadPngBytes.byteLength,
+            sha256: uploadPngSha,
+          },
+          {
+            itemId: 'font-1',
+            filename: 'Inter Bold:v2.woff2',
+            mimeType: 'font/woff2',
+            bytes: fontBytes.byteLength,
+            sha256: fontSha,
+            licenseFilename: 'OFL.txt',
+            licenseBytes: licenseBytes.byteLength,
+          },
+        ],
+      });
+
+      const imgTicket = ticketMap.get(prepared.tickets[0].ticketId)!;
+      const fontTicket = ticketMap.get(prepared.tickets[1].ticketId)!;
+      assert.equal(imgTicket.targetPath, `assets/imported/${imgTicket.id}.png`);
+      assert.equal(fontTicket.targetPath, 'fonts/Inter-Bold-v2.woff2');
+      assert.equal(resolveProjectAssetTargetPath('abc', 'clip.mp4', 'video/mp4'), 'assets/imported/abc.mp4');
+
+      // Simulate client presigned PUT uploads into S3 staging.
+      await storage.putObject(imgTicket.s3StagingKey, uploadPngBytes, 'image/png');
+      await storage.putObject(fontTicket.s3StagingKey, fontBytes, 'font/woff2');
+      await storage.putObject(fontTicket.licenseS3StagingKey!, licenseBytes, 'text/plain; charset=utf-8');
+
+      // Step 2: Commit both upload_tickets + a public HTTPS URL in a single batch (same requestId).
+      const batchRes = await importService.importItems(auth, {
+        projectId: PID_A,
+        requestId: 'req-e2e-batch',
+        items: [
+          { itemId: 'img-1', source: { kind: 'upload_ticket', ticketId: imgTicket.id }, name: 'Hero PNG' },
+          { itemId: 'font-1', source: { kind: 'upload_ticket', ticketId: fontTicket.id }, name: 'Inter Bold' },
+          {
+            itemId: 'url-1',
+            source: { kind: 'url', url: 'https://cdn.example.com/banner.png', expectedSha256: remotePngSha },
+            name: 'Remote Banner',
+          },
+        ],
+      });
+
+      assert.equal(batchRes.status, 'processing');
+      assert.equal(enqueued.length, 3);
+      assert.equal(enqueued[0].name, 'upload_commit');
+      assert.equal(enqueued[1].name, 'upload_commit');
+      assert.equal(enqueued[2].name, 'url_fetch');
+
+      const workerDeps = {
+        db: statefulDb,
+        storage,
+        eventBus: {
+          publish: async (channel: string, payload: unknown) => {
+            published.push({ channel, payload });
+            return 1;
+          },
+        },
+        logger: SILENT_LOGGER,
+        workerId: 'media-e2e-1',
+        tmpBaseDir: tmpRoot,
+        probeMedia: async (filePath: string) => {
+          const info = await stat(filePath);
+          const meta = await sharp(filePath).metadata();
+          return {
+            modality: 'image' as const,
+            mimeType: 'image/png',
+            extension: 'png',
+            sizeBytes: info.size,
+            width: meta.width ?? 16,
+            height: meta.height ?? 16,
+          };
+        },
+        fetchPublicUrlToFile: async (_url: string, destPath: string) => {
+          await writeFile(destPath, remotePngBytes);
+          return {
+            finalUrl: 'https://cdn.example.com/banner.png',
+            bytes: remotePngBytes.byteLength,
+            sha256: remotePngSha,
+          };
+        },
+        applyBlobDeltas: async (_tx: unknown, _wid: string, deltas: Parameters<typeof normalizeBlobRefDeltas>[0]) => {
+          // Verify deltas arrive already sorted ascending by sha256 to avoid PG deadlocks.
+          const shas = deltas.map((d) => d.sha256);
+          assert.deepEqual(shas, [...shas].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)));
+          for (const d of normalizeBlobRefDeltas(deltas)) {
+            const next = (blobRefCounts.get(d.sha256) ?? 0) + d.delta;
+            assert.ok(next >= 0, `CAS refcount underflow for ${d.sha256}`);
+            blobRefCounts.set(d.sha256, next);
+          }
+        },
+      };
+
+      // Step 3: Run worker-media handlers end-to-end on the exact enqueued payloads.
+      const imgPayload = enqueued[0].payload as MediaIngestPayloadMap['upload_commit'];
+      activeTicketId = imgPayload.uploadId;
+      activeJobId = imgPayload.jobId;
+      const imgCommitted = await handleUploadCommitJob(workerDeps, imgPayload);
+
+      const fontPayload = enqueued[1].payload as MediaIngestPayloadMap['upload_commit'];
+      activeTicketId = fontPayload.uploadId;
+      activeJobId = fontPayload.jobId;
+      const fontCommitted = await handleUploadCommitJob(workerDeps, fontPayload);
+
+      const urlPayload = enqueued[2].payload as MediaIngestPayloadMap['url_fetch'];
+      activeTicketId = null;
+      activeJobId = urlPayload.jobId;
+      const urlCommitted = await handleUrlFetchJob(workerDeps, urlPayload);
+
+      // Step 4: Verify project_files, canonical projects.revision, versions, snapshots, history, events & CAS refcounts.
+      const expectedPaths = [
+        'index.html',
+        'assets/bg.webp',
+        `assets/imported/${imgTicket.id}.png`,
+        'fonts/Inter-Bold-v2.woff2',
+        'fonts/OFL.txt',
+        `assets/imported/${urlPayload.jobId}.png`,
+      ];
+      assert.deepEqual([...projectFilesMap.keys()].sort(), [...expectedPaths].sort());
+
+      const finalExpectedRevision = computeProjectRevision(
+        [...projectFilesMap.values()].map((f) => ({ path: f.path, size: f.sizeBytes, hash: f.sha256 })),
+      );
+      assert.equal(projectRow.revision, finalExpectedRevision);
+      assert.notEqual(projectRow.revision, initialRevision);
+      assert.equal(projectRow.currentVersionNumber, 4);
+      assert.equal(projectRow.currentHistorySeq, 4);
+      assert.equal(versionRows.length, 4);
+      assert.deepEqual(
+        versionRows.map((v) => v.versionNumber),
+        [1, 2, 3, 4],
+      );
+      assert.equal(versionRows[3].id, projectRow.currentVersionId);
+      assert.equal(versionRows[3].revision, finalExpectedRevision);
+      assert.equal(imgCommitted.projectVersionNumber, 2);
+      assert.equal(fontCommitted.projectVersionNumber, 3);
+      assert.equal(urlCommitted.projectVersionNumber, 4);
+      assert.equal(urlCommitted.projectRevision, finalExpectedRevision);
+
+      // Verify project_version_files snapshots match file counts per version (2 -> 3 -> 5 -> 6).
+      const countForVersion = (versionId: unknown) =>
+        versionFileRows.filter((row) => row.versionId === versionId).length;
+      assert.equal(countForVersion(versionRows[0].id), 2);
+      assert.equal(countForVersion(versionRows[1].id), 3);
+      assert.equal(countForVersion(versionRows[2].id), 5);
+      assert.equal(countForVersion(versionRows[3].id), 6);
+
+      // Verify history chain links parentEntryId sequentially across v1 -> v2 -> v3 -> v4.
+      assert.deepEqual(
+        historyRows.map((h) => h.seq),
+        [1, 2, 3, 4],
+      );
+      assert.equal(historyRows[1].parentEntryId, historyRows[0].id);
+      assert.equal(historyRows[2].parentEntryId, historyRows[1].id);
+      assert.equal(historyRows[3].parentEntryId, historyRows[2].id);
+
+      // Verify exact CAS refcounts (live project_files + all project_version_files snapshots).
+      const imgCasSha = String(imgCommitted.sha256);
+      const urlCasSha = String(urlCommitted.sha256);
+      assert.equal(blobRefCounts.get(indexHtmlSha), 5); // 1 live + 4 snapshots (v1..v4)
+      assert.equal(blobRefCounts.get(imgCasSha), 4); // 1 live + 3 snapshots (v2..v4)
+      assert.equal(blobRefCounts.get(fontSha), 3); // 1 live + 2 snapshots (v3..v4)
+      assert.equal(blobRefCounts.get(licenseSha), 3); // 1 live + 2 snapshots (v3..v4)
+      assert.equal(blobRefCounts.get(urlCasSha), 2); // 1 live + 1 snapshot (v4)
+      assert.equal(blobRefCounts.has(catalogBgSha), false, 'Catalog blobs must never enter workspace_blobs');
+
+      // Verify om:project:{wid}:{pid} events carry the real updated projects.revision (not raw file sha256).
+      const projEvents = published.filter((e) => e.channel === projectChannel(WID_A, PID_A));
+      assert.equal(projEvents.length, 3);
+      assert.equal((projEvents[0].payload as { revision: string }).revision, imgCommitted.projectRevision);
+      assert.equal((projEvents[1].payload as { revision: string }).revision, fontCommitted.projectRevision);
+      assert.equal((projEvents[2].payload as { revision: string }).revision, finalExpectedRevision);
+      assert.deepEqual((projEvents[1].payload as { paths: string[] }).paths, [
+        'fonts/Inter-Bold-v2.woff2',
+        'fonts/OFL.txt',
+      ]);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
   });
 });

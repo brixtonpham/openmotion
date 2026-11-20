@@ -153,6 +153,7 @@ export interface UploadTicketRecord {
   workspaceId: string;
   userId: string | null;
   targetProjectId: string | null;
+  targetPath: string | null;
   filename: string;
   expectedMimeType: string | null;
   expectedSha256: string | null;
@@ -197,6 +198,7 @@ export interface ImportAssetsStore {
     workspaceId: string;
     userId: string;
     targetProjectId: string;
+    targetPath: string;
     filename: string;
     expectedMimeType: string;
     expectedSha256: string | null;
@@ -249,6 +251,8 @@ function sanitizeFilename(raw: string): string {
   return base;
 }
 
+const FONT_EXTENSIONS: ReadonlySet<string> = new Set(['.woff2', '.woff', '.ttf', '.otf', '.ttc']);
+
 function extensionFromMimeOrFilename(filename: string, mimeType: string): string {
   const fromFile = path.posix.extname(filename).toLowerCase().replace(/^\./, '');
   if (/^[a-z0-9]{1,8}$/.test(fromFile)) return fromFile;
@@ -257,16 +261,71 @@ function extensionFromMimeOrFilename(filename: string, mimeType: string): string
     'image/jpeg': 'jpg',
     'image/webp': 'webp',
     'image/gif': 'gif',
+    'image/svg+xml': 'svg',
     'video/mp4': 'mp4',
     'video/webm': 'webm',
+    'video/quicktime': 'mov',
     'audio/wav': 'wav',
     'audio/mpeg': 'mp3',
     'audio/mp4': 'm4a',
     'audio/aac': 'aac',
     'audio/ogg': 'ogg',
     'audio/flac': 'flac',
+    'font/woff2': 'woff2',
+    'font/woff': 'woff',
+    'font/ttf': 'ttf',
+    'font/otf': 'otf',
+    'font/collection': 'ttc',
+    'application/font-woff': 'woff',
+    'application/font-woff2': 'woff2',
+    'application/x-font-ttf': 'ttf',
+    'application/x-font-otf': 'otf',
   };
   return map[mimeType.toLowerCase()] ?? 'bin';
+}
+
+function sanitizeFontBasename(filename: string, fallbackId: string, ext: string): string {
+  const rawBase = path.posix.basename(filename.replaceAll('\\', '/')).trim();
+  const rawExt = path.posix.extname(rawBase);
+  const rawStem = rawExt ? rawBase.slice(0, -rawExt.length) : rawBase;
+  const cleanedStem = rawStem
+    .replace(/[^A-Za-z0-9._-]+/g, '-')
+    .replace(/^[.-]+/, '')
+    .replace(/-+/g, '-')
+    .replace(/-+$/, '')
+    .slice(0, 120);
+  const safeStem = cleanedStem || fallbackId;
+  return `${safeStem}.${ext}`;
+}
+
+/**
+ * Compute a deterministic, `projectPath(...)`-validated target path inside a project:
+ * - Font files (`.woff2`/`.woff`/`.ttf`/`.otf`/`.ttc` or `font/*` MIME) -> `fonts/<safe>`
+ * - All other media assets -> `assets/imported/<ticketId-or-jobId>.<ext>`
+ */
+export function resolveProjectAssetTargetPath(
+  id: string,
+  filename: string,
+  mimeType = '',
+): string {
+  const extFromName = path.posix.extname(filename).toLowerCase();
+  const lowerMime = mimeType.toLowerCase();
+  const isFont =
+    FONT_EXTENSIONS.has(extFromName) ||
+    lowerMime.startsWith('font/') ||
+    lowerMime === 'application/font-woff' ||
+    lowerMime === 'application/font-woff2' ||
+    lowerMime === 'application/x-font-ttf' ||
+    lowerMime === 'application/x-font-otf';
+
+  if (isFont) {
+    const ext = extensionFromMimeOrFilename(filename, mimeType);
+    const safeExt = FONT_EXTENSIONS.has(`.${ext}`) ? ext : 'woff2';
+    return projectPath(`fonts/${sanitizeFontBasename(filename, id, safeExt)}`);
+  }
+
+  const ext = extensionFromMimeOrFilename(filename, mimeType);
+  return projectPath(`assets/imported/${id}.${ext}`);
 }
 
 export function createPgImportAssetsStore(db: Database): ImportAssetsStore {
@@ -350,6 +409,7 @@ export function createPgImportAssetsStore(db: Database): ImportAssetsStore {
             userId: input.userId,
             purpose: 'project_asset',
             targetProjectId: input.targetProjectId,
+            targetPath: input.targetPath,
             filename: input.filename,
             expectedMimeType: input.expectedMimeType,
             expectedSha256: input.expectedSha256,
@@ -834,6 +894,17 @@ export class CloudImportAssetsService {
       }
 
       const ticketId = randomUUID();
+      const targetPath = resolveProjectAssetTargetPath(ticketId, filename, file.mimeType);
+      if (licenseFilename) {
+        try {
+          projectPath(path.posix.join(path.posix.dirname(targetPath), licenseFilename));
+        } catch {
+          throw new CloudError('INVALID_ARGUMENT', `Invalid licenseFilename: ${licenseFilename}`, {
+            status: 400,
+            applied: false,
+          });
+        }
+      }
       const s3StagingKey = uploadStagingKey(auth.workspaceId, ticketId);
       const licenseS3StagingKey = hasLicense
         ? uploadLicenseStagingKey(auth.workspaceId, ticketId)
@@ -844,6 +915,7 @@ export class CloudImportAssetsService {
         workspaceId: auth.workspaceId,
         userId: auth.userId,
         targetProjectId: input.projectId,
+        targetPath,
         filename,
         expectedMimeType: file.mimeType,
         expectedSha256: file.sha256 ?? null,
@@ -1077,6 +1149,9 @@ export class CloudImportAssetsService {
         const jobId = randomUUID();
         const displayName = (item.name?.trim() || ticket.filename).slice(0, 200);
         const expectedSha256 = source.expectedSha256 ?? ticket.expectedSha256 ?? undefined;
+        const targetPath = ticket.targetPath
+          ? projectPath(ticket.targetPath)
+          : resolveProjectAssetTargetPath(ticket.id, ticket.filename, ticket.expectedMimeType ?? '');
         let jobCreated = false;
 
         try {
@@ -1089,6 +1164,7 @@ export class CloudImportAssetsService {
               kind: 'upload_ticket',
               uploadId: ticket.id,
               itemId: item.itemId,
+              targetPath,
               name: displayName,
               ...(expectedSha256 ? { expectedSha256 } : {}),
             },
@@ -1102,6 +1178,7 @@ export class CloudImportAssetsService {
             userId: auth.userId,
             purpose: 'project_asset',
             targetProjectId: projectId,
+            targetPath,
             name: displayName,
             requestId,
             ...(expectedSha256 ? { expectedSha256 } : {}),
@@ -1137,6 +1214,7 @@ export class CloudImportAssetsService {
             kind: 'upload_ticket',
             ticketId: ticket.id,
             importJobId: jobId,
+            path: targetPath,
           },
         };
       }
@@ -1149,6 +1227,7 @@ export class CloudImportAssetsService {
         const jobId = randomUUID();
         const urlPathName = path.posix.basename(new URL(validatedUrl).pathname) || 'imported-asset';
         const displayName = (item.name?.trim() || urlPathName).slice(0, 200);
+        const targetPath = resolveProjectAssetTargetPath(jobId, urlPathName);
 
         await this.deps.store.createMediaIngestJob({
           id: jobId,
@@ -1158,6 +1237,7 @@ export class CloudImportAssetsService {
           inputPayload: {
             kind: 'url',
             url: validatedUrl,
+            targetPath,
             ...(source.licenseUrl ? { licenseUrl: source.licenseUrl } : {}),
             ...(source.expectedSha256 ? { expectedSha256: source.expectedSha256 } : {}),
             itemId: item.itemId,
@@ -1171,9 +1251,11 @@ export class CloudImportAssetsService {
             workspaceId: auth.workspaceId,
             url: validatedUrl,
             targetProjectId: projectId,
+            targetPath,
             itemId: item.itemId,
             name: displayName,
             requestId,
+            ...(source.expectedSha256 ? { expectedSha256: source.expectedSha256 } : {}),
           });
         } catch (enqueueError) {
           const message =
@@ -1201,6 +1283,7 @@ export class CloudImportAssetsService {
             kind: 'url',
             url: validatedUrl,
             importJobId: jobId,
+            path: targetPath,
           },
         };
       }
