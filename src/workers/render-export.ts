@@ -4,6 +4,7 @@ import { access, mkdir, open, readdir, readFile, rm, stat, writeFile } from 'nod
 import os from 'node:os';
 import path from 'node:path';
 import { and, eq } from 'drizzle-orm';
+import sharp from 'sharp';
 import {
   pluginRoot,
   runHyperframesIsolated,
@@ -297,6 +298,120 @@ async function computeFileSha256(filePath: string): Promise<string> {
   return hash.digest('hex');
 }
 
+const ALLOWED_RENDER_QUALITIES: ReadonlySet<string> = new Set(['draft', 'looks', 'delivery', 'standard', 'high']);
+const SAFE_FPS_STRING = /^\d{1,6}(?:\/\d{1,6})?$/;
+const SAFE_RESOLUTION_PRESET = /^[a-z0-9-]{2,32}$/i;
+const SAFE_BITRATE_STRING = /^\d+(?:\.\d+)?[kKmM]?$/;
+
+/**
+ * Build validated CLI arguments for `hyperframes@0.9.7 render`, forwarding only safe
+ * allowlisted `payload.settings` (`fps`, `quality`, `resolution`, `crf`, `videoBitrate`,
+ * `gifLoop`, `variables`).
+ */
+export function buildRenderExportArgs(params: {
+  compositionPath: string;
+  outputFilePath: string;
+  format: 'mp4' | 'mov' | 'webm' | 'gif';
+  settings?: Record<string, unknown>;
+}): string[] {
+  const args: string[] = [
+    'render',
+    '.',
+    ...(params.compositionPath !== 'index.html' ? ['--composition', params.compositionPath] : []),
+    '--output',
+    params.outputFilePath,
+    '--format',
+    params.format,
+  ];
+
+  const settings = params.settings;
+  if (settings && typeof settings === 'object' && !Array.isArray(settings)) {
+    if (typeof settings.fps === 'number' && Number.isFinite(settings.fps) && settings.fps >= 1 && settings.fps <= 240) {
+      args.push('--fps', String(settings.fps));
+    } else if (typeof settings.fps === 'string' && SAFE_FPS_STRING.test(settings.fps.trim())) {
+      args.push('--fps', settings.fps.trim());
+    }
+
+    if (typeof settings.quality === 'string' && ALLOWED_RENDER_QUALITIES.has(settings.quality.trim())) {
+      args.push('--quality', settings.quality.trim());
+    }
+
+    if (typeof settings.resolution === 'string' && SAFE_RESOLUTION_PRESET.test(settings.resolution.trim())) {
+      args.push('--resolution', settings.resolution.trim());
+    }
+
+    const hasCrf =
+      params.format !== 'mov' &&
+      typeof settings.crf === 'number' &&
+      Number.isInteger(settings.crf) &&
+      settings.crf >= 0 &&
+      settings.crf <= 51;
+    const hasBitrate =
+      params.format !== 'mov' &&
+      typeof settings.videoBitrate === 'string' &&
+      SAFE_BITRATE_STRING.test(settings.videoBitrate.trim());
+
+    // --crf and --video-bitrate are mutually exclusive in hyperframes@0.9.7.
+    if (hasCrf && !hasBitrate) {
+      args.push('--crf', String(settings.crf));
+    } else if (hasBitrate && !hasCrf) {
+      args.push('--video-bitrate', (settings.videoBitrate as string).trim());
+    }
+
+    if (
+      params.format === 'gif' &&
+      typeof settings.gifLoop === 'number' &&
+      Number.isInteger(settings.gifLoop) &&
+      settings.gifLoop >= 0 &&
+      settings.gifLoop <= 65_535
+    ) {
+      args.push('--gif-loop', String(settings.gifLoop));
+    }
+
+    if (settings.variables && typeof settings.variables === 'object' && !Array.isArray(settings.variables)) {
+      args.push('--variables', JSON.stringify(settings.variables));
+    }
+  }
+
+  args.push('--json');
+  return args;
+}
+
+/**
+ * Build valid `hyperframes@0.9.7 snapshot` CLI arguments for capturing a single composition
+ * thumbnail PNG at `timeSec` (never passing unsupported `--format png` or `--start/--end`).
+ */
+export function buildThumbnailSnapshotArgs(params: {
+  framesDir: string;
+  timeSec: number;
+  compositionId?: string | null;
+}): string[] {
+  const safeTime = Number.isFinite(params.timeSec) && params.timeSec >= 0 ? params.timeSec : 0;
+  return [
+    'snapshot',
+    '.',
+    '--output',
+    params.framesDir,
+    '--at',
+    String(safeTime),
+    '--no-end',
+    ...(params.compositionId ? ['--composition', params.compositionId] : []),
+    '--json',
+  ];
+}
+
+async function resolveNonRootCompositionId(projectDir: string, compositionPath: string): Promise<string | null> {
+  const normalized = compositionPath.replace(/^\/+/, '') || 'index.html';
+  if (normalized === 'index.html') return null;
+  try {
+    const html = await readFile(path.join(projectDir, normalized), 'utf8');
+    const match = /\bdata-composition-id\s*=\s*["']([^"']+)["']/i.exec(html);
+    return match?.[1]?.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
 async function verifyContainerHeader(filePath: string, format: string): Promise<void> {
   const info = await stat(filePath);
   if (!info.isFile() || info.size <= 16) {
@@ -496,16 +611,12 @@ export async function processExportRenderJob(
     assertRenderSubprocessEnvClean(renderEnv);
 
     let lastPublishAt = 0;
-    const renderArgs = [
-      'render',
-      '.',
-      ...(compositionPath !== 'index.html' ? ['--composition', compositionPath] : []),
-      '--output',
+    const renderArgs = buildRenderExportArgs({
+      compositionPath,
       outputFilePath,
-      '--format',
       format,
-      '--json',
-    ];
+      settings: payload.settings,
+    });
 
     const runRender = deps.runRenderCommand ?? runHyperframesIsolated;
     const renderResult = await runRender(runtimeRoot, projectDir, renderArgs, {
@@ -727,26 +838,16 @@ async function defaultRenderCompositionThumbnail(params: {
   env: Record<string, string>;
   signal?: AbortSignal;
 }): Promise<void> {
-  // Use Hyperframes CLI PNG sequence single-frame render in stripped env so Chromium + Hyperframes
-  // execute strictly inside the isolated allowlisted env without leaking worker secrets.
+  // Use hyperframes@0.9.7 built-in `snapshot` subcommand in stripped env so Chromium executes
+  // strictly inside the allowlisted env without leaking worker secrets.
   const framesDir = path.join(path.dirname(params.outputPngPath), 'frames');
   await mkdir(framesDir, { recursive: true, mode: 0o700 });
-  const args = [
-    'render',
-    '.',
-    ...(params.compositionPath !== 'index.html' ? ['--composition', params.compositionPath] : []),
-    '--output',
+  const compositionId = await resolveNonRootCompositionId(params.projectDir, params.compositionPath);
+  const args = buildThumbnailSnapshotArgs({
     framesDir,
-    '--format',
-    'png',
-    '--start',
-    String(params.timeSec),
-    '--end',
-    String(params.timeSec + 0.05),
-    '--workers',
-    '1',
-    '--json',
-  ];
+    timeSec: params.timeSec,
+    compositionId,
+  });
 
   const result = await runHyperframesIsolated(params.runtimeRoot, params.projectDir, args, {
     env: params.env,
@@ -754,16 +855,28 @@ async function defaultRenderCompositionThumbnail(params: {
     signal: params.signal,
   });
   if (result.code !== 0) {
-    throw new Error(`Composition thumbnail render failed: ${(result.stderr || result.stdout).slice(-1000)}`);
+    throw new Error(`Composition thumbnail snapshot failed: ${(result.stderr || result.stdout).slice(-1000)}`);
   }
 
-  const entries = (await readdir(framesDir)).filter((name) => name.toLowerCase().endsWith('.png')).sort();
-  if (entries.length === 0) {
-    throw new Error('Composition thumbnail render produced no PNG frames');
+  const allPngs = (await readdir(framesDir))
+    .filter((name) => name.toLowerCase().endsWith('.png') && !name.includes('contact'))
+    .sort();
+  const targetPng = allPngs.find((name) => name.startsWith('at-')) ?? allPngs[0];
+  if (!targetPng) {
+    throw new Error('Composition thumbnail snapshot produced no PNG frames');
   }
 
-  const firstFrame = await readFile(path.join(framesDir, entries[0]));
-  await writeFile(params.outputPngPath, firstFrame, { mode: 0o600 });
+  const rawFrame = await readFile(path.join(framesDir, targetPng));
+  const resized = await sharp(rawFrame)
+    .resize({
+      width: params.width,
+      height: params.height,
+      fit: 'inside',
+      withoutEnlargement: true,
+    })
+    .png()
+    .toBuffer();
+  await writeFile(params.outputPngPath, resized, { mode: 0o600 });
 }
 
 /**

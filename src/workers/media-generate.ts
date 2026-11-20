@@ -305,6 +305,7 @@ export async function processMediaGenerateJob<K extends MediaGenerateJobName>(
 
   let unsubscribeCancel: (() => Promise<void>) | null = null;
   let claimedJob: typeof jobs.$inferSelect | null = null;
+  let terminalHandled = false;
 
   const publishProgress = async (
     state: JobProgressEvent['state'],
@@ -468,11 +469,39 @@ export async function processMediaGenerateJob<K extends MediaGenerateJobName>(
       if (pollResult.status === 'succeeded') {
         break;
       }
-      if (pollResult.status === 'failed' || pollResult.status === 'cancelled') {
+      if (pollResult.status === 'cancelled') {
         const outcomeUnknown = Boolean(pollResult.error?.outcomeUnknown);
-        const errorCode = pollResult.error?.code ?? `REMOTE_TASK_${pollResult.status.toUpperCase()}`;
+        const errorCode = pollResult.error?.code ?? 'REMOTE_TASK_CANCELLED';
         const errorMessage =
-          pollResult.error?.message ?? `Upstream generation task ${pollResult.status} (${errorCode})`;
+          pollResult.error?.message ?? `Upstream generation task cancelled (${errorCode})`;
+        const terminalNow = new Date();
+        await deps.db
+          .update(jobs)
+          .set(
+            asUpdate(jobs, {
+              state: 'cancelled',
+              stage: 'cancelled',
+              remoteTerminal: !outcomeUnknown,
+              failureStage: 'generating',
+              errorCode,
+              errorMessage,
+              resultJson: pollResult.error ? { error: pollResult.error } : null,
+              terminalAt: terminalNow,
+              updatedAt: terminalNow,
+            }),
+          )
+          .where(and(eq(jobs.id, jobId), eq(jobs.workspaceId, workspaceId), eq(jobs.claimToken, claimToken)));
+
+        await publishProgress('cancelled', 'cancelled', 0, { errorCode, errorMessage });
+        terminalHandled = true;
+        return { jobId, state: 'cancelled', remoteId };
+      }
+
+      if (pollResult.status === 'failed') {
+        const outcomeUnknown = Boolean(pollResult.error?.outcomeUnknown);
+        const errorCode = pollResult.error?.code ?? 'REMOTE_TASK_FAILED';
+        const errorMessage =
+          pollResult.error?.message ?? `Upstream generation task failed (${errorCode})`;
         const terminalNow = new Date();
         await deps.db
           .update(jobs)
@@ -492,6 +521,7 @@ export async function processMediaGenerateJob<K extends MediaGenerateJobName>(
           .where(and(eq(jobs.id, jobId), eq(jobs.workspaceId, workspaceId), eq(jobs.claimToken, claimToken)));
 
         await publishProgress('failed', 'failed', 0, { errorCode, errorMessage });
+        terminalHandled = true;
         throw new CloudError('STORAGE_ERROR', errorMessage, { status: 502 });
       }
 
@@ -743,7 +773,7 @@ export async function processMediaGenerateJob<K extends MediaGenerateJobName>(
     await publishProgress('completed', 'completed', 100, { resultJson: finalPayload });
     return { jobId, state: 'completed', ...finalPayload };
   } catch (error) {
-    if (claimedJob) {
+    if (claimedJob && !terminalHandled) {
       const isCancelled =
         abortController.signal.aborted || (error instanceof Error && error.message === 'COMMAND_CANCELLED');
       const now = new Date();

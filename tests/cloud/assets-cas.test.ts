@@ -331,6 +331,13 @@ describe('SSRF URL & Hardened Public IP Validation', () => {
       'https://[fe80::1]/a.png',
       'https://[::ffff:127.0.0.1]/a.png',
       'https://[::ffff:169.254.169.254]/a.png',
+      // Trailing-dot FQDN SSRF bypass attempts:
+      'https://localhost./secret',
+      'https://sub.localhost./secret',
+      'https://metadata.google.internal./computeMetadata/v1/',
+      'https://postgres.openmotion.svc.cluster.local./a.png',
+      'https://service.local./a.png',
+      'https://redis./a.png',
     ];
 
     for (const candidate of blockedUrls) {
@@ -547,6 +554,42 @@ describe('AssetLibraryService: Presigned Tickets, Confirm Ownership, URL Import 
       { code: 'SSRF_BLOCKED' },
     );
     assert.equal(enqueued.length, 1);
+
+    // Enqueue failure marks job failed and deletes idempotency_receipts so requestId is never stranded.
+    const { db: rollbackDb, ops: rollbackOps } = createScriptedDb({
+      selectQueue: [[]],
+      insertImpl(_table, values) {
+        return [values];
+      },
+    });
+    const failingQueueService = new AssetLibraryService({
+      db: rollbackDb,
+      storage,
+      queues: {
+        enqueueMediaIngest: async () => {
+          throw new Error('Redis connection refused');
+        },
+      },
+    });
+    await assert.rejects(
+      () =>
+        failingQueueService.importFromPublicUrl(authFor(), {
+          url: 'https://cdn.example.com/assets/retry-me.mp4',
+          name: 'Retry Me',
+          requestId: 'req-url-fail',
+        }),
+      /Redis connection refused/,
+    );
+    assert.ok(
+      rollbackOps.some(
+        (o) =>
+          o.op === 'update' &&
+          o.table === jobs &&
+          (o.values as Record<string, unknown>)?.state === 'failed' &&
+          (o.values as Record<string, unknown>)?.errorCode === 'QUEUE_ENQUEUE_FAILED',
+      ),
+    );
+    assert.ok(rollbackOps.some((o) => o.op === 'delete' && o.table === idempotencyReceipts));
   });
 });
 

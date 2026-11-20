@@ -41,6 +41,7 @@ import {
 } from '../db/schema/blobs-assets.ts';
 import { jobs } from '../db/schema/jobs.ts';
 import { projectFiles } from '../db/schema/project-files.ts';
+import { projects } from '../db/schema/projects.ts';
 import type { Logger } from '../infra/logger.ts';
 import { jobChannel, projectChannel, type RedisEventBus } from '../infra/redis.ts';
 import {
@@ -458,7 +459,7 @@ export async function safePublicHttpsFetchToFile(
 
     for (let redirectCount = 0; ; redirectCount += 1) {
       const parsed = new URL(currentUrl);
-      const hostname = parsed.hostname.replace(/^\[|\]$/g, '');
+      const hostname = parsed.hostname.replace(/^\[|\]$/g, '').replace(/\.+$/, '').toLowerCase();
       const addresses = await resolveDns(hostname, totalController.signal);
       if (addresses.length === 0 || addresses.some((entry) => !isHardenedPublicIp(entry.address))) {
         throw new CloudError('SSRF_BLOCKED', 'DNS resolution returned a non-public IP address', { status: 400 });
@@ -627,6 +628,41 @@ async function retryOnBlobGcConflict<T>(
   }
 }
 
+const FONT_EXTENSIONS: ReadonlySet<string> = new Set(['.woff2', '.woff', '.ttf', '.otf', '.ttc']);
+
+export interface DetectedFontInfo {
+  mimeType: string;
+  extension: string;
+  sizeBytes: number;
+}
+
+/**
+ * Inspect font binary magic bytes (`wOF2`, `wOFF`, `OTTO`, TrueType `00 01 00 00`/`true`/`ttcf`)
+ * so `project_asset` font uploads (+ companion license) bypass `ffprobe` cleanly.
+ */
+export async function detectFontBinary(filePath: string, targetPath?: string): Promise<DetectedFontInfo | null> {
+  const bytes = await readFile(filePath);
+  if (bytes.byteLength < 12 || bytes.byteLength > MAX_ASSET_BYTES) return null;
+
+  const sigAscii = bytes.subarray(0, 4).toString('ascii');
+  const sigHex = bytes.subarray(0, 4).toString('hex');
+  const ext = targetPath ? path.posix.extname(targetPath).toLowerCase() : '';
+
+  if (sigAscii === 'wOF2') return { mimeType: 'font/woff2', extension: 'woff2', sizeBytes: bytes.byteLength };
+  if (sigAscii === 'wOFF') return { mimeType: 'font/woff', extension: 'woff', sizeBytes: bytes.byteLength };
+  if (sigAscii === 'OTTO') return { mimeType: 'font/otf', extension: 'otf', sizeBytes: bytes.byteLength };
+  if (sigHex === '00010000' || sigAscii === 'true' || sigAscii === 'ttcf') {
+    return { mimeType: 'font/ttf', extension: 'ttf', sizeBytes: bytes.byteLength };
+  }
+  // Reject files claiming a font extension whose magic bytes are not a valid font container.
+  if (FONT_EXTENSIONS.has(ext)) {
+    throw new CloudError('INVALID_ARGUMENT', 'Uploaded font file has unrecognized or corrupt font header bytes', {
+      status: 400,
+    });
+  }
+  return null;
+}
+
 async function promoteFileToLibraryOrProject(
   deps: MediaIngestDeps,
   params: {
@@ -651,10 +687,26 @@ async function promoteFileToLibraryOrProject(
   sha256: string;
   sizeBytes: number;
   mimeType: string;
-  modality: AssetModality;
+  modality: AssetModality | 'font';
   thumbnailKey?: string;
   projectPath?: string;
+  licenseProjectPath?: string;
 }> {
+  if (params.purpose === 'project_archive') {
+    throw new CloudError(
+      'INVALID_ARGUMENT',
+      'project_archive uploads must be processed by the archive import service, not media-ingest upload_commit',
+      { status: 400 },
+    );
+  }
+  if (params.purpose === 'project_asset' && (!params.targetProjectId || !params.targetPath)) {
+    throw new CloudError(
+      'INVALID_ARGUMENT',
+      'project_asset uploads require both targetProjectId and targetPath',
+      { status: 400 },
+    );
+  }
+
   const runCmd = deps.runFfmpegCommand ?? defaultRunFfmpegCommand;
   const probe = deps.probeMedia ?? ((file: string) => probeMediaFile(file, runCmd));
   const thumbFn =
@@ -663,22 +715,48 @@ async function promoteFileToLibraryOrProject(
       defaultGenerateThumbnailBuffer(file, media, opts, runCmd));
   const applyDeltas = deps.applyBlobDeltas ?? applyWorkspaceBlobRefDeltas;
 
-  const probed = await probe(params.filePath);
-  if (params.expectedModality && probed.modality !== params.expectedModality) {
-    throw new CloudError(
-      'INVALID_ARGUMENT',
-      `Uploaded media modality "${probed.modality}" does not match expected "${params.expectedModality}"`,
-      { status: 400 },
-    );
+  // Support font uploads (`project_asset` + optional companion license) without running ffprobe/thumbnailing.
+  const detectedFont =
+    params.purpose === 'project_asset' && !params.expectedModality
+      ? await detectFontBinary(params.filePath, params.targetPath)
+      : null;
+
+  let probed: ProbedMediaInfo | null = null;
+  let mimeType: string;
+  let modality: AssetModality | 'font';
+  let sha256: string;
+  let sizeBytes: number;
+  let finalBytes: Buffer;
+  let blobMetadata: BlobMetadata | null = null;
+
+  if (detectedFont) {
+    finalBytes = await readFile(params.filePath);
+    sha256 = createHash('sha256').update(finalBytes).digest('hex');
+    sizeBytes = finalBytes.byteLength;
+    mimeType = detectedFont.mimeType;
+    modality = 'font';
+    blobMetadata = { mimeType: detectedFont.mimeType };
+  } else {
+    probed = await probe(params.filePath);
+    if (params.expectedModality && probed.modality !== params.expectedModality) {
+      throw new CloudError(
+        'INVALID_ARGUMENT',
+        `Uploaded media modality "${probed.modality}" does not match expected "${params.expectedModality}"`,
+        { status: 400 },
+      );
+    }
+
+    // Strip SDR PNG colour tags before finalizing CAS sha256 (#9 §6.5).
+    const normalized = await normalizeSdrPngFileIfApplicable(params.filePath, probed.mimeType);
+    finalBytes = await readFile(params.filePath);
+    sha256 = normalized.sha256;
+    sizeBytes = finalBytes.byteLength;
+    mimeType = probed.mimeType;
+    modality = probed.modality;
+    blobMetadata = toBlobMetadata(probed, normalized.normalized ? { sdrNormalized: true } : {});
   }
 
-  // Strip SDR PNG colour tags before finalizing CAS sha256 (#9 §6.5).
-  const normalized = await normalizeSdrPngFileIfApplicable(params.filePath, probed.mimeType);
-  const finalBytes = await readFile(params.filePath);
-  const sha256 = normalized.sha256;
-  const sizeBytes = finalBytes.byteLength;
   const blobKey = workspaceBlobKey(params.workspaceId, sha256);
-  const blobMetadata = toBlobMetadata(probed, normalized.normalized ? { sdrNormalized: true } : {});
 
   // Optional companion font license blob (e.g. uploaded alongside font/project asset).
   let licenseSha256: string | null = null;
@@ -688,17 +766,19 @@ async function promoteFileToLibraryOrProject(
     licenseBlobKey = workspaceBlobKey(params.workspaceId, licenseSha256);
   }
 
-  // Generate thumbnail off-thread before PG tx.
+  // Generate thumbnail off-thread before PG tx (skipped for fonts and audio).
   let uploadedThumbKey: string | undefined;
-  const thumbBuffer = await thumbFn(params.filePath, probed, { width: 320 }).catch(() => null);
-  if (thumbBuffer && thumbBuffer.byteLength > 0) {
-    uploadedThumbKey = thumbnailKey(params.workspaceId, sha256, 'w320');
-    await deps.storage.putObject(uploadedThumbKey, thumbBuffer, 'image/jpeg', thumbBuffer.byteLength);
+  if (probed) {
+    const thumbBuffer = await thumbFn(params.filePath, probed, { width: 320 }).catch(() => null);
+    if (thumbBuffer && thumbBuffer.byteLength > 0) {
+      uploadedThumbKey = thumbnailKey(params.workspaceId, sha256, 'w320');
+      await deps.storage.putObject(uploadedThumbKey, thumbBuffer, 'image/jpeg', thumbBuffer.byteLength);
+    }
   }
 
   // INVARIANT: Upload bytes to S3 CAS BEFORE opening PG transaction!
   const uploadCasBlobs = async () => {
-    await deps.storage.putBlobIfAbsent(blobKey, finalBytes, probed.mimeType);
+    await deps.storage.putBlobIfAbsent(blobKey, finalBytes, mimeType);
     if (licenseBlobKey && params.licenseBuffer) {
       await deps.storage.putBlobIfAbsent(licenseBlobKey, params.licenseBuffer, 'text/plain; charset=utf-8');
     }
@@ -724,7 +804,7 @@ async function promoteFileToLibraryOrProject(
           sha256,
           delta: 1,
           sizeBytes,
-          mimeType: probed.mimeType,
+          mimeType,
           s3Key: blobKey,
           metadata: blobMetadata,
         },
@@ -733,9 +813,25 @@ async function promoteFileToLibraryOrProject(
       let createdAssetId: string | undefined;
       let createdVersionId: string | undefined;
       let committedProjectPath: string | undefined;
+      let committedLicensePath: string | undefined;
       const now = new Date();
 
       if (params.purpose === 'project_asset' && params.targetProjectId && params.targetPath) {
+        // Lock parent project row FOR UPDATE so concurrent overwrites to the same path
+        // serialize and cannot double-decrement workspace_blobs.ref_count.
+        const lockedProject = await tx
+          .select({ id: projects.id, trashed: projects.trashed })
+          .from(projects)
+          .where(and(eq(projects.id, params.targetProjectId), eq(projects.workspaceId, params.workspaceId)))
+          .for('update')
+          .limit(1);
+        if (lockedProject.length === 0) {
+          throw new CloudError('PROJECT_NOT_FOUND', 'Target project not found', { status: 404 });
+        }
+        if (lockedProject[0].trashed) {
+          throw new CloudError('PROJECT_TRASHED', 'Target project is in trash', { status: 400 });
+        }
+
         committedProjectPath = projectPath(params.targetPath);
         const existingFile = await tx
           .select()
@@ -758,6 +854,7 @@ async function promoteFileToLibraryOrProject(
           licenseTargetPath = projectPath(
             path.posix.join(path.posix.dirname(committedProjectPath), params.licenseFilename),
           );
+          committedLicensePath = licenseTargetPath;
           const existingLicense = await tx
             .select()
             .from(projectFiles)
@@ -822,7 +919,7 @@ async function promoteFileToLibraryOrProject(
               blobScope: 'workspace',
               sha256,
               sizeBytes,
-              mimeType: probed.mimeType,
+              mimeType,
               isText: isTextProjectPath(committedProjectPath),
               updatedAt: now,
             }),
@@ -833,13 +930,18 @@ async function promoteFileToLibraryOrProject(
               blobScope: 'workspace',
               sha256,
               sizeBytes,
-              mimeType: probed.mimeType,
+              mimeType,
               isText: isTextProjectPath(committedProjectPath),
               updatedAt: now,
             }),
           });
       } else {
-        // Library asset creation or new version append.
+        // Library asset creation or new version append (requires probed media info).
+        if (!probed) {
+          throw new CloudError('INVALID_ARGUMENT', 'Library assets must be image, video, or audio media', {
+            status: 400,
+          });
+        }
         await applyDeltas(tx, params.workspaceId, deltas);
 
         let assetId = params.targetAssetId;
@@ -930,12 +1032,13 @@ async function promoteFileToLibraryOrProject(
         jobId: params.jobId,
         sha256,
         sizeBytes,
-        mimeType: probed.mimeType,
-        modality: probed.modality,
+        mimeType,
+        modality,
         ...(createdAssetId ? { assetId: createdAssetId } : {}),
         ...(createdVersionId ? { versionId: createdVersionId } : {}),
         ...(uploadedThumbKey ? { thumbnailKey: uploadedThumbKey } : {}),
         ...(committedProjectPath ? { projectPath: committedProjectPath } : {}),
+        ...(committedLicensePath ? { licenseProjectPath: committedLicensePath } : {}),
       };
 
       if (params.uploadId) {
@@ -974,6 +1077,7 @@ async function promoteFileToLibraryOrProject(
         assetId: createdAssetId,
         versionId: createdVersionId,
         projectPath: committedProjectPath,
+        licenseProjectPath: committedLicensePath,
         resultPayload,
       };
     }),
@@ -992,12 +1096,16 @@ async function promoteFileToLibraryOrProject(
   };
   const publications: Promise<unknown>[] = [deps.eventBus.publish(jobChannel(params.jobId), readyEvent)];
   if (params.targetProjectId && committed.projectPath) {
+    const changedPaths = [
+      committed.projectPath,
+      ...(committed.licenseProjectPath ? [committed.licenseProjectPath] : []),
+    ];
     const projEvent: ProjectEvent = {
       type: 'file-change',
       workspaceId: params.workspaceId,
       projectId: params.targetProjectId,
       revision: sha256,
-      paths: [committed.projectPath],
+      paths: changedPaths,
       affectsPreview: true,
       ts: Date.now(),
     };
@@ -1010,10 +1118,11 @@ async function promoteFileToLibraryOrProject(
     versionId: committed.versionId,
     sha256,
     sizeBytes,
-    mimeType: probed.mimeType,
-    modality: probed.modality,
+    mimeType,
+    modality,
     thumbnailKey: uploadedThumbKey,
     projectPath: committed.projectPath,
+    licenseProjectPath: committed.licenseProjectPath,
   };
 }
 
@@ -1549,6 +1658,21 @@ export async function handleFreezeFrameJob(
 
     await retryOnBlobGcConflict(uploadBlobs, () =>
       deps.db.transaction(async (tx) => {
+        // Lock parent project row FOR UPDATE before reading existing project_files to prevent
+        // concurrent overwrite refcount double-decrements.
+        const lockedProject = await tx
+          .select({ id: projects.id, trashed: projects.trashed })
+          .from(projects)
+          .where(and(eq(projects.id, payload.projectId), eq(projects.workspaceId, payload.workspaceId)))
+          .for('update')
+          .limit(1);
+        if (lockedProject.length === 0) {
+          throw new CloudError('PROJECT_NOT_FOUND', 'Target project not found', { status: 404 });
+        }
+        if (lockedProject[0].trashed) {
+          throw new CloudError('PROJECT_TRASHED', 'Target project is in trash', { status: 400 });
+        }
+
         const deltas: BlobRefDelta[] = [
           {
             sha256: pngSha,

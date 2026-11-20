@@ -234,7 +234,7 @@ export function validatePublicImportUrl(raw: unknown): string {
   }
 
   const parsed = new URL(normalized);
-  const hostname = parsed.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  const hostname = parsed.hostname.replace(/^\[|\]$/g, '').replace(/\.+$/, '').toLowerCase();
   if (
     !hostname ||
     hostname === 'localhost' ||
@@ -876,18 +876,48 @@ export class AssetLibraryService {
     });
 
     if (!txOutcome.replayed) {
-      await this.queues.enqueueMediaIngest('url_fetch', {
-        jobId: txOutcome.jobId,
-        workspaceId: ctx.workspaceId,
-        url: normalizedUrl,
-        ...(input.targetProjectId ? { targetProjectId: input.targetProjectId } : {}),
-        ...(input.targetAssetId ? { targetAssetId: input.targetAssetId } : {}),
-        ...(input.parentVersionId ? { parentVersionId: input.parentVersionId } : {}),
-        ...(input.itemId ? { itemId: input.itemId } : {}),
-        name,
-        requestId,
-        ...(input.expectedModality ? { expectedModality: input.expectedModality } : {}),
-      });
+      try {
+        await this.queues.enqueueMediaIngest('url_fetch', {
+          jobId: txOutcome.jobId,
+          workspaceId: ctx.workspaceId,
+          url: normalizedUrl,
+          ...(input.targetProjectId ? { targetProjectId: input.targetProjectId } : {}),
+          ...(input.targetAssetId ? { targetAssetId: input.targetAssetId } : {}),
+          ...(input.parentVersionId ? { parentVersionId: input.parentVersionId } : {}),
+          ...(input.itemId ? { itemId: input.itemId } : {}),
+          name,
+          requestId,
+          ...(input.expectedModality ? { expectedModality: input.expectedModality } : {}),
+        });
+      } catch (error) {
+        const failNow = new Date();
+        await Promise.allSettled([
+          this.db
+            .update(jobs)
+            .set(
+              asUpdate(jobs, {
+                state: 'failed',
+                stage: 'failed',
+                failureStage: 'enqueue',
+                errorCode: 'QUEUE_ENQUEUE_FAILED',
+                errorMessage: error instanceof Error ? error.message : 'Failed to enqueue url_fetch job',
+                terminalAt: failNow,
+                updatedAt: failNow,
+              }),
+            )
+            .where(and(eq(jobs.id, txOutcome.jobId), eq(jobs.workspaceId, ctx.workspaceId))),
+          this.db
+            .delete(idempotencyReceipts)
+            .where(
+              and(
+                eq(idempotencyReceipts.workspaceId, ctx.workspaceId),
+                eq(idempotencyReceipts.scope, scope),
+                eq(idempotencyReceipts.requestId, requestId),
+              ),
+            ),
+        ]);
+        throw error;
+      }
     }
 
     return {

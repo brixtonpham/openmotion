@@ -377,6 +377,123 @@ describe('worker-media: upload_commit, SDR PNG stripping, Upload-Before-Referenc
       await rm(tmpRoot, { recursive: true, force: true });
     }
   });
+
+  it('promotes project_asset WOFF2 font + companion license without ffprobe and rejects project_archive', async () => {
+    const tmpRoot = await mkdtemp(path.join(os.tmpdir(), 'om-test-font-'));
+    try {
+      const storage = new InMemoryStorage();
+      const fontBytes = Buffer.concat([Buffer.from('wOF2', 'ascii'), Buffer.alloc(64, 0x2a)]);
+      const licenseBytes = Buffer.from('SIL Open Font License 1.1\n', 'utf8');
+      const fontSha = createHash('sha256').update(fontBytes).digest('hex');
+      const licenseSha = createHash('sha256').update(licenseBytes).digest('hex');
+
+      const mainStagingKey = uploadStagingKey(WID_A, UID_A);
+      const licStagingKey = uploadLicenseStagingKey(WID_A, UID_A);
+      await storage.putObject(mainStagingKey, fontBytes, 'font/woff2');
+      await storage.putObject(licStagingKey, licenseBytes, 'text/plain; charset=utf-8');
+
+      const ticketRow = {
+        id: UID_A,
+        workspaceId: WID_A,
+        userId: UID_A,
+        purpose: 'project_asset',
+        targetProjectId: PID_A,
+        targetAssetId: null,
+        targetPath: 'assets/fonts/Inter-Bold.woff2',
+        filename: 'Inter-Bold.woff2',
+        expectedMimeType: 'font/woff2',
+        expectedModality: null,
+        expectedSha256: fontSha,
+        maxBytes: 100_000,
+        s3StagingKey: mainStagingKey,
+        licenseS3StagingKey: licStagingKey,
+        licenseFilename: 'OFL.txt',
+        licenseMaxBytes: 10_000,
+        state: 'uploaded',
+        requestId: 'req-font-upload',
+        resultPayload: null,
+        error: null,
+        expiresAt: new Date(Date.now() + 60_000),
+      };
+
+      const appliedDeltas: Array<{ sha256: string; delta: number }> = [];
+      let ffprobeCalled = false;
+      const db = createFakeDb({
+        selectQueue: [
+          [ticketRow], // load ticket
+          [{ id: PID_A, trashed: false }], // lock parent project row FOR UPDATE
+          [], // existing font project_files
+          [], // existing license project_files
+        ],
+      });
+
+      const res = await handleUploadCommitJob(
+        {
+          db,
+          storage,
+          eventBus: { publish: async () => 1 },
+          logger: SILENT_LOGGER,
+          workerId: 'media-font-1',
+          tmpBaseDir: tmpRoot,
+          probeMedia: async () => {
+            ffprobeCalled = true;
+            throw new Error('ffprobe must not run for WOFF2 font uploads');
+          },
+          applyBlobDeltas: async (_tx, _wid, deltas) => {
+            for (const d of deltas) appliedDeltas.push({ sha256: d.sha256, delta: d.delta });
+          },
+        },
+        {
+          jobId: JID_A,
+          workspaceId: WID_A,
+          uploadId: UID_A,
+          purpose: 'project_asset',
+          targetProjectId: PID_A,
+          targetPath: 'assets/fonts/Inter-Bold.woff2',
+          name: 'Inter-Bold.woff2',
+        },
+      );
+
+      assert.equal(ffprobeCalled, false);
+      assert.equal(res.modality, 'font');
+      assert.equal(res.mimeType, 'font/woff2');
+      assert.equal(res.projectPath, 'assets/fonts/Inter-Bold.woff2');
+      assert.equal(res.licenseProjectPath, 'assets/fonts/OFL.txt');
+      assert.ok(storage.objects.has(workspaceBlobKey(WID_A, fontSha)));
+      assert.ok(storage.objects.has(workspaceBlobKey(WID_A, licenseSha)));
+      assert.equal(storage.objects.has(mainStagingKey), false);
+      assert.equal(storage.objects.has(licStagingKey), false);
+      assert.equal(appliedDeltas.length, 2);
+
+      // Explicit rejection of purpose === 'project_archive' (must never fall through into library_asset).
+      const archiveTicket = { ...ticketRow, purpose: 'project_archive', licenseS3StagingKey: null, expectedSha256: null };
+      await storage.putObject(mainStagingKey, Buffer.from('PK\x03\x04dummy-zip-content'), 'application/zip');
+      const archiveDb = createFakeDb({ selectQueue: [[archiveTicket]] });
+      await assert.rejects(
+        () =>
+          handleUploadCommitJob(
+            {
+              db: archiveDb,
+              storage,
+              eventBus: { publish: async () => 1 },
+              logger: SILENT_LOGGER,
+              workerId: 'media-font-1',
+              tmpBaseDir: tmpRoot,
+            },
+            {
+              jobId: JID_B,
+              workspaceId: WID_A,
+              uploadId: UID_A,
+              purpose: 'project_archive',
+              name: 'export.zip',
+            },
+          ),
+        { code: 'INVALID_ARGUMENT' },
+      );
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('worker-media: url_fetch SSRF & DNS-Pinning Checks', () => {
@@ -597,10 +714,17 @@ Summary:
       assert.equal(loudRes.derivedKey, derivedAssetKey(WID_A, SHA_A, 'loudness.json'));
       assert.ok(storage.objects.has(String(loudRes.derivedKey)));
 
-      // 4. freeze_frame
+      // 4. freeze_frame (locks parent project row FOR UPDATE before checking existing project_files)
+      const freezeDb = createFakeDb({
+        selectQueue: [
+          [{ id: PID_A, trashed: false }], // locked project row
+          [], // existing project_files
+        ],
+      });
       const freezeRes = await handleFreezeFrameJob(
         {
           ...baseDeps,
+          db: freezeDb,
           probeMedia: async () => ({
             modality: 'image',
             mimeType: 'image/png',
@@ -810,6 +934,150 @@ describe('worker-media: media-generate (remote_id persisted BEFORE polling + res
         { jobId: JID_B, workspaceId: WID_A, remoteId: 'remote_task_42' },
       );
       assert.equal(submitCount, 1, 'resume_generation must NEVER re-submit paid upstream task');
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('maps upstream cancelled status to cancelled and emits exactly one failed SSE event on upstream failure', async () => {
+    const tmpRoot = await mkdtemp(path.join(os.tmpdir(), 'om-test-gen-term-'));
+    try {
+      const storage = new InMemoryStorage();
+
+      // 1. Upstream cancelled -> state: 'cancelled', single cancelled event.
+      const cancelEvents: Array<Record<string, unknown>> = [];
+      const cancelDbUpdates: Array<Record<string, unknown>> = [];
+      const cancelDb = createFakeDb({
+        onUpdate(table, values) {
+          const v = values as Record<string, unknown>;
+          if (table === jobs && typeof v.claimToken === 'string') {
+            return [
+              {
+                id: JID_A,
+                workspaceId: WID_A,
+                projectId: null,
+                state: 'running',
+                claimToken: v.claimToken,
+                remoteId: 'remote_cancel_1',
+                inputPayload: {
+                  modality: 'image',
+                  mode: 'text-to-image',
+                  modelId: 'mock-image-1',
+                  prompt: 'Cancel test',
+                  parameters: {},
+                  assetName: 'Cancel Test',
+                },
+              },
+            ];
+          }
+          cancelDbUpdates.push(v);
+          return [{ id: JID_A }];
+        },
+      });
+      const cancelGateway: PlatformModelGateway = {
+        providerId: 'opendesign',
+        async listMediaModels() { return []; },
+        async uploadReference() { return { remoteAssetId: 'r' }; },
+        async submitTask() { throw new Error('must not submit'); },
+        async pollTask() {
+          return {
+            remoteTaskId: 'remote_cancel_1',
+            status: 'cancelled',
+            error: { code: 'USER_CANCELLED', message: 'Cancelled upstream' },
+          };
+        },
+        async downloadOutput() { throw new Error('no output'); },
+      };
+
+      const cancelRes = await processMediaGenerateJob(
+        {
+          db: cancelDb,
+          storage,
+          eventBus: {
+            publish: async (_ch, payload) => {
+              cancelEvents.push(payload as Record<string, unknown>);
+              return 1;
+            },
+            subscribe: async () => async () => {},
+          },
+          logger: SILENT_LOGGER,
+          workerId: 'media-gen-2',
+          gateway: cancelGateway,
+          pollIntervalMs: 1,
+          tmpBaseDir: tmpRoot,
+        },
+        'resume_generation',
+        { jobId: JID_A, workspaceId: WID_A, remoteId: 'remote_cancel_1' },
+      );
+      assert.equal(cancelRes.state, 'cancelled');
+      assert.ok(cancelDbUpdates.some((u) => u.state === 'cancelled'));
+      assert.equal(cancelEvents.filter((e) => e.state === 'cancelled').length, 1);
+      assert.equal(cancelEvents.filter((e) => e.state === 'failed').length, 0);
+
+      // 2. Upstream failed -> exactly ONE failed SSE event carrying upstream errorCode (never duplicate STORAGE_ERROR).
+      const failEvents: Array<Record<string, unknown>> = [];
+      const failDb = createFakeDb({
+        onUpdate(table, values) {
+          const v = values as Record<string, unknown>;
+          if (table === jobs && typeof v.claimToken === 'string') {
+            return [
+              {
+                id: JID_B,
+                workspaceId: WID_A,
+                projectId: null,
+                state: 'running',
+                claimToken: v.claimToken,
+                remoteId: 'remote_fail_1',
+                inputPayload: {
+                  modality: 'image',
+                  mode: 'text-to-image',
+                  modelId: 'mock-image-1',
+                  prompt: 'Fail test',
+                  parameters: {},
+                  assetName: 'Fail Test',
+                },
+              },
+            ];
+          }
+          return [{ id: JID_B }];
+        },
+      });
+      const failGateway: PlatformModelGateway = {
+        ...cancelGateway,
+        async pollTask() {
+          return {
+            remoteTaskId: 'remote_fail_1',
+            status: 'failed',
+            error: { code: 'insufficient_balance', message: 'Insufficient balance' },
+          };
+        },
+      };
+
+      await assert.rejects(() =>
+        processMediaGenerateJob(
+          {
+            db: failDb,
+            storage,
+            eventBus: {
+              publish: async (_ch, payload) => {
+                failEvents.push(payload as Record<string, unknown>);
+                return 1;
+              },
+              subscribe: async () => async () => {},
+            },
+            logger: SILENT_LOGGER,
+            workerId: 'media-gen-2',
+            gateway: failGateway,
+            pollIntervalMs: 1,
+            tmpBaseDir: tmpRoot,
+          },
+          'resume_generation',
+          { jobId: JID_B, workspaceId: WID_A, remoteId: 'remote_fail_1' },
+        ),
+      );
+      const failedPublished = failEvents.filter((e) => e.state === 'failed');
+      assert.equal(failedPublished.length, 1, 'Must emit exactly one failed event (no duplicate catch event)');
+      assert.equal(failedPublished[0].errorCode, 'insufficient_balance');
     } finally {
       await rm(tmpRoot, { recursive: true, force: true });
     }

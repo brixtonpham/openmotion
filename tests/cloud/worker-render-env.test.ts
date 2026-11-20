@@ -26,6 +26,8 @@ import {
   injectStudioRenderParityScripts,
 } from '../../src/workers/render-env.ts';
 import {
+  buildRenderExportArgs,
+  buildThumbnailSnapshotArgs,
   hydrateSnapshotFilesToDir,
   processExportRenderJob,
   processRenderThumbnailJob,
@@ -425,6 +427,93 @@ describe('Studio Manual Edits & Studio Motion Render Parity Injection (#9 §6.3 
     } finally {
       await rm(tmpDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('worker-render: CLI Argument Builders (hyperframes@0.9.7 snapshot & render settings)', () => {
+  it('builds valid hyperframes@0.9.7 snapshot args for composition thumbnails (never --format png or --start/--end)', () => {
+    const rootArgs = buildThumbnailSnapshotArgs({ framesDir: '/tmp/frames', timeSec: 2.5 });
+    assert.deepEqual(rootArgs, ['snapshot', '.', '--output', '/tmp/frames', '--at', '2.5', '--no-end', '--json']);
+    assert.equal(rootArgs.includes('--format'), false);
+    assert.equal(rootArgs.includes('--start'), false);
+    assert.equal(rootArgs.includes('--end'), false);
+
+    const subCompArgs = buildThumbnailSnapshotArgs({
+      framesDir: '/tmp/frames',
+      timeSec: 0,
+      compositionId: 'intro-scene',
+    });
+    assert.deepEqual(subCompArgs, [
+      'snapshot',
+      '.',
+      '--output',
+      '/tmp/frames',
+      '--at',
+      '0',
+      '--no-end',
+      '--composition',
+      'intro-scene',
+      '--json',
+    ]);
+  });
+
+  it('forwards allowlisted payload.settings onto hyperframes render CLI args cleanly', () => {
+    const mp4Args = buildRenderExportArgs({
+      compositionPath: 'compositions/hero.html',
+      outputFilePath: '/tmp/out/final.mp4',
+      format: 'mp4',
+      settings: {
+        fps: 60,
+        quality: 'delivery',
+        resolution: '1080p',
+        crf: 18,
+        variables: { title: 'Hello' },
+        ignoredUnsafeFlag: '--evil',
+      },
+    });
+    assert.deepEqual(mp4Args, [
+      'render',
+      '.',
+      '--composition',
+      'compositions/hero.html',
+      '--output',
+      '/tmp/out/final.mp4',
+      '--format',
+      'mp4',
+      '--fps',
+      '60',
+      '--quality',
+      'delivery',
+      '--resolution',
+      '1080p',
+      '--crf',
+      '18',
+      '--variables',
+      '{"title":"Hello"}',
+      '--json',
+    ]);
+
+    const gifArgs = buildRenderExportArgs({
+      compositionPath: 'index.html',
+      outputFilePath: '/tmp/out/loop.gif',
+      format: 'gif',
+      settings: { fps: '24000/1001', gifLoop: 0, videoBitrate: '8M' },
+    });
+    assert.deepEqual(gifArgs, [
+      'render',
+      '.',
+      '--output',
+      '/tmp/out/loop.gif',
+      '--format',
+      'gif',
+      '--fps',
+      '24000/1001',
+      '--video-bitrate',
+      '8M',
+      '--gif-loop',
+      '0',
+      '--json',
+    ]);
   });
 });
 
