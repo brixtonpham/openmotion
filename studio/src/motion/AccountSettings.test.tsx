@@ -91,7 +91,7 @@ it('shows the account email once, under the name only when the account has a dif
 });
 
 it('refreshes Go on checkout return and updates providers only after the plan changes', async () => {
-  const page = await open({ state: 'signed-in', plan: 'go', balance: '0.00' });
+  const page = await open({ state: 'signed-in', plan: 'go', balance: '0.00' }, 'en', 'subscription');
   const original = hooks.account;
   hooks.request.mockImplementation(async (route: string) => route === 'settings/account/subscription' ? { opened: true } : hooks.account);
   hooks.request.mockClear();
