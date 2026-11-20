@@ -161,7 +161,7 @@ it('replaces missing billing metrics with a dashboard link on 403 and restores t
 it('keeps the account page focused on sign-in and account management', async () => {
   const page = await open({ state: 'signed-out' });
   expect(actions(page)).toEqual(['Sign in with OpenDesign']);
-  expect(page.querySelector('.om-account-metrics, .om-plan-guide')).toBeNull();
+  expect(page.querySelector('.om-account-metrics, [data-guide="upgrade"]')).toBeNull();
   await act(async () => button(page, 'Sign in with OpenDesign')!.click());
   expect(hooks.request).toHaveBeenCalledWith('settings/account/login', 'POST', {});
 
@@ -172,14 +172,14 @@ it('keeps the account page focused on sign-in and account management', async () 
   expect(page.textContent).toContain('Model providers');
 });
 
-it('shows sign-in benefits and billing placeholders on the subscription page', async () => {
-  const page = await open({ state: 'signed-out' }, 'zh-CN', 'subscription');
+it.each(['account', 'subscription'] as const)('shows the same sign-in benefits on the %s page', async section => {
+  const page = await open({ state: 'signed-out' }, 'zh-CN', section);
   expect(page.querySelector('.om-plan-guide h2')?.textContent).toBe('登录 OpenDesign，开始多模态生成');
   expect(page.querySelector('.om-plan-guide .om-badge')?.textContent).toBe('Plus 及以上');
   expect(page.querySelector('.om-plan-guide .om-button')?.textContent).toBe('使用 OpenDesign 登录');
   expect([...page.querySelectorAll('.om-account-capabilities li')].map(item => item.textContent)).toEqual(['图片', '视频', '配音', '音乐']);
   expect(page.querySelector('.om-plan-guide p')?.textContent).toBe('登录后升级到 Plus，即可在 OpenMotion 里直接生成图片、视频、配音和音乐，不用配置 API 密钥。');
-  expect(page.querySelectorAll('.om-account-metrics .om-card')).toHaveLength(2);
+  expect(page.querySelectorAll('.om-account-metrics .om-card')).toHaveLength(section === 'subscription' ? 2 : 0);
   expect(page.querySelector('[data-guide="upgrade"]')).toBeNull();
 });
 
