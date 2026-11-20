@@ -51,7 +51,7 @@ import {
   type AuthMiddlewareDeps,
   type AuthStore,
 } from '../auth/index.ts';
-import type { AuthContext } from '../contracts/auth.ts';
+import { hasMinRole, hasScope, type AuthContext } from '../contracts/auth.ts';
 import { CloudError, featureDeferredP2, isCloudError } from '../contracts/errors.ts';
 import type { StoragePort } from '../contracts/storage.ts';
 import { createDbHandle, type Database, type DbHandle } from '../db/client.ts';
@@ -347,6 +347,24 @@ function createCloudMediaJobsPort(deps: {
   const serializeJob = (row: typeof jobs.$inferSelect): Record<string, unknown> => {
     const input = (row.inputPayload ?? {}) as Record<string, unknown>;
     const result = (row.resultJson ?? {}) as Record<string, unknown>;
+    const modality =
+      input.modality === 'image' || input.modality === 'video' || input.modality === 'audio'
+        ? input.modality
+        : 'image';
+    const mode =
+      typeof input.mode === 'string' && input.mode
+        ? input.mode
+        : modality === 'video'
+          ? 'text-to-video'
+          : modality === 'audio'
+            ? 'text-to-audio'
+            : 'text-to-image';
+    const modelId = typeof input.modelId === 'string' ? input.modelId : 'unknown';
+    const fullModelId = modelId.startsWith('opendesign:') ? modelId : `opendesign:${modelId}`;
+    const libraryAssets =
+      typeof result.assetId === 'string' && typeof result.versionId === 'string'
+        ? [{ assetId: result.assetId, versionId: result.versionId }]
+        : [];
     return {
       id: row.id,
       jobId: row.id,
@@ -355,12 +373,31 @@ function createCloudMediaJobsPort(deps: {
       kind: row.kind,
       state: row.state,
       stage: row.stage ?? row.state,
+      phase: row.stage ?? row.state,
       progress: Number(row.progress ?? 0),
       provider: 'opendesign',
-      modality: input.modality ?? null,
-      mode: input.mode ?? null,
-      model: input.modelId ?? null,
-      prompt: input.prompt ?? null,
+      modality,
+      mode,
+      modelId,
+      model: {
+        id: fullModelId,
+        provider: 'opendesign',
+        modelId,
+        label: modelId,
+        modality,
+        source: 'live',
+        mode,
+      },
+      prompt: typeof input.prompt === 'string' ? input.prompt : '',
+      parameters:
+        input.parameters && typeof input.parameters === 'object' && !Array.isArray(input.parameters)
+          ? (input.parameters as Record<string, unknown>)
+          : {},
+      requestHash: row.requestHash ?? '',
+      idempotencyKey: row.idempotencyKey ?? row.requestId ?? undefined,
+      saveToLibrary: true,
+      assets: [],
+      libraryAssets,
       remoteId: row.remoteId ?? null,
       savePending: row.savePending,
       requestId: row.requestId ?? null,
@@ -369,8 +406,9 @@ function createCloudMediaJobsPort(deps: {
       ...(typeof result.versionId === 'string' ? { versionId: result.versionId } : {}),
       ...(row.errorCode ? { errorCode: row.errorCode } : {}),
       ...(row.errorMessage ? { error: row.errorMessage } : {}),
-      createdAt: row.createdAt.toISOString(),
-      updatedAt: row.updatedAt.toISOString(),
+      createdAt: row.createdAt.getTime(),
+      updatedAt: row.updatedAt.getTime(),
+      ...(row.startedAt ? { startedAt: row.startedAt.getTime() } : {}),
       ...(row.terminalAt ? { terminalAt: row.terminalAt.toISOString() } : {}),
     };
   };
@@ -944,6 +982,7 @@ function createMcpDomainPorts(deps: {
           sessionId: project.sessionId,
           project,
           revision: project.revision,
+          currentVersionId: project.currentVersionId,
           version: {
             versionId: project.currentVersionId,
             versionNumber: project.currentVersionNumber,
@@ -1473,6 +1512,10 @@ function createMcpDomainPorts(deps: {
             modality: typeof args.modality === 'string' ? (args.modality as 'image' | 'video' | 'audio') : undefined,
             source: typeof args.source === 'string' ? (args.source as 'upload' | 'generated') : undefined,
             query: typeof args.query === 'string' ? args.query : undefined,
+            sort:
+              args.sort === 'newest' || args.sort === 'oldest' || args.sort === 'name'
+                ? args.sort
+                : undefined,
             trash: args.trash === true,
             offset: typeof args.offset === 'number' ? args.offset : undefined,
             limit: typeof args.limit === 'number' ? args.limit : undefined,
@@ -1487,6 +1530,53 @@ function createMcpDomainPorts(deps: {
             typeof args.versionId === 'string' ? args.versionId : undefined,
           );
           return detail as unknown as Record<string, unknown>;
+        }
+
+        if (action === 'update') {
+          const changes =
+            args.changes && typeof args.changes === 'object' && !Array.isArray(args.changes)
+              ? (args.changes as { name?: string; trashed?: boolean; currentVersionId?: string })
+              : {};
+          const asset = await deps.assets.updateAsset(auth, String(args.assetId ?? ''), {
+            ...(changes.name !== undefined ? { name: changes.name } : {}),
+            ...(changes.trashed !== undefined ? { trashed: changes.trashed } : {}),
+            ...(changes.currentVersionId !== undefined ? { currentVersionId: changes.currentVersionId } : {}),
+          });
+          return { asset };
+        }
+
+        if (action === 'import_to_project') {
+          const projectId = String(args.projectId ?? '');
+          const requestId = String(args.requestId ?? randomUUID());
+          const assetId = String(args.assetId ?? '');
+          const versionId = String(args.versionId ?? '');
+          const imported = await deps.importAssets.importItems(auth, {
+            projectId,
+            requestId,
+            items: [
+              {
+                itemId: assetId,
+                source: { kind: 'library_asset', assetId, versionId },
+                ...(typeof args.name === 'string' && args.name.trim() ? { name: args.name.trim() } : {}),
+              },
+            ],
+          });
+          const item = imported.items[0];
+          if (item?.status === 'failed') {
+            throw new CloudError(
+              (item.error?.code as never) || 'IMPORT_FAILED',
+              item.error?.message || 'Failed to import asset into project',
+              { status: 400, applied: false },
+            );
+          }
+          return {
+            projectId: imported.projectId,
+            revision: imported.revision,
+            versionId: imported.versionId,
+            item,
+            ...(item?.path ? { path: item.path } : {}),
+            replayed: imported.replayed ?? false,
+          };
         }
 
         if (action === 'rename') {
@@ -1828,6 +1918,17 @@ export function createApiApp(deps: CreateApiAppDeps): { app: Hono<AuthEnv>; serv
     );
   });
 
+  app.get('/motion-api/health', async (c) => {
+    const report = await checkReadiness();
+    return c.json(
+      {
+        ...report,
+        mcp: phase1McpCapabilities,
+      },
+      report.ok ? 200 : 503,
+    );
+  });
+
   // -------------------------------------------------------------------------
   // 2. Auth & OAuth 2.1 Routes (`/auth/*`, `/.well-known/*`, `/oauth/*`, `/motion-api/tokens*`)
   // -------------------------------------------------------------------------
@@ -1953,11 +2054,130 @@ export function createApiApp(deps: CreateApiAppDeps): { app: Hono<AuthEnv>; serv
   app.post('/motion-api/tracking', authMiddleware, (c) => {
     return c.json({ ok: true, accepted: false }, 202);
   });
+  const trackingPreferencesPayload = {
+    enabled: false,
+    preference: false,
+    locked: true,
+    reason: 'environment' as const,
+  };
+  app.get('/motion-api/tracking/preferences', authMiddleware, (c) => {
+    return c.json(trackingPreferencesPayload);
+  });
+  app.put('/motion-api/tracking/preferences', authMiddleware, (c) => {
+    return c.json(trackingPreferencesPayload);
+  });
+  app.post('/motion-api/tracking/preferences', authMiddleware, (c) => {
+    return c.json(trackingPreferencesPayload);
+  });
   app.post('/motion-api/diagnostics', authMiddleware, (c) => {
     return c.json({ ok: true, mode: 'cloud-container', version: VERSION });
   });
   app.post('/motion-api/diagnostics/events', authMiddleware, (c) => {
     return c.json({ ok: true }, 202);
+  });
+
+  // POST /motion-api/phase1/call — Studio bridge delegating directly to the canonical MCP tool dispatcher.
+  app.post('/motion-api/phase1/call', authWithWelcome, async (c) => {
+    const auth = getAuthContext(c);
+    let body: { name?: unknown; arguments?: unknown };
+    try {
+      const parsed = await c.req.json();
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new Error('Body must be a JSON object');
+      }
+      body = parsed as { name?: unknown; arguments?: unknown };
+    } catch {
+      throw new CloudError('INVALID_ARGUMENT', 'Request body must be a JSON object with name and optional arguments', {
+        status: 400,
+        applied: false,
+      });
+    }
+
+    if (typeof body.name !== 'string' || !body.name.trim()) {
+      throw new CloudError('INVALID_ARGUMENT', 'Tool name is required', { status: 400, applied: false });
+    }
+
+    const result = await mcpDispatcher.dispatch(body.name, body.arguments ?? {}, {
+      auth,
+      supportsMcpAppsUi: false,
+    });
+
+    const firstContent = result.content?.[0];
+    const firstText = firstContent?.type === 'text' ? firstContent.text : undefined;
+
+    if (result.isError) {
+      const structuredError = (result.structuredContent as { error?: Record<string, unknown> } | undefined)?.error;
+      const rawStatus = typeof structuredError?.status === 'number' ? structuredError.status : 400;
+      const status = (rawStatus >= 400 && rawStatus <= 599 ? rawStatus : 400) as ContentfulStatusCode;
+      const code = typeof structuredError?.code === 'string' ? structuredError.code : 'TOOL_FAILED';
+      const message =
+        typeof structuredError?.message === 'string'
+          ? structuredError.message
+          : firstText || 'Tool execution failed';
+      return c.json(
+        {
+          code,
+          error: message,
+          message,
+          applied: structuredError?.applied ?? false,
+          ...(structuredError?.details ? { details: structuredError.details } : {}),
+        },
+        status,
+      );
+    }
+
+    if (result.structuredContent !== undefined) {
+      return c.json(result.structuredContent, 200);
+    }
+    if (typeof firstText === 'string' && firstText.trim()) {
+      try {
+        return c.json(JSON.parse(firstText), 200);
+      } catch {
+        return c.json({ ok: true, text: firstText }, 200);
+      }
+    }
+    return c.json({ ok: true }, 200);
+  });
+
+  // GET /motion-api/generations & POST /motion-api/generations/:id/cancel — Studio media generation polling/cancel aliases.
+  app.get('/motion-api/generations', authWithWelcome, async (c) => {
+    const auth = getAuthContext(c);
+    if (!hasScope(auth, 'assets:read')) {
+      throw new CloudError('INSUFFICIENT_SCOPE', 'Missing required scope: assets:read', {
+        status: 403,
+        applied: false,
+      });
+    }
+    const projectId = c.req.query('projectId') || undefined;
+    const limitRaw = c.req.query('limit');
+    const offsetRaw = c.req.query('offset');
+    const limit = limitRaw !== undefined ? Number.parseInt(limitRaw, 10) : undefined;
+    const offset = offsetRaw !== undefined ? Number.parseInt(offsetRaw, 10) : undefined;
+    const list = await mediaJobs.listJobs(auth, {
+      projectId,
+      limit: limit !== undefined && Number.isFinite(limit) ? limit : undefined,
+      offset: offset !== undefined && Number.isFinite(offset) ? offset : undefined,
+    });
+    return c.json(list, 200);
+  });
+
+  app.post('/motion-api/generations/:id/cancel', authWithWelcome, async (c) => {
+    const auth = getAuthContext(c);
+    if (!hasScope(auth, 'media:generate')) {
+      throw new CloudError('INSUFFICIENT_SCOPE', 'Missing required scope: media:generate', {
+        status: 403,
+        applied: false,
+      });
+    }
+    if (!hasMinRole(auth, 'editor')) {
+      throw new CloudError('FORBIDDEN', 'Workspace editor role or higher is required', {
+        status: 403,
+        applied: false,
+      });
+    }
+    const jobId = c.req.param('id') ?? '';
+    const result = await mediaJobs.cancelJob(auth, jobId);
+    return c.json(result, 200);
   });
 
   // -------------------------------------------------------------------------
@@ -1967,6 +2187,7 @@ export function createApiApp(deps: CreateApiAppDeps): { app: Hono<AuthEnv>; serv
   // Note: In Hono, `/prefix/*` matches both `/prefix` and `/prefix/...`, so register once per prefix.
   app.use('/motion-api/projects/*', authWithWelcome);
   app.use('/motion-api/project/*', authWithWelcome);
+  app.use('/motion-api/preview/*', authWithWelcome);
   app.use('/motion-api/sessions/*', authWithWelcome);
   app.use('/motion-api/project-archives/*', authWithWelcome);
   app.use('/motion-api/assets/*', authWithWelcome);
@@ -1975,8 +2196,8 @@ export function createApiApp(deps: CreateApiAppDeps): { app: Hono<AuthEnv>; serv
   app.use('/motion-api/models/*', authWithWelcome);
   app.use('/motion-api/account/*', authWithWelcome);
 
-  app.route('/', createProjectsRouter({ workspace, files, history, assetNames, workRounds, archives }));
-  app.route('/', createSessionsRouter({ workspace }));
+  app.route('/', createProjectsRouter({ workspace, files, history, assetNames, workRounds, archives, exports: exportsService }));
+  app.route('/', createSessionsRouter({ workspace, exports: exportsService }));
   app.route('/', createArchivesRouter({ archives }));
   app.route('/motion-api/assets', createAssetRoutes({ assetService: assets }));
   app.route('/motion-api', createExportRoutes({ exportService: exportsService }));

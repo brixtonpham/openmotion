@@ -1,14 +1,36 @@
 import { Hono, type Context } from 'hono';
 import type { AuthContext, PatScope, WorkspaceRole } from '../contracts/auth.ts';
 import { CloudError, isCloudError } from '../contracts/errors.ts';
+import type { ExportService } from '../services/export-service.ts';
 import type { WorkspaceService } from '../services/workspace-service.ts';
 import { assertAuthAccess } from '../studio/context.ts';
 import { artifactViewers, creationModes } from '../../shared/session.ts';
-import type { ProductRouteVariables } from './projects.ts';
+import type { ProductRouteVariables, WorkspaceExportJobSummary } from './projects.ts';
 
 export interface SessionsRouterDeps {
   readonly workspace: WorkspaceService;
+  readonly exports?: Pick<ExportService, 'listProjectExports'>;
   readonly resolveAuth?: (c: Context<{ Variables: ProductRouteVariables }>) => AuthContext | Promise<AuthContext>;
+}
+
+async function resolveSessionExportJob(
+  exportsService: Pick<ExportService, 'listProjectExports'> | undefined,
+  auth: AuthContext,
+  projectId: string | undefined,
+): Promise<WorkspaceExportJobSummary | null> {
+  if (!exportsService || !projectId) return null;
+  try {
+    const list = await exportsService.listProjectExports(auth, projectId, { limit: 5 });
+    const active = list.find((job) => job.state === 'queued' || job.state === 'running');
+    if (!active) return null;
+    return {
+      id: active.id,
+      state: active.state === 'queued' ? 'pending' : 'running',
+      ...(active.errorMessage ? { error: active.errorMessage } : {}),
+    };
+  } catch {
+    return null;
+  }
 }
 
 const READ_REQ = { scope: 'projects:read' } as const;
@@ -59,13 +81,21 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Hono<{ Variables
   app.post('/motion-api/sessions', async (c) => {
     const auth = await requireAuth(c, deps, WRITE_REQ);
     const body = (await c.req.json().catch(() => ({}))) as {
+      id?: string;
       title?: string;
       mode?: string;
       templateId?: string;
       prompt?: string;
+      instruction?: string;
     };
-    const created = await deps.workspace.createSession(auth, body);
-    return c.json(created, 201);
+    const created = await deps.workspace.createSession(auth, {
+      id: body.id,
+      title: body.title,
+      mode: body.mode,
+      templateId: body.templateId,
+      prompt: body.prompt ?? body.instruction,
+    });
+    return c.json({ sessionId: created.id, session: created, ...created }, 201);
   });
 
   // GET /motion-api/sessions/:id — Session detail including artifacts and messages.
@@ -78,14 +108,33 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Hono<{ Variables
   app.patch('/motion-api/sessions/:id', async (c) => {
     const auth = await requireAuth(c, deps, WRITE_REQ);
     const body = (await c.req.json().catch(() => ({}))) as { title?: string };
-    return c.json(await deps.workspace.renameSession(auth, c.req.param('id'), body.title ?? ''));
+    const renamed = await deps.workspace.renameSession(auth, c.req.param('id'), body.title ?? '');
+    const catalog = await deps.workspace.getCatalog(auth);
+    return c.json({ ...renamed, ...catalog });
   });
 
   // POST /motion-api/sessions/:id/open — Activate session and its active artifact.
   app.post('/motion-api/sessions/:id/open', async (c) => {
     const auth = await requireAuth(c, deps, WRITE_REQ);
-    const opened = await deps.workspace.openSession(auth, c.req.param('id'));
-    return c.json({ ok: true, session: opened });
+    const body = (await c.req.json().catch(() => ({}))) as { projectId?: string };
+    const opened = await deps.workspace.openSession(auth, c.req.param('id'), body.projectId);
+    const activeArtifact =
+      (body.projectId ? opened.artifacts.find((item) => item.projectId === body.projectId) : undefined) ??
+      opened.artifacts.find((item) => item.id === opened.activeArtifactId) ??
+      opened.artifacts[0];
+    const project = activeArtifact
+      ? await deps.workspace.getProject(auth, activeArtifact.projectId, { allowTrashed: true })
+      : null;
+    const exportJob = await resolveSessionExportJob(deps.exports, auth, project?.id);
+    return c.json({
+      ok: true,
+      session: opened,
+      sessionId: opened.id,
+      projectId: project?.id ?? '',
+      projectTitle: project?.title ?? '',
+      revision: project?.revision ?? '',
+      exportJob,
+    });
   });
 
   // GET /motion-api/sessions/:id/messages — List session messages.
@@ -98,17 +147,19 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Hono<{ Variables
   // POST /motion-api/sessions/:id/messages — Append a session message (idempotent on caller UUID `id`).
   app.post('/motion-api/sessions/:id/messages', async (c) => {
     const auth = await requireAuth(c, deps, WRITE_REQ);
+    const sessionId = c.req.param('id');
     const body = (await c.req.json().catch(() => ({}))) as {
       id?: string;
       role?: 'user' | 'assistant';
       content?: string;
     };
-    const appended = await deps.workspace.appendMessage(auth, c.req.param('id'), {
+    const appended = await deps.workspace.appendMessage(auth, sessionId, {
       id: body.id,
       role: body.role,
       content: body.content ?? '',
     });
-    return c.json(appended, appended.replayed ? 200 : 201);
+    const detail = await deps.workspace.getSession(auth, sessionId);
+    return c.json({ ...detail, ...appended }, appended.replayed ? 200 : 201);
   });
 
   // POST /motion-api/sessions/:id/artifacts — Create a new motion project artifact inside an existing session.
@@ -121,6 +172,8 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Hono<{ Variables
       requirements?: string;
       namingLanguage?: string;
       requestId?: string;
+      prompt?: string;
+      instruction?: string;
       selectActive?: boolean;
     };
     const created = await deps.workspace.createProject(auth, {
@@ -130,9 +183,17 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Hono<{ Variables
       requirements: body.requirements,
       namingLanguage: body.namingLanguage,
       requestId: body.requestId,
+      initialPrompt: body.prompt ?? body.instruction,
       selectActive: body.selectActive,
     });
-    return c.json(created, created.replayed ? 200 : 201);
+    return c.json(
+      {
+        ...created,
+        projectTitle: created.title,
+        exportJob: null,
+      },
+      created.replayed ? 200 : 201,
+    );
   });
 
   return app;

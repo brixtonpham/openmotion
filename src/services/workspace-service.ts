@@ -1389,7 +1389,7 @@ export class WorkspaceService {
 
   async createSession(
     ctx: AuthContext,
-    input: { title?: string; mode?: string; templateId?: string | null; prompt?: string } = {},
+    input: { id?: string; title?: string; mode?: string; templateId?: string | null; prompt?: string; instruction?: string } = {},
   ): Promise<SessionDetail> {
     assertValidUuid(ctx.workspaceId, 'workspaceId');
     try {
@@ -1401,13 +1401,27 @@ export class WorkspaceService {
       });
     }
 
+    const requestedId = typeof input.id === 'string' && isUuid(input.id) ? input.id : undefined;
+    const promptText = input.prompt ?? input.instruction;
     const title = safeTitle(input.title, 'New Session');
     const now = new Date();
     const sessionId = await this.db.transaction(async (tx) => {
+      if (requestedId) {
+        const existing = await tx
+          .select({ id: sessions.id })
+          .from(sessions)
+          .where(and(eq(sessions.workspaceId, ctx.workspaceId), eq(sessions.id, requestedId)))
+          .limit(1);
+        if (existing[0]) {
+          return existing[0].id;
+        }
+      }
+
       const [sess] = await tx
         .insert(sessions)
         .values(
           asInsert(sessions, {
+            ...(requestedId ? { id: requestedId } : {}),
             workspaceId: ctx.workspaceId,
             title,
             mode: 'motion',
@@ -1419,8 +1433,8 @@ export class WorkspaceService {
         )
         .returning({ id: sessions.id });
 
-      if (input.prompt?.trim()) {
-        const content = validateInstruction(input.prompt);
+      if (promptText?.trim()) {
+        const content = validateInstruction(promptText);
         await tx.insert(sessionMessages).values(
           asInsert(sessionMessages, {
             id: randomUUID(),
@@ -1464,7 +1478,7 @@ export class WorkspaceService {
     return this.getSession(ctx, sessionId);
   }
 
-  async openSession(ctx: AuthContext, sessionId: string): Promise<SessionDetail> {
+  async openSession(ctx: AuthContext, sessionId: string, projectId?: string): Promise<SessionDetail> {
     assertValidUuid(ctx.workspaceId, 'workspaceId');
     assertValidUuid(sessionId, 'sessionId');
 
@@ -1494,7 +1508,10 @@ export class WorkspaceService {
         .orderBy(desc(projects.openedAt));
 
       const activeProj =
-        projRows.find((p) => p.artifactId === sess.activeArtifactId) ?? projRows[0] ?? null;
+        (projectId ? projRows.find((p) => p.id === projectId) : undefined) ??
+        projRows.find((p) => p.artifactId === sess.activeArtifactId) ??
+        projRows[0] ??
+        null;
       const now = new Date();
 
       await tx
