@@ -1,0 +1,101 @@
+import type { Context } from 'hono';
+import type { AuthContext } from '../contracts/auth.ts';
+import { CloudError, isCloudError } from '../contracts/errors.ts';
+import type { RenderWorkerHealth } from '../contracts/events.ts';
+import type {
+  MediaIngestJobName,
+  MediaIngestPayloadMap,
+  RenderExportJobName,
+  RenderExportPayloadMap,
+} from '../contracts/jobs.ts';
+import type { StoragePort } from '../contracts/storage.ts';
+import type { Database } from '../db/client.ts';
+import type { AssetNamesService } from '../services/asset-names-service.ts';
+import type { EventBusPort, HotTextCachePort, ProjectFilesService } from '../services/project-files-service.ts';
+import type { VersionHistoryService } from '../services/version-history-service.ts';
+import type { WorkRoundsService } from '../services/work-rounds-service.ts';
+import type { WorkspaceService } from '../services/workspace-service.ts';
+import type { ContainerFontCatalog } from './fonts-catalog.ts';
+
+export interface StudioEventBusPort extends EventBusPort {
+  subscribe(
+    channel: string,
+    listener: (payload: unknown, channel: string) => void,
+  ): Promise<() => Promise<void>>;
+  getRenderWorkersHealth(maxAgeMs?: number): Promise<RenderWorkerHealth[]>;
+}
+
+export interface StudioQueuesPort {
+  enqueueMediaIngest<K extends MediaIngestJobName>(
+    name: K,
+    payload: MediaIngestPayloadMap[K],
+    options?: Record<string, unknown>,
+  ): Promise<unknown>;
+  enqueueRenderExport<K extends RenderExportJobName>(
+    name: K,
+    payload: RenderExportPayloadMap[K],
+    options?: Record<string, unknown>,
+  ): Promise<unknown>;
+}
+
+export interface StudioVariables {
+  auth: AuthContext;
+}
+
+export interface DisklessStudioDeps {
+  readonly db: Database;
+  readonly storage: StoragePort;
+  readonly hotTextCache?: HotTextCachePort;
+  readonly eventBus?: StudioEventBusPort;
+  readonly queues?: StudioQueuesPort;
+  readonly workspace: WorkspaceService;
+  readonly files: ProjectFilesService;
+  readonly history: VersionHistoryService;
+  readonly assetNames: AssetNamesService;
+  readonly workRounds?: WorkRoundsService;
+  readonly fontCatalog?: ContainerFontCatalog;
+  readonly fontsDir?: string;
+  readonly runtimeRoot?: string;
+  readonly resolveAuth?: (c: Context<{ Variables: StudioVariables }>) => AuthContext | Promise<AuthContext>;
+  readonly skipDeterministicFonts?: boolean;
+  readonly fetchImpl?: typeof fetch;
+  readonly studioVersion?: string;
+}
+
+export async function getAuthContext(
+  c: Context<{ Variables: StudioVariables }>,
+  deps: DisklessStudioDeps,
+): Promise<AuthContext> {
+  if (deps.resolveAuth) {
+    return deps.resolveAuth(c);
+  }
+  const existing = c.get('auth');
+  if (!existing) {
+    throw new CloudError('UNAUTHORIZED', 'Authentication context is required.', {
+      status: 401,
+      applied: false,
+    });
+  }
+  return existing;
+}
+
+/** Extract a wildcard path segment after `marker` (e.g. `"/files/"`), safely URI-decoded. */
+export function extractWildcardPath(url: string, marker: string): string {
+  const pathname = new URL(url).pathname;
+  const idx = pathname.indexOf(marker);
+  if (idx < 0) return '';
+  const raw = pathname.slice(idx + marker.length);
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    throw new CloudError('INVALID_PATH', 'Malformed URL encoding in path.', { status: 400, applied: false });
+  }
+}
+
+export function handleStudioError(c: Context, error: unknown): Response {
+  if (isCloudError(error)) {
+    return c.json(error.toJSON(), error.status as 400);
+  }
+  const message = error instanceof Error ? error.message : 'Internal studio error';
+  return c.json({ code: 'INTERNAL_ERROR', error: message }, 500);
+}

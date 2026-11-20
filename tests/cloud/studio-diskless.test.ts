@@ -1,0 +1,1047 @@
+import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
+import { readFile, readdir } from 'node:fs/promises';
+import path from 'node:path';
+import { Readable } from 'node:stream';
+import { describe, it } from 'node:test';
+import { fileURLToPath } from 'node:url';
+import { drizzle } from 'drizzle-orm/node-postgres';
+import type { AuthContext } from '../../src/contracts/auth.ts';
+import type { RenderWorkerHealth } from '../../src/contracts/events.ts';
+import type {
+  HeadObjectResult,
+  ObjectStreamResult,
+  PresignGetOptions,
+  PresignPutOptions,
+  StoragePort,
+} from '../../src/contracts/storage.ts';
+import type { Database } from '../../src/db/client.ts';
+import * as schema from '../../src/db/schema/index.ts';
+import { createArchivesRouter } from '../../src/routes/archives.ts';
+import { createProjectsRouter } from '../../src/routes/projects.ts';
+import { createSessionsRouter } from '../../src/routes/sessions.ts';
+import { AssetNamesService } from '../../src/services/asset-names-service.ts';
+import { ProjectArchiveService } from '../../src/services/project-archive-service.ts';
+import {
+  ProjectFilesService,
+  type HotTextCachePort,
+} from '../../src/services/project-files-service.ts';
+import { VersionHistoryService } from '../../src/services/version-history-service.ts';
+import { WorkRoundsService } from '../../src/services/work-rounds-service.ts';
+import { WorkspaceService } from '../../src/services/workspace-service.ts';
+import {
+  DELETED_VERSION,
+  InMemoryVirtualProject,
+  bundlePreviewInMemory,
+  createDisklessStudioApp,
+  fileContentVersion,
+  infoInMemory,
+  lintProjectInMemory,
+  sha256Hex,
+  timelineInMemory,
+  type StudioEventBusPort,
+  type StudioQueuesPort,
+  type VirtualFileRecord,
+} from '../../src/studio/index.ts';
+import { compThumbnailKey, exportKey } from '../../src/infra/storage.ts';
+
+const REPO_ROOT = fileURLToPath(new URL('../../', import.meta.url));
+
+// ---------------------------------------------------------------------------
+// Compact Self-Contained In-Memory Drizzle PG + S3 + Redis Test Harness
+// ---------------------------------------------------------------------------
+
+type Row = Record<string, unknown>;
+const UUID_TABLES = new Set([
+  'workspaces',
+  'sessions',
+  'projects',
+  'work_rounds',
+  'project_versions',
+  'project_history_entries',
+  'jobs',
+]);
+
+class StudioTestPgClient {
+  readonly tables = new Map<string, Row[]>();
+  private snap: Map<string, Row[]> | null = null;
+
+  constructor() {
+    for (const t of [
+      'workspaces',
+      'sessions',
+      'session_messages',
+      'projects',
+      'work_rounds',
+      'project_files',
+      'project_versions',
+      'project_version_files',
+      'project_history_entries',
+      'workspace_blobs',
+      'catalog_templates',
+      'catalog_template_files',
+      'jobs',
+      'idempotency_receipts',
+    ]) {
+      this.tables.set(t, []);
+    }
+  }
+
+  seed(table: string, row: Row): void {
+    this.tables.get(table)!.push({ ...row });
+  }
+
+  rows(table: string): Row[] {
+    return this.tables.get(table)!;
+  }
+
+  async query(config: string | { text: string; rowMode?: string }, params: unknown[] = []): Promise<{ rows: unknown[] }> {
+    const sqlText = (typeof config === 'string' ? config : config.text).trim();
+    const rowMode = typeof config === 'string' ? undefined : config.rowMode;
+    const upper = sqlText.toUpperCase();
+
+    if (upper === 'BEGIN' || upper.startsWith('BEGIN ')) {
+      this.snap = new Map([...this.tables.entries()].map(([k, v]) => [k, v.map((r) => structuredClone(r))]));
+      return { rows: [] };
+    }
+    if (upper === 'COMMIT') {
+      this.snap = null;
+      return { rows: [] };
+    }
+    if (upper === 'ROLLBACK') {
+      if (this.snap) {
+        this.tables.clear();
+        for (const [k, v] of this.snap) this.tables.set(k, v);
+        this.snap = null;
+      }
+      return { rows: [] };
+    }
+    if (upper.startsWith('SELECT ')) return this.select(sqlText, params, rowMode);
+    if (upper.startsWith('INSERT INTO ')) return this.insert(sqlText, params, rowMode);
+    if (upper.startsWith('UPDATE ')) return this.update(sqlText, params, rowMode);
+    if (upper.startsWith('DELETE FROM ')) return this.del(sqlText, params, rowMode);
+    throw new Error(`Unsupported SQL: ${sqlText}`);
+  }
+
+  private select(sqlText: string, params: unknown[], rowMode?: string): { rows: unknown[] } {
+    const cleaned = sqlText.replace(/\s+for\s+update\s*$/i, '').trim();
+    const m = /^select\s+([\s\S]+?)\s+from\s+"([^"]+)"([\s\S]*)$/i.exec(cleaned)!;
+    const selectList = m[1].trim();
+    const table = m[2];
+    let rem = m[3].trim();
+    let limit: number | null = null;
+    let order = '';
+    let where = '';
+
+    const limM = /\s+limit\s+(\$\d+|\d+)\s*$/i.exec(rem);
+    if (limM) {
+      limit = limM[1].startsWith('$') ? Number(params[Number(limM[1].slice(1)) - 1]) : Number(limM[1]);
+      rem = rem.slice(0, limM.index).trim();
+    }
+    const ordM = /\s+order\s+by\s+([\s\S]+)$/i.exec(rem);
+    if (ordM) {
+      order = ordM[1].trim();
+      rem = rem.slice(0, ordM.index).trim();
+    }
+    const whM = /^where\s+([\s\S]+)$/i.exec(rem);
+    if (whM) where = whM[1].trim();
+
+    let matched = this.rows(table).filter((r) => (where ? evalW(r, where, params) : true));
+    if (/^COALESCE\s*\(\s*MAX\s*\(/i.test(selectList)) {
+      const col = /MAX\s*\(\s*"([^"]+)"\s*\)/i.exec(selectList)![1];
+      const maxVal = matched.reduce((acc, r) => Math.max(acc, Number(r[col] ?? 0)), 0);
+      return { rows: [rowMode === 'array' ? [maxVal] : { maxSeq: maxVal }] };
+    }
+    if (order) {
+      const specs = splitTop(order, ',').map((p) => {
+        const parts = p.trim().split(/\s+/);
+        return { col: colName(parts[0]), dir: parts[1]?.toLowerCase() === 'desc' ? -1 : 1 };
+      });
+      matched = [...matched].sort((a, b) => {
+        for (const s of specs) {
+          const av = sortVal(a[s.col]);
+          const bv = sortVal(b[s.col]);
+          if (av < bv) return -s.dir;
+          if (av > bv) return s.dir;
+        }
+        return 0;
+      });
+    }
+    if (limit !== null) matched = matched.slice(0, limit);
+    const cols = splitTop(selectList, ',').map(colName);
+    return { rows: fmtRows(matched, cols, rowMode) };
+  }
+
+  private insert(sqlText: string, params: unknown[], rowMode?: string): { rows: unknown[] } {
+    const retM = /\s+returning\s+([\s\S]+)$/i.exec(sqlText);
+    const retCols = retM ? splitTop(retM[1], ',').map(colName) : null;
+    const noRet = retM ? sqlText.slice(0, retM.index).trim() : sqlText;
+    const confM = /\s+on\s+conflict\s*\(([^)]+)\)\s+do\s+update\s+set\s+([\s\S]+)$/i.exec(noRet);
+    const target = confM ? splitTop(confM[1], ',').map(colName) : null;
+    let setC = '';
+    let whereC = '';
+    if (confM) {
+      const idx = findKw(confM[2].trim(), 'where');
+      setC = idx >= 0 ? confM[2].trim().slice(0, idx).trim() : confM[2].trim();
+      whereC = idx >= 0 ? confM[2].trim().slice(idx + 5).trim() : '';
+    }
+    const base = confM ? noRet.slice(0, confM.index).trim() : noRet;
+    const hM = /^insert\s+into\s+"([^"]+)"\s*\(([^)]+)\)\s+values\s+([\s\S]+)$/i.exec(base)!;
+    const table = hM[1];
+    const cols = splitTop(hM[2], ',').map(colName);
+    const tuples = splitTuples(hM[3].trim());
+    const rows = this.rows(table);
+    const out: Row[] = [];
+
+    for (const t of tuples) {
+      const exprs = splitTop(t, ',');
+      const row: Row = {};
+      for (let i = 0; i < cols.length; i++) {
+        row[cols[i]] = evalInsVal(table, cols[i], exprs[i].trim(), params);
+      }
+      if (UUID_TABLES.has(table) && !row.id) row.id = randomUUID();
+      if (table === 'projects') {
+        if (!row.artifact_id) row.artifact_id = randomUUID();
+        if (row.asset_name_allocations === undefined) row.asset_name_allocations = {};
+        if (row.reviews === undefined) row.reviews = [];
+        if (row.trashed === undefined) row.trashed = false;
+        if (row.trashed_at === undefined) row.trashed_at = null;
+      }
+      if (table === 'workspace_blobs' && !row.gc_state) row.gc_state = 'active';
+      if (target) {
+        const existing = rows.find((r) => target.every((k) => r[k] === row[k]));
+        if (existing) {
+          if (whereC && !evalW(existing, whereC, params)) continue;
+          applySet(existing, setC, params);
+          out.push(existing);
+          continue;
+        }
+      }
+      rows.push(row);
+      out.push(row);
+    }
+    return { rows: retCols ? fmtRows(out, retCols, rowMode) : [] };
+  }
+
+  private update(sqlText: string, params: unknown[], rowMode?: string): { rows: unknown[] } {
+    const retM = /\s+returning\s+([\s\S]+)$/i.exec(sqlText);
+    const retCols = retM ? splitTop(retM[1], ',').map(colName) : null;
+    const noRet = retM ? sqlText.slice(0, retM.index).trim() : sqlText;
+    const m = /^update\s+"([^"]+)"\s+set\s+([\s\S]+)$/i.exec(noRet)!;
+    const table = m[1];
+    const body = m[2].trim();
+    const wIdx = findKw(body, 'where');
+    const setC = wIdx >= 0 ? body.slice(0, wIdx).trim() : body;
+    const whereC = wIdx >= 0 ? body.slice(wIdx + 5).trim() : '';
+    const matched = this.rows(table).filter((r) => (whereC ? evalW(r, whereC, params) : true));
+    for (const r of matched) applySet(r, setC, params);
+    return { rows: retCols ? fmtRows(matched, retCols, rowMode) : [] };
+  }
+
+  private del(sqlText: string, params: unknown[], rowMode?: string): { rows: unknown[] } {
+    const retM = /\s+returning\s+([\s\S]+)$/i.exec(sqlText);
+    const retCols = retM ? splitTop(retM[1], ',').map(colName) : null;
+    const noRet = retM ? sqlText.slice(0, retM.index).trim() : sqlText;
+    const m = /^delete\s+from\s+"([^"]+)"(?:\s+where\s+([\s\S]+))?$/i.exec(noRet)!;
+    const table = m[1];
+    const whereC = m[2]?.trim() ?? '';
+    const kept: Row[] = [];
+    const removed: Row[] = [];
+    for (const r of this.rows(table)) {
+      if (!whereC || evalW(r, whereC, params)) removed.push(r);
+      else kept.push(r);
+    }
+    this.tables.set(table, kept);
+    return { rows: retCols ? fmtRows(removed, retCols, rowMode) : [] };
+  }
+}
+
+function colName(expr: string): string {
+  const m = [...expr.trim().replace(/\s+as\s+"[^"]+"$/i, '').matchAll(/"([^"]+)"/g)];
+  return m.length > 0 ? m[m.length - 1][1] : expr.trim();
+}
+function splitTop(input: string, sep: string): string[] {
+  const out: string[] = [];
+  let d = 0, sq = false, dq = false, st = 0;
+  for (let i = 0; i < input.length; i++) {
+    const c = input[i];
+    if (c === "'" && !dq) sq = !sq;
+    else if (c === '"' && !sq) dq = !dq;
+    else if (!sq && !dq) {
+      if (c === '(') d++;
+      else if (c === ')') d--;
+      else if (d === 0 && input.slice(i, i + sep.length) === sep) {
+        out.push(input.slice(st, i));
+        st = i + sep.length;
+        i += sep.length - 1;
+      }
+    }
+  }
+  out.push(input.slice(st));
+  return out;
+}
+function splitTuples(input: string): string[] {
+  const out: string[] = [];
+  let d = 0, sq = false, dq = false, st = -1;
+  for (let i = 0; i < input.length; i++) {
+    const c = input[i];
+    if (c === "'" && !dq) sq = !sq;
+    else if (c === '"' && !sq) dq = !dq;
+    else if (!sq && !dq) {
+      if (c === '(') { if (d === 0) st = i + 1; d++; }
+      else if (c === ')') { d--; if (d === 0 && st >= 0) { out.push(input.slice(st, i)); st = -1; } }
+    }
+  }
+  return out;
+}
+function findKw(input: string, kw: string): number {
+  const lo = input.toLowerCase();
+  let d = 0, sq = false, dq = false;
+  for (let i = 0; i < input.length; i++) {
+    const c = input[i];
+    if (c === "'" && !dq) sq = !sq;
+    else if (c === '"' && !sq) dq = !dq;
+    else if (!sq && !dq) {
+      if (c === '(') d++;
+      else if (c === ')') d--;
+      else if (d === 0 && lo.slice(i, i + kw.length) === kw && (i === 0 || /\s/.test(input[i - 1])) && (i + kw.length === input.length || /\s/.test(input[i + kw.length]))) return i;
+    }
+  }
+  return -1;
+}
+function evalSc(expr: string, params: unknown[]): unknown {
+  const t = expr.trim();
+  if (/^\$\d+$/.test(t)) {
+    const v = params[Number(t.slice(1)) - 1];
+    if (typeof v === 'string' && (v.startsWith('{') || v.startsWith('['))) {
+      try { return JSON.parse(v); } catch { return v; }
+    }
+    return v;
+  }
+  if (/^null$/i.test(t)) return null;
+  if (/^true$/i.test(t)) return true;
+  if (/^false$/i.test(t)) return false;
+  if (/^now\(\)$/i.test(t)) return new Date().toISOString();
+  if (/^'([^']*)'$/.test(t)) return t.slice(1, -1);
+  if (/^-?\d+(?:\.\d+)?$/.test(t)) return Number(t);
+  return t;
+}
+function evalInsVal(table: string, col: string, expr: string, params: unknown[]): unknown {
+  if (/^default$/i.test(expr)) {
+    if (col === 'id' && UUID_TABLES.has(table)) return randomUUID();
+    if (col === 'artifact_id') return randomUUID();
+    if (col.endsWith('_at') || col === 'started_at' || col === 'ended_at') return new Date().toISOString();
+    if (col === 'expires_at') return new Date(Date.now() + 86_400_000).toISOString();
+    if (['pinned', 'undone', 'trashed', 'remote_terminal', 'save_pending'].includes(col)) return false;
+    if (['current_version_number', 'current_history_seq', 'progress'].includes(col)) return 0;
+    if (['asset_name_allocations', 'input_payload', 'default_models'].includes(col)) return {};
+    if (col === 'reviews') return [];
+    if (col === 'gc_state') return 'active';
+    if (col === 'state') return table === 'jobs' ? 'queued' : 'pending';
+    if (col === 'mode') return 'motion';
+    return null;
+  }
+  return evalSc(expr, params);
+}
+function stripP(s: string): string {
+  let out = s.trim();
+  while (out.startsWith('(') && out.endsWith(')')) {
+    let d = 0, ok = true;
+    for (let i = 0; i < out.length - 1; i++) {
+      if (out[i] === '(') d++;
+      else if (out[i] === ')') d--;
+      if (d === 0) { ok = false; break; }
+    }
+    if (!ok) break;
+    out = out.slice(1, -1).trim();
+  }
+  return out;
+}
+function splitAnd(expr: string): string[] {
+  const parts: string[] = [];
+  let d = 0, sq = false, dq = false, st = 0;
+  const lo = expr.toLowerCase();
+  for (let i = 0; i < expr.length; i++) {
+    const c = expr[i];
+    if (c === "'" && !dq) sq = !sq;
+    else if (c === '"' && !sq) dq = !dq;
+    else if (!sq && !dq) {
+      if (c === '(') d++;
+      else if (c === ')') d--;
+      else if (d === 0 && lo.slice(i, i + 3) === 'and' && i > 0 && /\s/.test(expr[i - 1]) && i + 3 < expr.length && /\s/.test(expr[i + 3])) {
+        parts.push(expr.slice(st, i).trim());
+        st = i + 3;
+        i += 2;
+      }
+    }
+  }
+  parts.push(expr.slice(st).trim());
+  return parts;
+}
+function evalW(row: Row, raw: string, params: unknown[]): boolean {
+  const terms = splitAnd(stripP(raw));
+  if (terms.length > 1) return terms.every((t) => evalW(row, t, params));
+  const term = stripP(terms[0]);
+  let m: RegExpExecArray | null;
+  if ((m = /^([\s\S]+?)\s+is\s+null$/i.exec(term))) return row[colName(m[1])] == null;
+  if ((m = /^([\s\S]+?)\s+is\s+not\s+null$/i.exec(term))) return row[colName(m[1])] != null;
+  if ((m = /^([\s\S]+?)\s+in\s*\(([\s\S]+)\)$/i.exec(term))) {
+    return splitTop(m[2], ',').map((v) => evalSc(v, params)).includes(row[colName(m[1])]);
+  }
+  if ((m = /^([\s\S]+?)\s*>=\s*([\s\S]+)$/.exec(term))) return Number(row[colName(m[1])]) >= Number(evalSc(m[2], params));
+  if ((m = /^([\s\S]+?)\s*>\s*([\s\S]+)$/.exec(term))) return Number(row[colName(m[1])]) > Number(evalSc(m[2], params));
+  if ((m = /^([\s\S]+?)\s*<\s*([\s\S]+)$/.exec(term))) return Number(row[colName(m[1])]) < Number(evalSc(m[2], params));
+  if ((m = /^([\s\S]+?)\s*=\s*([\s\S]+)$/.exec(term))) return row[colName(m[1])] === evalSc(m[2], params);
+  throw new Error(`Unsupported WHERE: ${term}`);
+}
+function applySet(row: Row, setC: string, params: unknown[]): void {
+  for (const a of splitTop(setC, ',')) {
+    const eq = a.indexOf('=');
+    if (eq < 0) continue;
+    const col = colName(a.slice(0, eq));
+    const rhs = a.slice(eq + 1).trim();
+    let m: RegExpExecArray | null;
+    if ((m = /"ref_count"\s*\+\s*(\$\d+)/i.exec(rhs))) {
+      row[col] = Number(row.ref_count ?? 0) + Number(evalSc(m[1], params));
+    } else if (!/^CASE\b/i.test(rhs) && (m = /"ref_count"\s*-\s*(\$\d+)/i.exec(rhs))) {
+      row[col] = Number(row.ref_count ?? 0) - Number(evalSc(m[1], params));
+    } else if (/CASE\s+WHEN[\s\S]*?"ref_count"/i.test(rhs)) {
+      row[col] = Number(row.ref_count ?? 0) === 0 ? new Date().toISOString() : null;
+    } else if ((m = /COALESCE\([\s\S]*?"metadata"[\s\S]*?\)\s*\|\|\s*(\$\d+)::jsonb/i.exec(rhs))) {
+      const inc = evalSc(m[1], params);
+      row[col] = { ...((row[col] as Record<string, unknown>) ?? {}), ...((inc as Record<string, unknown>) ?? {}) };
+    } else {
+      row[col] = evalSc(rhs, params);
+    }
+  }
+}
+function sortVal(v: unknown): string | number {
+  if (typeof v === 'number') return v;
+  if (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(v)) return Date.parse(v);
+  return String(v ?? '');
+}
+function fmtRows(rows: readonly Row[], cols: readonly string[], rowMode?: string): unknown[] {
+  return rows.map((r) =>
+    rowMode === 'array'
+      ? cols.map((c) => r[c] ?? null)
+      : Object.fromEntries(cols.map((c) => [c, r[c] ?? null])),
+  );
+}
+
+class MockStorage implements StoragePort {
+  readonly objects = new Map<string, { body: Buffer; contentType: string }>();
+  presignGetCalls = 0;
+
+  async putObject(key: string, body: Buffer | Uint8Array | Readable | string, contentType: string): Promise<void> {
+    const buf = Buffer.isBuffer(body) ? body : typeof body === 'string' ? Buffer.from(body) : Buffer.from(body as Uint8Array);
+    this.objects.set(key, { body: buf, contentType });
+  }
+  async putBlobIfAbsent(key: string, body: Buffer, contentType: string): Promise<{ uploaded: boolean }> {
+    if (this.objects.has(key)) return { uploaded: false };
+    this.objects.set(key, { body: Buffer.from(body), contentType });
+    return { uploaded: true };
+  }
+  async getObjectBuffer(key: string): Promise<Buffer> {
+    const found = this.objects.get(key);
+    if (!found) throw new Error(`Missing key: ${key}`);
+    return Buffer.from(found.body);
+  }
+  async getObjectStream(key: string): Promise<ObjectStreamResult> {
+    const buf = await this.getObjectBuffer(key);
+    return { stream: Readable.from([buf]), contentLength: buf.byteLength };
+  }
+  async headObject(key: string): Promise<HeadObjectResult | null> {
+    const found = this.objects.get(key);
+    return found ? { contentLength: found.body.byteLength, contentType: found.contentType } : null;
+  }
+  async deleteObject(key: string): Promise<void> { this.objects.delete(key); }
+  async deletePrefix(): Promise<number> { return 0; }
+  async presignPut(key: string, _opts: PresignPutOptions): Promise<string> { return `https://s3.local/${key}?sig=put`; }
+  async presignGet(key: string, opts?: PresignGetOptions): Promise<string> {
+    this.presignGetCalls++;
+    const disp = opts?.responseContentDisposition ? `&disp=${encodeURIComponent(opts.responseContentDisposition)}` : '';
+    return `https://s3.local/${key}?sig=get${disp}`;
+  }
+  async ensureBucketAndCors(): Promise<void> {}
+}
+
+function createStudioTestEnv() {
+  const pgClient = new StudioTestPgClient();
+  const db = drizzle({ client: pgClient as never, schema }) as unknown as Database;
+  const storage = new MockStorage();
+  const textCache = new Map<string, string>();
+  const fontCssCache = new Map<string, string>();
+  const hotTextCache: HotTextCachePort = {
+    getText: async (s) => textCache.get(s) ?? null,
+    setText: async (s, c) => { textCache.set(s, c); return true; },
+    getFontCss: async (h) => fontCssCache.get(h) ?? null,
+    setFontCss: async (h, c) => { fontCssCache.set(h, c); return true; },
+  };
+  const published: Array<{ channel: string; payload: unknown }> = [];
+  const listeners = new Map<string, Set<(payload: unknown, ch: string) => void>>();
+  const workerHealth: RenderWorkerHealth[] = [
+    { workerId: 'render-1', ffmpeg: true, ffprobe: true, chromium: true, concurrency: 2, activeJobs: 0, updatedAt: Date.now() },
+  ];
+  const eventBus: StudioEventBusPort = {
+    publish: async (ch, payload) => {
+      published.push({ channel: ch, payload });
+      const set = listeners.get(ch);
+      if (set) for (const fn of set) fn(payload, ch);
+      return set?.size ?? 0;
+    },
+    subscribe: async (ch, fn) => {
+      let set = listeners.get(ch);
+      if (!set) { set = new Set(); listeners.set(ch, set); }
+      set.add(fn);
+      return async () => { set?.delete(fn); };
+    },
+    getRenderWorkersHealth: async () => workerHealth,
+  };
+  const enqueued: Array<{ queue: string; name: string; payload: unknown }> = [];
+  const queues: StudioQueuesPort = {
+    enqueueMediaIngest: async (name, payload) => { enqueued.push({ queue: 'media-ingest', name, payload }); return { id: 'q1' }; },
+    enqueueRenderExport: async (name, payload) => { enqueued.push({ queue: 'render-export', name, payload }); return { id: 'q2' }; },
+  };
+
+  const WID = '11111111-1111-4111-8111-111111111111';
+  const UID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  pgClient.seed('workspaces', {
+    id: WID,
+    slug: 'demo',
+    name: 'Demo Workspace',
+    owner_user_id: UID,
+    active_project_id: null,
+    active_session_id: null,
+    default_models: {},
+    tracking_enabled: true,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  });
+
+  const auth: AuthContext = {
+    workspaceId: WID,
+    userId: UID,
+    role: 'owner',
+    scopes: ['workspace:admin'],
+    authMode: 'dev',
+    authMethod: 'session_cookie',
+    displayName: 'Studio Tester',
+  };
+
+  const files = new ProjectFilesService({ db, storage, hotTextCache, eventBus });
+  const history = new VersionHistoryService({ db, storage, hotTextCache, eventBus });
+  const workspace = new WorkspaceService({ db, storage, files, hotTextCache });
+  const assetNames = new AssetNamesService({ db, files });
+  const workRounds = new WorkRoundsService(db);
+  const archives = new ProjectArchiveService({ db, storage, workspace, files });
+
+  const studioApp = createDisklessStudioApp({
+    db,
+    storage,
+    hotTextCache,
+    eventBus,
+    queues,
+    workspace,
+    files,
+    history,
+    assetNames,
+    workRounds,
+    resolveAuth: () => auth,
+    skipDeterministicFonts: true,
+  });
+
+  const projectsApp = createProjectsRouter({
+    workspace,
+    files,
+    history,
+    assetNames,
+    workRounds,
+    archives,
+    resolveAuth: () => auth,
+  });
+  const sessionsApp = createSessionsRouter({ workspace, resolveAuth: () => auth });
+  const archivesApp = createArchivesRouter({ archives, resolveAuth: () => auth });
+
+  return {
+    pgClient,
+    storage,
+    hotTextCache,
+    eventBus,
+    published,
+    enqueued,
+    workerHealth,
+    auth,
+    files,
+    history,
+    workspace,
+    studioApp,
+    projectsApp,
+    sessionsApp,
+    archivesApp,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+describe('Zero Local ProjectDir Disk Writes Guard', () => {
+  it('verifies no service or studio file writes to local filesystem or references HYPERFRAMES_HISTORY_ROOT', async () => {
+    const collectTs = async (dir: string): Promise<string[]> => {
+      const entries = await readdir(dir, { withFileTypes: true });
+      const out: string[] = [];
+      for (const e of entries) {
+        const full = path.join(dir, e.name);
+        if (e.isDirectory()) out.push(...(await collectTs(full)));
+        else if (e.isFile() && e.name.endsWith('.ts')) out.push(full);
+      }
+      return out;
+    };
+
+    const ownedFiles = [
+      path.join(REPO_ROOT, 'src/services/workspace-service.ts'),
+      path.join(REPO_ROOT, 'src/services/project-files-service.ts'),
+      path.join(REPO_ROOT, 'src/services/version-history-service.ts'),
+      path.join(REPO_ROOT, 'src/services/project-archive-service.ts'),
+      path.join(REPO_ROOT, 'src/services/asset-names-service.ts'),
+      path.join(REPO_ROOT, 'src/services/work-rounds-service.ts'),
+      ...(await collectTs(path.join(REPO_ROOT, 'src/studio'))),
+      path.join(REPO_ROOT, 'src/routes/projects.ts'),
+      path.join(REPO_ROOT, 'src/routes/sessions.ts'),
+      path.join(REPO_ROOT, 'src/routes/archives.ts'),
+    ];
+
+    for (const file of ownedFiles) {
+      const src = await readFile(file, 'utf8');
+      assert.doesNotMatch(src, /\b(?:writeFile|writeFileSync|mkdir|mkdirSync|unlink|unlinkSync|rmSync)\b/, `Forbidden disk write in ${file}`);
+      assert.doesNotMatch(src, /HYPERFRAMES_HISTORY_ROOT/, `Forbidden local history root reference in ${file}`);
+      assert.doesNotMatch(src, /\bspawn\s*\(|\bexecFile\s*\(/, `Forbidden child process spawn in ${file}`);
+    }
+  });
+});
+
+describe('Pure In-Memory Hyperframes Engines (Bundle, Lint, Info, Timeline)', () => {
+  it('bundles preview HTML, lints with PG blob metadata (no ffprobe), and computes info + timeline purely in memory', async () => {
+    const html = `<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><link rel="stylesheet" href="styles.css"></head>
+<body>
+  <div id="root" data-composition-id="main" data-width="1920" data-height="1080" data-fps="30" data-duration="10">
+    <video id="clip1" src="assets/clip.mp4" data-start="0" data-duration="5" data-media-start="12"></video>
+    <h1 id="headline" data-start="1" data-duration="4">Hello Diskless</h1>
+  </div>
+  <script>
+    const tl = gsap.timeline({ paused: true });
+    tl.to("#headline", { opacity: 1, duration: 1 }, 1);
+  </script>
+</body>
+</html>`;
+    const css = '#headline { font-size: 64px; }';
+    const now = new Date();
+    const records: VirtualFileRecord[] = [
+      {
+        path: 'index.html',
+        blobScope: 'workspace',
+        sha256: sha256Hex(html),
+        sizeBytes: Buffer.byteLength(html),
+        mimeType: 'text/html; charset=utf-8',
+        isText: true,
+        updatedAt: now,
+      },
+      {
+        path: 'styles.css',
+        blobScope: 'workspace',
+        sha256: sha256Hex(css),
+        sizeBytes: Buffer.byteLength(css),
+        mimeType: 'text/css; charset=utf-8',
+        isText: true,
+        updatedAt: now,
+      },
+      {
+        path: 'assets/clip.mp4',
+        blobScope: 'workspace',
+        sha256: 'a'.repeat(64),
+        sizeBytes: 2048,
+        mimeType: 'video/mp4',
+        isText: false,
+        updatedAt: now,
+        // Metadata from PG workspace_blobs: duration 8s (so media-start=12 is past EOF!) and codec hevc!
+        metadata: { modality: 'video', durationSec: 8, codec: 'hevc', width: 1920, height: 1080, fps: 30 },
+      },
+    ];
+
+    const virtual = new InMemoryVirtualProject({
+      projectId: 'proj-virtual',
+      projectName: 'Diskless Engine Test',
+      revision: 'b'.repeat(64),
+      files: records,
+      textContents: { 'index.html': html, 'styles.css': css },
+    });
+
+    const bundled = await bundlePreviewInMemory(virtual, {
+      runtimeUrl: '/api/runtime.js',
+      baseHref: '/api/projects/proj-virtual/preview/',
+      skipDeterministicFonts: true,
+    });
+    assert.ok(bundled && bundled.includes('hyperframes-studio-preview'));
+    assert.ok(bundled.includes('/api/runtime.js'));
+    assert.ok(bundled.includes('Hello Diskless'));
+
+    const lint = await lintProjectInMemory(virtual);
+    const rules = lint.findings.map((f) => f.code);
+    assert.ok(rules.includes('video_media_start_past_eof'), `Expected media_start_past_eof in ${rules.join(',')}`);
+    assert.ok(rules.includes('hevc_preview_codec'), `Expected hevc_preview_codec in ${rules.join(',')}`);
+
+    const info = infoInMemory(virtual);
+    assert.equal(info.width, 1920);
+    assert.equal(info.height, 1080);
+    assert.equal(info.fps, 30);
+    assert.equal(info.duration, 10);
+    assert.equal(info.resolution, 'landscape');
+
+    const timeline = timelineInMemory(virtual);
+    assert.equal(timeline.duration, 10);
+    assert.equal(timeline.fps, 30);
+    assert.ok(timeline.tracks.length >= 1);
+  });
+});
+
+describe('Diskless Studio HTTP Routes (ETag, HEAD direct, 302 headers, DOM & GSAP mutations, Render, Media)', () => {
+  it('enforces exact strong ETag "sha256:...", If-Match, 428, 409, ?optional=1, and DELETED_VERSION', async () => {
+    const env = createStudioTestEnv();
+    const created = await env.workspace.createProject(env.auth, { title: 'ETag Studio' });
+
+    // Optional missing file returns 200 { missing: true }.
+    const optRes = await env.studioApp.request(`/api/projects/${created.projectId}/files/missing.css?optional=1`);
+    assert.equal(optRes.status, 200);
+    const optJson = (await optRes.json()) as { missing: boolean; version: string | null };
+    assert.equal(optJson.missing, true);
+    assert.equal(optJson.version, null);
+
+    // GET index.html returns exact strong ETag `"sha256:<64hex>"`.
+    const getRes = await env.studioApp.request(`/api/projects/${created.projectId}/files/index.html`);
+    assert.equal(getRes.status, 200);
+    const getJson = (await getRes.json()) as { content: string; version: string };
+    assert.match(getJson.version, /^"sha256:[a-f0-9]{64}"$/);
+    assert.equal(getRes.headers.get('etag'), getJson.version);
+    assert.equal(getJson.version, fileContentVersion(getJson.content));
+
+    // PUT without If-Match / If-None-Match -> 428 Precondition Required.
+    const noPre = await env.studioApp.request(`/api/projects/${created.projectId}/files/index.html`, {
+      method: 'PUT',
+      body: 'updated',
+    });
+    assert.equal(noPre.status, 428);
+
+    // PUT with wrong If-Match -> 409 Conflict with currentVersion + currentContent.
+    const badMatch = await env.studioApp.request(`/api/projects/${created.projectId}/files/index.html`, {
+      method: 'PUT',
+      headers: { 'If-Match': `"sha256:${'0'.repeat(64)}"` },
+      body: 'updated',
+    });
+    assert.equal(badMatch.status, 409);
+    const conflictJson = (await badMatch.json()) as { code: string; currentVersion: string; currentContent: string };
+    assert.equal(conflictJson.code, 'VERSION_MISMATCH');
+    assert.equal(conflictJson.currentVersion, getJson.version);
+    assert.equal(conflictJson.currentContent, getJson.content);
+
+    // PUT new file with If-None-Match: * and X-Hyperframes-Write-Token echoes writeToken.
+    const createCss = await env.studioApp.request(`/api/projects/${created.projectId}/files/extra.css`, {
+      method: 'PUT',
+      headers: {
+        'If-None-Match': '*',
+        'X-Hyperframes-Write-Token': 'studio-write-77',
+      },
+      body: '.box { opacity: 1; }',
+    });
+    assert.equal(createCss.status, 200);
+    const cssJson = (await createCss.json()) as { version: string; writeToken: string };
+    assert.equal(cssJson.writeToken, 'studio-write-77');
+    assert.equal(cssJson.version, fileContentVersion('.box { opacity: 1; }'));
+
+    // DELETE emits DELETED_VERSION = '"deleted"'.
+    const delRes = await env.studioApp.request(`/api/projects/${created.projectId}/files/extra.css`, {
+      method: 'DELETE',
+    });
+    assert.equal(delRes.status, 200);
+    const delJson = (await delRes.json()) as { version: string };
+    assert.equal(delJson.version, DELETED_VERSION);
+    assert.equal(DELETED_VERSION, '"deleted"');
+  });
+
+  it('answers HEAD /preview/* and HEAD /render/:jobId/view DIRECTLY (never 302) while GET binary returns 302 with Cache-Control & Vary', async () => {
+    const env = createStudioTestEnv();
+    const created = await env.workspace.createProject(env.auth, { title: 'Media Preview' });
+
+    const videoBytes = Buffer.from('FAKE_MP4_BINARY_PAYLOAD_0123456789');
+    await env.files.commitChanges(env.auth, {
+      projectId: created.projectId,
+      ops: [{ op: 'upsert_binary', path: 'assets/intro.mp4', data: videoBytes, mimeType: 'video/mp4' }],
+    });
+
+    // HEAD /api/projects/:id/preview/assets/intro.mp4 -> 200 DIRECT from PG metadata, ZERO presignGet calls!
+    const presignBefore = env.storage.presignGetCalls;
+    const headPreview = await env.studioApp.request(
+      `/api/projects/${created.projectId}/preview/assets/intro.mp4`,
+      { method: 'HEAD' },
+    );
+    assert.equal(headPreview.status, 200);
+    assert.equal(headPreview.headers.get('content-type'), 'video/mp4');
+    assert.equal(headPreview.headers.get('content-length'), String(videoBytes.byteLength));
+    assert.equal(headPreview.headers.get('accept-ranges'), 'bytes');
+    assert.equal(headPreview.headers.get('etag'), fileContentVersion(videoBytes));
+    assert.equal(env.storage.presignGetCalls, presignBefore, 'HEAD must NEVER call presignGet');
+
+    // GET /api/projects/:id/preview/assets/intro.mp4 -> 302 Found with Cache-Control & Vary!
+    const getPreview = await env.studioApp.request(
+      `/api/projects/${created.projectId}/preview/assets/intro.mp4`,
+      { method: 'GET' },
+    );
+    assert.equal(getPreview.status, 302);
+    assert.ok(getPreview.headers.get('location')?.startsWith('https://s3.local/workspaces/'));
+    assert.equal(getPreview.headers.get('cache-control'), 'private, max-age=60');
+    assert.equal(getPreview.headers.get('vary'), 'Origin, Cookie');
+
+    // Seed a completed export job in PG and test HEAD vs GET on /api/render/:jobId/view & /download.
+    const jobId = randomUUID();
+    const renderKey = exportKey(env.auth.workspaceId, jobId, 'Media_Preview.mp4');
+    const renderSha = 'd'.repeat(64);
+    env.pgClient.seed('jobs', {
+      id: jobId,
+      workspace_id: env.auth.workspaceId,
+      project_id: created.projectId,
+      kind: 'export_render',
+      state: 'completed',
+      stage: 'done',
+      progress: 100,
+      input_payload: { outputName: 'Media_Preview.mp4' },
+      result_json: {
+        s3Key: renderKey,
+        filename: 'Media_Preview.mp4',
+        mimeType: 'video/mp4',
+        sizeBytes: 987654,
+        sha256: renderSha,
+      },
+      deleted_at: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+
+    const presignBeforeRenderHead = env.storage.presignGetCalls;
+    const headRender = await env.studioApp.request(`/api/render/${jobId}/view`, { method: 'HEAD' });
+    assert.equal(headRender.status, 200);
+    assert.equal(headRender.headers.get('content-type'), 'video/mp4');
+    assert.equal(headRender.headers.get('content-length'), '987654');
+    assert.equal(headRender.headers.get('accept-ranges'), 'bytes');
+    assert.equal(headRender.headers.get('etag'), `"sha256:${renderSha}"`);
+    assert.equal(env.storage.presignGetCalls, presignBeforeRenderHead, 'HEAD /render/:jobId/view must NEVER presign');
+
+    const getRenderView = await env.studioApp.request(`/api/render/${jobId}/view`);
+    assert.equal(getRenderView.status, 302);
+    assert.equal(getRenderView.headers.get('cache-control'), 'private, max-age=60');
+    assert.equal(getRenderView.headers.get('vary'), 'Origin, Cookie');
+
+    const getRenderDownload = await env.studioApp.request(`/api/render/${jobId}/download`);
+    assert.equal(getRenderDownload.status, 302);
+    assert.ok(getRenderDownload.headers.get('location')?.includes('attachment'));
+  });
+
+  it('executes DOM file-mutations and GSAP AST mutations + rollback purely in memory via PG', async () => {
+    const env = createStudioTestEnv();
+    const initialHtml = `<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body>
+  <div id="root" data-composition-id="main" data-width="1920" data-height="1080" data-duration="5" data-fps="30">
+    <h1 id="headline" data-start="0" data-duration="5">Before</h1>
+  </div>
+  <script>
+    const tl = gsap.timeline({ paused: true });
+    tl.to("#headline", { opacity: 0.5, duration: 1 }, 0);
+  </script>
+</body>
+</html>`;
+
+    const created = await env.workspace.createProject(env.auth, {
+      title: 'Mutations Demo',
+      initialFiles: [{ path: 'index.html', content: initialHtml }],
+    });
+
+    // DOM patch-element
+    const patchRes = await env.studioApp.request(
+      `/api/projects/${created.projectId}/file-mutations/patch-element/index.html`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          target: { id: 'headline' },
+          ops: [{ type: 'text-content', property: 'textContent', value: 'After Patch' }],
+        }),
+      },
+    );
+    assert.equal(patchRes.status, 200);
+    const patchJson = (await patchRes.json()) as { matched: boolean; changed: boolean; content: string };
+    assert.equal(patchJson.matched, true);
+    assert.equal(patchJson.changed, true);
+    assert.ok(patchJson.content.includes('After Patch'));
+
+    // GSAP capabilities + read + mutate + rollback
+    const capRes = await env.studioApp.request(
+      `/api/projects/${created.projectId}/gsap-mutation-capabilities`,
+    );
+    assert.equal(capRes.status, 200);
+    assert.deepEqual(await capRes.json(), { atomicOwnershipPairs: true });
+
+    const gsapListRes = await env.studioApp.request(
+      `/api/projects/${created.projectId}/gsap-animations/index.html`,
+    );
+    assert.equal(gsapListRes.status, 200);
+    const gsapList = (await gsapListRes.json()) as { animations: Array<{ id: string }> };
+    assert.equal(gsapList.animations.length, 1);
+
+    const mutateRes = await env.studioApp.request(
+      `/api/projects/${created.projectId}/gsap-mutations/index.html`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          type: 'update-property',
+          animationId: gsapList.animations[0].id,
+          property: 'opacity',
+          value: 1,
+        }),
+      },
+    );
+    assert.equal(mutateRes.status, 200);
+    const mutateJson = (await mutateRes.json()) as { ok: boolean; mutated: boolean; before: string; after: string };
+    assert.equal(mutateJson.ok, true);
+    assert.equal(mutateJson.mutated, true);
+    assert.notEqual(mutateJson.before, mutateJson.after);
+
+    // Rollback succeeds when expected matches current, and reports conflict when mismatched.
+    const rbOk = await env.studioApp.request(
+      `/api/projects/${created.projectId}/gsap-mutation-rollback/index.html`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ expected: mutateJson.after, restore: mutateJson.before }),
+      },
+    );
+    assert.equal(rbOk.status, 200);
+    assert.equal(((await rbOk.json()) as { restored: boolean }).restored, true);
+  });
+
+  it('handles /thumbnail (?cached=1 -> 204 miss, 302 hit), /remove-background (501), /environment/ffmpeg (Redis), and product routes', async () => {
+    const env = createStudioTestEnv();
+    const created = await env.workspace.createProject(env.auth, { title: 'System Routes' });
+
+    // remove-background -> 501 FEATURE_DEFERRED_P2
+    const remBg = await env.studioApp.request(
+      `/api/projects/${created.projectId}/media/remove-background`,
+      { method: 'POST' },
+    );
+    assert.equal(remBg.status, 501);
+    assert.equal(((await remBg.json()) as { code: string }).code, 'FEATURE_DEFERRED_P2');
+
+    // thumbnail ?cached=1 on miss -> 204 No Content
+    const thumbMiss = await env.studioApp.request(
+      `/api/projects/${created.projectId}/thumbnail?cached=1`,
+    );
+    assert.equal(thumbMiss.status, 204);
+
+    // thumbnail without ?cached=1 on miss -> enqueues render_thumbnail and returns 202
+    const thumbEnqueue = await env.studioApp.request(`/api/projects/${created.projectId}/thumbnail`);
+    assert.equal(thumbEnqueue.status, 202);
+    const { cacheKey } = (await thumbEnqueue.json()) as { cacheKey: string };
+    assert.ok(env.enqueued.some((j) => j.queue === 'render-export' && j.name === 'render_thumbnail'));
+
+    // Seed cached PNG thumbnail in S3 -> GET /thumbnail now returns 302 with Cache-Control & Vary!
+    await env.storage.putObject(
+      compThumbnailKey(env.auth.workspaceId, created.projectId, cacheKey),
+      Buffer.from([0x89, 0x50, 0x4e, 0x47]),
+      'image/png',
+    );
+    const thumbHit = await env.studioApp.request(`/api/projects/${created.projectId}/thumbnail?cached=1`);
+    assert.equal(thumbHit.status, 302);
+    assert.equal(thumbHit.headers.get('cache-control'), 'private, max-age=60');
+    assert.equal(thumbHit.headers.get('vary'), 'Origin, Cookie');
+
+    // /api/environment/ffmpeg reads Redis render worker health!
+    const ffRes = await env.studioApp.request('/api/environment/ffmpeg');
+    assert.equal(ffRes.status, 200);
+    const ffJson = (await ffRes.json()) as { ok: boolean; available: boolean; workers: unknown[] };
+    assert.equal(ffJson.ok, true);
+    assert.equal(ffJson.available, true);
+    assert.equal(ffJson.workers.length, 1);
+
+    // Product routes: /motion-api/projects, /motion-api/sessions, /motion-api/project-archives
+    const listProjects = await env.projectsApp.request('/motion-api/projects');
+    assert.equal(listProjects.status, 200);
+    assert.equal(((await listProjects.json()) as { projects: unknown[] }).projects.length, 1);
+
+    const createSess = await env.sessionsApp.request('/motion-api/sessions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'Brand Launch' }),
+    });
+    assert.equal(createSess.status, 201);
+    const sess = (await createSess.json()) as { id: string };
+
+    const msgId = randomUUID();
+    const postMsg = await env.sessionsApp.request(`/motion-api/sessions/${sess.id}/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: msgId, role: 'user', content: 'Create a 5s product reveal.' }),
+    });
+    assert.equal(postMsg.status, 201);
+
+    // Export via archives router + verify HEAD /file is 200 direct & GET /file is 302.
+    const expRes = await env.archivesApp.request('/motion-api/project-archives/export', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ requestId: 'route-exp-1', all: true }),
+    });
+    assert.equal(expRes.status, 200);
+    const expJson = (await expRes.json()) as { archiveId: string; downloadUrl: string };
+
+    const headArchive = await env.archivesApp.request(expJson.downloadUrl, { method: 'HEAD' });
+    assert.equal(headArchive.status, 200);
+    assert.equal(headArchive.headers.get('content-type'), 'application/zip');
+
+    const getArchive = await env.archivesApp.request(expJson.downloadUrl);
+    assert.equal(getArchive.status, 302);
+    assert.equal(getArchive.headers.get('cache-control'), 'private, max-age=60');
+    assert.equal(getArchive.headers.get('vary'), 'Origin, Cookie');
+
+    // Enqueue failure on POST /api/projects/:id/render marks PG job 'failed' so project is not wedged in EXPORT_BUSY.
+    const failingStudio = createDisklessStudioApp({
+      db: drizzle({ client: env.pgClient as never, schema }) as unknown as Database,
+      storage: env.storage,
+      hotTextCache: env.hotTextCache,
+      eventBus: env.eventBus,
+      queues: {
+        enqueueMediaIngest: async () => { throw new Error('Redis down'); },
+        enqueueRenderExport: async () => { throw new Error('BullMQ down'); },
+      },
+      workspace: env.workspace,
+      files: env.files,
+      history: env.history,
+      assetNames: new AssetNamesService({ db: drizzle({ client: env.pgClient as never, schema }) as unknown as Database, files: env.files }),
+      resolveAuth: () => env.auth,
+      skipDeterministicFonts: true,
+    });
+    const failedRender = await failingStudio.request(`/api/projects/${created.projectId}/render`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ format: 'mp4' }),
+    });
+    assert.equal(failedRender.status, 500);
+    // Subsequent render on healthy studio must succeed (NOT 409 EXPORT_BUSY!).
+    const retryRender = await env.studioApp.request(`/api/projects/${created.projectId}/render`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ format: 'mp4' }),
+    });
+    assert.equal(retryRender.status, 200);
+  });
+});
