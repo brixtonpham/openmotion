@@ -59,7 +59,7 @@ it.each([false, true])('prepares only existing projects while browsing, and crea
     const open = [...container.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent?.includes('Open and edit'))!;
     await act(async () => open.click());
     expect(posts().map(([url]) => url.split('?')[0])).toEqual([
-      '/design-api/sessions', `/design-api/sessions/${preparedSessionId}/artifacts`, `/motion-api/projects/${preparedId}/open`,
+      '/motion-api/sessions', `/motion-api/sessions/${preparedSessionId}/artifacts`, `/motion-api/projects/${preparedId}/open`,
     ]);
     expect(JSON.parse(String(posts()[0][1]!.body)).templateId).toBe('product-promo');
     expect(JSON.parse(String(posts()[1][1]!.body))).toEqual({ templateId: 'product-promo', expectedRevision: 'original-revision', expectedProjectId: existing ? id : 'project' });
@@ -190,7 +190,7 @@ it('keeps chrome, sidebar search and geometry mounted while replacing only the p
     }
     if ((url.includes('/preview/open') || url.includes('/project/status')) && projectId === second) await opening;
     return Response.json(url.endsWith('/projects') && !init?.method ? catalog
-      : url.includes('/design-api/sessions/') ? catalog.sessions.find(item => url.includes(item.id))
+      : url.includes('/motion-api/sessions/') ? catalog.sessions.find(item => url.includes(item.id))
       : url.includes('/open') && url.includes('/projects/') ? { projectId: new URL(url, location.origin).pathname.split('/').at(-2), revision: 'r' }
       : { projectId, revision: 'r' });
   }));

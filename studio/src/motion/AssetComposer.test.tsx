@@ -11,7 +11,6 @@ const { generate, loadGateway, gatewayRequest, chrome } = vi.hoisted(() => ({
 }));
 vi.mock('./assetClient', () => ({ assetRequest: generate }));
 vi.mock('./gatewayClient', () => ({ loadGateway, gatewayRequest }));
-vi.mock('./AssetConversation', () => ({ AssetConversation: () => null }));
 vi.mock('../i18n/I18n', () => ({ useI18n: () => ({ t: (text: string) => text }) }));
 vi.mock('./WorkspaceFrame', () => ({ useWorkspaceChrome: () => chrome }));
 const model: Model = { id: 'codex:image', provider: 'codex', modelId: 'image', label: 'Codex Image', modality: 'image', source: 'builtin', mode: 'text-to-image' };
@@ -19,20 +18,18 @@ let root: Root, container: HTMLDivElement;
 const created = vi.fn();
 const props: ComponentProps<typeof AssetComposer> = {
   active: true, draft: { modality: 'image', model: model.id, prompt: 'Continue the original', parameters: { size: '1536x1024', custom: { value: 7 } }, references: [] },
-  setDraft: vi.fn(), agentReferences: [], setAgentReferences: vi.fn(), jobs: [], mode: 'direct', onMode: vi.fn(), taskIds: {},
+  setDraft: vi.fn(), jobs: [],
   history: { tasks: [], loading: false, onRetry: vi.fn(), onSelect: vi.fn() }, selectingTask: false,
-  onNew: vi.fn(), onChatChanged: vi.fn(), onChatStarted: vi.fn(), onCancel: vi.fn(), onView: vi.fn(), onReference: vi.fn(), onCreated: created, onError: vi.fn(), onClose: vi.fn(),
+  onNew: vi.fn(), onCancel: vi.fn(), onView: vi.fn(), onReference: vi.fn(), onCreated: created, onError: vi.fn(), onClose: vi.fn(),
 };
 beforeEach(() => { vi.clearAllMocks(); loadGateway.mockResolvedValue({ models: [model], status: { providers: [{ id: 'codex', available: true }], routes: {} } }); container = document.createElement('div'); document.body.append(container); root = createRoot(container); });
 afterEach(async () => { await act(async () => root.unmount()); container.remove(); });
-it('temporarily hides the Agent tab and keeps direct generation available when viewing a conversation', async () => {
-  await act(async () => root.render(<AssetComposer {...props} mode="agent" />));
+it('exposes direct generation without a retired local Agent conversation tab', async () => {
+  await act(async () => root.render(<AssetComposer {...props} />));
   expect(container.querySelector('button[aria-label="Agent conversation"]')).toBeNull();
   const direct = container.querySelector<HTMLButtonElement>('button[aria-label="Direct generation"]')!;
   expect(direct.textContent).toBe('Generate');
-  expect(direct.getAttribute('aria-pressed')).toBe('false');
-  await act(async () => direct.click());
-  expect(props.onMode).toHaveBeenCalledExactlyOnceWith('direct');
+  expect(direct.getAttribute('aria-pressed')).toBe('true');
 });
 it('restores native and custom parameters without submitting until explicitly requested', async () => {
   generate.mockResolvedValue({ job: { id: 'new-job' } });
@@ -113,7 +110,7 @@ it('syncs unknown Cloud capability without remounting or losing the draft and re
   expect(container.querySelector<HTMLButtonElement>('.om-creation-submit-button')!.disabled).toBe(true);
   loadGateway.mockResolvedValue(cloudState([{ ...cloudImage, supportsImageReference: true, maxInputImages: 3 }]));
   await act(async () => Array.from(container.querySelectorAll('button')).find(b => b.textContent === 'Sync models')!.click());
-  expect(gatewayRequest).toHaveBeenCalledExactlyOnceWith('settings/providers/opendesign/sync', 'POST', {});
+  expect(gatewayRequest).toHaveBeenCalledExactlyOnceWith('models/catalog?refresh=true', 'GET');
   expect(container.querySelector<HTMLButtonElement>('.om-creation-reference')!.disabled).toBe(false);
   expect(container.querySelector<HTMLTextAreaElement>('textarea')!.value).toBe(draft.prompt);
   expect(container.textContent).toContain('Cup'); expect(props.setDraft).not.toHaveBeenCalled(); expect(generate).not.toHaveBeenCalled();
@@ -129,7 +126,7 @@ it('discards an earlier model response after settings change and keeps a removed
   expect(props.setDraft).not.toHaveBeenCalled();
   gatewayRequest.mockResolvedValue({}); loadGateway.mockResolvedValue(cloudState([{ ...cloudImage, supportsImageReference: true }]));
   await act(async () => Array.from(container.querySelectorAll('button')).find(b => b.textContent === 'Sync models')!.click());
-  expect(gatewayRequest).toHaveBeenCalledExactlyOnceWith('settings/providers/opendesign/sync', 'POST', {});
+  expect(gatewayRequest).toHaveBeenCalledExactlyOnceWith('models/catalog?refresh=true', 'GET');
   expect(container.textContent).not.toContain('This task’s model is unavailable');
 });
 it('distinguishes explicit unsupported capability from unknown and reports failed sync', async () => {
@@ -321,7 +318,7 @@ it('resumes an old account task while preserving a newer prompt draft', async ()
   const job = { id: 'old-job', model: account, prompt: 'old prompt', parameters: {}, modality: 'image' as const, state: 'failed' as const, phase: 'failed', remoteId: 'original-remote', assets: [], requestHash: 'snapshot', createdAt: 1, updatedAt: 2 };
   const resume = vi.fn(async () => {}), setDraft = vi.fn();
   const draft = { ...props.draft, model: account.id, prompt: 'new prompt for next generation', parameters: {} };
-  await act(async () => root.render(<AssetComposer {...props} draft={draft} setDraft={setDraft} jobs={[job]} taskIds={{ direct: job.id }} onResume={resume} />));
+  await act(async () => root.render(<AssetComposer {...props} draft={draft} setDraft={setDraft} jobs={[job]} taskId={job.id} onResume={resume} />));
   const button = [...container.querySelectorAll('button')].find(node => node.textContent === 'Continue download')!;
   await act(async () => button.click());
   expect(resume).toHaveBeenCalledExactlyOnceWith(job);

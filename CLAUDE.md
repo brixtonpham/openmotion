@@ -49,9 +49,9 @@ The design-system workbench is an independent package-owned editing surface. Kee
 
 ## MCP onboarding
 
-The MCP main page is the shared capability and usage handbook. Follow [MCP maintenance](AGENTS.md#mcp-onboarding-and-capability-maintenance) for every capability change and every scenario built from existing tools, even without a new tool. Update its entry points, examples, prerequisites, recovery and limitations in the same change; reuse shared instruction builders with feature UI and test both atomic tool coverage and scenario coverage. Platform export must remain aligned between Export and the handbook.
+The MCP main page is the shared capability and usage handbook for **Streamable HTTP `/mcp`** (OAuth 2.1 + PAT; ChatGPT Cloud supported on public HTTPS + OAuth 2.1) and the unified OpenDesign Model Gateway (no workspace BYOK forms). Follow [MCP maintenance](AGENTS.md#mcp-onboarding-and-capability-maintenance) for every capability change and every scenario built from existing tools, even without a new tool. Update its entry points, examples, prerequisites, recovery, P1/P2 boundaries and limitations in the same change; reuse shared instruction builders with feature UI and test both atomic tool coverage and scenario coverage. Platform export must remain aligned between Export and the handbook.
 
-Follow [MCP onboarding and capability maintenance](AGENTS.md#mcp-onboarding-and-capability-maintenance). Changes to local MCP, media generation, Agent adapters, templates or optional presentation must keep the Studio connection page, capability descriptions, setup instructions and compatibility boundaries current in the same change.
+Follow [MCP onboarding and capability maintenance](AGENTS.md#mcp-onboarding-and-capability-maintenance). Changes to Streamable HTTP MCP, 3-way cloud asset import, unified OpenDesign media generation, Agent adapters, templates or optional presentation must keep the Studio connection page, capability descriptions, setup instructions and compatibility boundaries current in the same change.
 
 ## Core capabilities and shared APIs
 

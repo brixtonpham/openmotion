@@ -8,7 +8,7 @@ import { Menu, MenuItem, MenuSeparator, MenuSubmenu, MenuRadioGroup, MenuRadioIt
 import { Tooltip } from '../components/ui/Tooltip';
 import { languages, useI18n, type Locale } from '../i18n/I18n';
 import { useWorkspaceChrome } from './WorkspaceFrame';
-import { useAccountSummary } from './AccountSettings';
+import { buildLoginUrl, useAccountSummary } from './AccountSettings';
 import { CommunityLink } from './CommunityLink';
 import { GitHubLink } from './GitHubLink';
 import { repositorySupportLinks } from './githubRepository';
@@ -58,6 +58,7 @@ export function ApplicationHeader({ settings, atExploreHome, onSkill, openAsset,
     </div>
   </header>;
 }
+
 export function WorkspaceUtilityActions({ openSettings }: { openSettings: (section: SettingsSection) => void }) {
   const { t } = useI18n();
   const item = (label: string, icon: string, action: () => void) => (
@@ -67,7 +68,7 @@ export function WorkspaceUtilityActions({ openSettings }: { openSettings: (secti
   );
   return <nav className="motion-sidebar-utilities" aria-label={t('Application navigation')}>
     {item('Settings', 'settings-3-line', () => openSettings('general'))}
-    {item('Model providers', 'brain-line', () => openSettings('providers'))}
+    {item('Model gateway', 'brain-line', () => openSettings('providers'))}
     {item('Help', 'question-line', () => openSettings('help'))}
   </nav>;
 }
@@ -76,18 +77,110 @@ export function ApplicationAccountMenu({ settings, openSettings }: { settings: S
   const { t, locale, setLocale } = useI18n();
   const { account } = useAccountSummary();
   const userName = account?.user?.name?.trim() || account?.user?.email?.trim() || t('Account');
+  const workspaceLabel = account?.activeWorkspace?.name;
+  const isDevMode = account?.authMode === 'dev';
+  const signedIn = account?.state === 'signed-in';
   const avatarInitial = avatarSegmenter.segment(userName)[Symbol.iterator]().next().value?.segment;
-  return <Menu tooltip={t('Account menu')} modal={false} side="bottom" align="end" aria-label={t('Account menu')} className="om-account-menu om-selection-panel om-menu-panel" trigger={<Button variant="plain" type="button" className="om-nav-item om-account-trigger" aria-current={settings === 'account' || settings === 'subscription' ? 'page' : undefined} aria-label={t('Account menu')}><span className="om-avatar" aria-hidden="true">{account?.state === 'signed-in' ? avatarInitial : <RemixIcon className="om-default-avatar-icon" name="user-3-line" size={14} />}</span></Button>}>
-      <MenuItem onClick={() => openSettings('account')}><span className="om-menu-label"><RemixIcon name="user-3-line" size={16} /><strong>{userName}</strong></span></MenuItem><MenuSeparator />
-      <MenuItem onClick={() => openSettings('subscription')}><span className="om-menu-label"><RemixIcon name="bank-card-line" size={16} />{t('Subscription & usage')}</span></MenuItem>
+
+  async function signOut() {
+    try {
+      const response = await fetch('/auth/logout', { method: 'POST', credentials: 'same-origin' });
+      const data = await response.json().catch(() => ({})) as { endSessionUrl?: string };
+      window.dispatchEvent(new Event('motion:account-changed'));
+      if (data.endSessionUrl) window.location.assign(data.endSessionUrl);
+    } catch {
+      openSettings('account');
+    }
+  }
+
+  return (
+    <Menu
+      tooltip={t('Account menu')}
+      modal={false}
+      side="bottom"
+      align="end"
+      aria-label={t('Account menu')}
+      className="om-account-menu om-selection-panel om-menu-panel"
+      trigger={
+        <Button
+          variant="plain"
+          type="button"
+          className="om-nav-item om-account-trigger"
+          aria-current={settings === 'account' || settings === 'subscription' ? 'page' : undefined}
+          aria-label={t('Account menu')}
+        >
+          <span className="om-avatar" aria-hidden="true">
+            {signedIn ? avatarInitial : <RemixIcon className="om-default-avatar-icon" name="user-3-line" size={14} />}
+          </span>
+          {isDevMode && <span className="om-badge" data-active="true">{t('Dev')}</span>}
+        </Button>
+      }
+    >
+      <MenuItem onClick={() => openSettings('account')}>
+        <span className="om-menu-label">
+          <RemixIcon name="user-3-line" size={16} />
+          <strong>{userName}</strong>
+        </span>
+      </MenuItem>
+      {workspaceLabel && (
+        <MenuItem onClick={() => openSettings('account')}>
+          <span className="om-menu-label">
+            <RemixIcon name="apps-2-line" size={16} />
+            <span>{workspaceLabel}</span>
+          </span>
+        </MenuItem>
+      )}
       <MenuSeparator />
-      <MenuItem shortcut="⌘ ," onClick={() => openSettings('general')}><span className="om-menu-label"><RemixIcon name="settings-3-line" size={16} />{t('Settings')}</span></MenuItem>
-      <MenuItem onClick={() => openSettings('appearance')}><span className="om-menu-label"><RemixIcon name="sun-line" size={16} />{t('Appearance')}</span></MenuItem>
-      <MenuSubmenu aria-label={t('Language')} className="om-selection-panel om-menu-panel" label={<span className="om-menu-label"><RemixIcon name="global-line" size={16} />{t('Language')}</span>} detail={languages.find(language => language.locale === locale)?.label}>
-        <MenuRadioGroup value={locale} onValueChange={value => setLocale(value as Locale)}>{languages.map(language => <MenuRadioItem key={language.locale} value={language.locale} closeOnClick>{language.label}</MenuRadioItem>)}</MenuRadioGroup>
+      <MenuItem onClick={() => openSettings('subscription')}>
+        <span className="om-menu-label"><RemixIcon name="bank-card-line" size={16} />{t('Subscription & usage')}</span>
+      </MenuItem>
+      <MenuItem onClick={() => openSettings('account')}>
+        <span className="om-menu-label"><RemixIcon name="lock-line" size={16} />{t('Personal access tokens')}</span>
+      </MenuItem>
+      <MenuSeparator />
+      <MenuItem shortcut="⌘ ," onClick={() => openSettings('general')}>
+        <span className="om-menu-label"><RemixIcon name="settings-3-line" size={16} />{t('Settings')}</span>
+      </MenuItem>
+      <MenuItem onClick={() => openSettings('appearance')}>
+        <span className="om-menu-label"><RemixIcon name="sun-line" size={16} />{t('Appearance')}</span>
+      </MenuItem>
+      <MenuSubmenu
+        aria-label={t('Language')}
+        className="om-selection-panel om-menu-panel"
+        label={<span className="om-menu-label"><RemixIcon name="global-line" size={16} />{t('Language')}</span>}
+        detail={languages.find(language => language.locale === locale)?.label}
+      >
+        <MenuRadioGroup value={locale} onValueChange={value => setLocale(value as Locale)}>
+          {languages.map(language => <MenuRadioItem key={language.locale} value={language.locale} closeOnClick>{language.label}</MenuRadioItem>)}
+        </MenuRadioGroup>
       </MenuSubmenu>
       <MenuSeparator />
-      {repositorySupportLinks.map(link => <MenuItem key={link.href} render={<a href={link.href} target="_blank" rel="noopener noreferrer" />}><span className="om-menu-label"><RemixIcon name={link.icon} size={16} />{t(link.label)}<RemixIcon className="om-menu-external" name="external-link-line" size={14} /></span></MenuItem>)}
-      <MenuItem onClick={() => openSettings('help')}><span className="om-menu-label"><RemixIcon name="question-line" size={16} />{t('Help')}</span></MenuItem>
-    </Menu>;
+      {repositorySupportLinks.map(link => (
+        <MenuItem key={link.href} render={<a href={link.href} target="_blank" rel="noopener noreferrer" />}>
+          <span className="om-menu-label">
+            <RemixIcon name={link.icon} size={16} />
+            {t(link.label)}
+            <RemixIcon className="om-menu-external" name="external-link-line" size={14} />
+          </span>
+        </MenuItem>
+      ))}
+      <MenuItem onClick={() => openSettings('help')}>
+        <span className="om-menu-label"><RemixIcon name="question-line" size={16} />{t('Help')}</span>
+      </MenuItem>
+      {!isDevMode && (
+        <>
+          <MenuSeparator />
+          {signedIn ? (
+            <MenuItem onClick={() => void signOut()}>
+              <span className="om-menu-label"><RemixIcon name="login-box-line" mirrored size={16} />{t('Sign out')}</span>
+            </MenuItem>
+          ) : (
+            <MenuItem onClick={() => window.location.assign(buildLoginUrl())}>
+              <span className="om-menu-label"><RemixIcon name="login-box-line" size={16} />{t('Sign in with OpenDesign')}</span>
+            </MenuItem>
+          )}
+        </>
+      )}
+    </Menu>
+  );
 }

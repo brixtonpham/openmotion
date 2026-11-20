@@ -3,32 +3,51 @@ import { act } from 'react';
 import { createRoot } from 'react-dom/client';
 import { afterEach, expect, it, vi } from 'vitest';
 import { useFfmpegStatus } from './useFfmpegStatus';
+
 Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
 afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
-it('polls background readiness and restores export without reload or another download request', async () => {
+
+it('reads remote-worker heartbeat from /api/environment/ffmpeg and polls until a worker comes online', async () => {
   vi.useFakeTimers();
-  let ready = false, result: ReturnType<typeof useFfmpegStatus>;
-  const fetch = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response(JSON.stringify({ managed: true, components: [{ id: 'browser', stage: ready ? 'ready' : 'downloading' }], capabilities: { capture: ready, media: true, export: ready } })));
+  let ready = false;
+  let result: ReturnType<typeof useFfmpegStatus>;
+  const fetcher = vi.spyOn(globalThis, 'fetch').mockImplementation(async (url) => {
+    expect(String(url)).toContain('/api/environment/ffmpeg');
+    return new Response(JSON.stringify({
+      ok: ready,
+      available: ready,
+      version: ready ? 'remote-worker' : null,
+      mode: 'remote-worker',
+      workers: ready
+        ? [{ workerId: 'render-1', ffmpeg: true, ffprobe: true, chromium: true, concurrency: 2, activeJobs: 0, updatedAt: new Date().toISOString() }]
+        : [],
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  });
   function View() { result = useFfmpegStatus(); return <span>{String(result.status?.ok)}</span>; }
   const host = document.createElement('div'), root = createRoot(host);
   await act(async () => { root.render(<View />); });
   expect(result!.status?.ok).toBe(false);
+  expect(result!.status?.mode).toBe('remote-worker');
+  expect(result!.status?.title).toContain('Render worker');
   ready = true;
-  await act(async () => { await vi.advanceTimersByTimeAsync(1500); });
+  await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
   expect(result!.status?.ok).toBe(true);
-  expect(fetch.mock.calls.every(([, init]) => !init?.method || init.method === 'GET')).toBe(true);
+  expect(result!.status?.workers).toHaveLength(1);
+  expect(fetcher.mock.calls.every(([, init]) => !init?.method || init.method === 'GET')).toBe(true);
   act(() => root.unmount());
 });
 
-it('keeps a completed retry when an older status request finishes later', async () => {
+it('keeps a completed recheck when an older status request finishes later', async () => {
   let ready = false, reads = 0, release: (response: Response) => void;
   let result: ReturnType<typeof useFfmpegStatus>;
   const response = (available: boolean) => new Response(JSON.stringify({
-    managed: true, components: [{ id: 'browser', stage: available ? 'ready' : 'failed' }],
-    capabilities: { capture: available, media: true, export: available },
-  }));
-  vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
-    if (init?.method === 'POST') { ready = true; return response(true); }
+    ok: available,
+    available,
+    version: available ? 'remote-worker' : null,
+    mode: 'remote-worker',
+    workers: available ? [{ workerId: 'render-1', ffmpeg: true, ffprobe: true, chromium: true, concurrency: 2, activeJobs: 0, updatedAt: new Date().toISOString() }] : [],
+  }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
     if (++reads === 2) return new Promise(resolve => { release = resolve; });
     return response(ready);
   });
@@ -36,7 +55,9 @@ it('keeps a completed retry when an older status request finishes later', async 
   const host = document.createElement('div'), root = createRoot(host);
   try {
     await act(async () => { root.render(<View />); });
+    expect(result!.status?.ok).toBe(false);
     await act(async () => { window.dispatchEvent(new Event('focus')); });
+    ready = true;
     await act(async () => { result!.recheck(); });
     expect(result!.status?.ok).toBe(true);
     await act(async () => { release!(response(false)); });

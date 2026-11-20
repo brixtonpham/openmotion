@@ -161,7 +161,7 @@ it('reports the MCP page entry, client and setup choices, and each copy result w
   await act(async () => button('Explore templates').click());
   expect(openLibrary).toHaveBeenCalled();
   expect(of('ui_click').at(-1)?.properties).toMatchObject({ area: 'mcp_start', element: 'open_library' });
-  await act(async () => button('Manage providers').click());
+  await act(async () => button('Model gateway').click());
   expect(openProviders).toHaveBeenCalled();
   expect(of('ui_click').at(-1)?.properties).toMatchObject({ area: 'mcp_resources', element: 'manage_providers' });
   expectAdmitted();

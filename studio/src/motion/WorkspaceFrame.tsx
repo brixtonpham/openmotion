@@ -157,11 +157,6 @@ export function WorkspaceFrame({ children, waitForSaves, projectId, sessionId, b
     requestAnimationFrame(() => applicationRef.current?.querySelector<HTMLButtonElement>('.om-app-brand')?.focus());
   }, [navigatePage]);
   useEffect(() => {
-    const open = () => openSettings('local');
-    window.addEventListener('motion:agents-open', open);
-    return () => window.removeEventListener('motion:agents-open', open);
-  }, [openSettings]);
-  useEffect(() => {
     const query = window.matchMedia('(max-width: 999px)');
     const update = () => {
       // Close the desktop list in the same render that enables the modal drawer.
@@ -347,7 +342,7 @@ export function WorkspaceFrame({ children, waitForSaves, projectId, sessionId, b
       {(skillsOpen || page.specialty) && !settings && !templatesPage && <div className="om-skills-host"><SkillsPage previewsEnabled={!connectionsOpen} briefs={skillBriefs.current} onCreate={openStudio} key={page.specialty?.id ?? 'skills'} studio={page.specialty ?? undefined} onExplore={returnToExplore} skillId={page.skill} routeCategory={page.skills ? page.skillCategory : undefined} onCategoryChange={skillCategory => navigatePage({ skillCategory }, true)} onSkillChange={skill => navigatePage({ skill })} hasProject={Boolean(projectId)} /></div>}
       {settings && !templatesPage && <SettingsSurfaceBoundary key={settings}>{settings === 'brand-kit'
         ? <BrandKitPage inWorkspace={!hostChrome} onClose={openHome} selectedId={page.brandKit} onSelect={brandKit => navigatePage({ brandKit })} previewsEnabled={!connectionsOpen} hasProject={Boolean(projectId)} /> : settings === 'mcp'
-        ? <McpConnectionPage openProviders={value.openModelSettings} onBack={() => openPage('explore')} entry={connectionEntry.current} projectId={projectId ?? undefined} hasProject={Boolean(projectId)} previewsEnabled={!connectionsOpen} openLibrary={value.openLibrary} route={page} onRouteChange={navigatePage} />
+        ? <McpConnectionPage openProviders={value.openModelSettings} openAccount={value.openAccountSettings} onBack={() => openPage('explore')} entry={connectionEntry.current} projectId={projectId ?? undefined} hasProject={Boolean(projectId)} previewsEnabled={!connectionsOpen} openLibrary={value.openLibrary} route={page} onRouteChange={navigatePage} />
         : <SettingsCenter hasProject={Boolean(projectId)} section={settings} onSection={openSettings} openConnections={value.openConnections} providerId={page.provider} onProviderChange={provider => navigatePage({ provider })} />}</SettingsSurfaceBoundary>}
       {(templatesPage || detailOnly) && library}
       {templatesPage && page.templateCollection === 'black-friday' && page.skill && <SkillsPage detailOnly skillId={page.skill}
