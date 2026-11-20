@@ -272,6 +272,30 @@ spec:
                 configMapKeyRef:
                   name: openmotion-config
                   key: ALLOW_DOH_FAKEIP_FALLBACK
+            - name: SENTRY_WEB_DSN
+              valueFrom:
+                configMapKeyRef:
+                  name: openmotion-config
+                  key: SENTRY_WEB_DSN
+                  optional: true
+            - name: SENTRY_ENVIRONMENT
+              valueFrom:
+                configMapKeyRef:
+                  name: openmotion-config
+                  key: SENTRY_ENVIRONMENT
+                  optional: true
+            - name: SENTRY_RELEASE
+              valueFrom:
+                configMapKeyRef:
+                  name: openmotion-config
+                  key: SENTRY_RELEASE
+                  optional: true
+            - name: SENTRY_TRACES_SAMPLE_RATE
+              valueFrom:
+                configMapKeyRef:
+                  name: openmotion-config
+                  key: SENTRY_TRACES_SAMPLE_RATE
+                  optional: true
           livenessProbe:
             httpGet:
               path: /api/health/live

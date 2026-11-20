@@ -221,6 +221,7 @@ jobs:
         run: |
           npm run build:studio
           npm run build:tracking
+          npm run build:observability
       - name: Run cloud backend and integration test suite
         if: steps.scope.outputs.full == 'true'
         run: |

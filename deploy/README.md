@@ -102,7 +102,25 @@ All runtime variables are validated strictly by [`src/infra/config.ts`](../src/i
 | `S3_PRESIGN_CACHE_WINDOW_SEC` | `3600` | UTC time-window alignment (seconds) for cacheable `immutable` Presigned GET URLs on content-addressed blobs/proxies/thumbnails. |
 | `BLOB_GC_GRACE_SECONDS` | `604800` | 7-day grace period (seconds) before Mark-and-Sweep CAS GC physically deletes verified-unreferenced blobs. |
 | `HISTORY_COALESCE_WINDOW_MS` | `4000` | Edit-window duration (ms) for coalescing rapid interactive Studio edits into the head unpinned version (`0` disables coalescing). |
+| `SENTRY_WEB_DSN` | *(empty)* | Optional Sentry public DSN injected into Studio `index.html` at runtime by `api` (via `@openmotion/observability`). Leave empty to disable web Sentry completely. |
+| `SENTRY_ENVIRONMENT` / `SENTRY_RELEASE` | `NODE_ENV` / `openmotion@<version>` | Runtime Sentry environment and release labels injected alongside `SENTRY_WEB_DSN`. |
+| `SENTRY_TRACES_SAMPLE_RATE` | `0.1` | Browser performance tracing sample rate in `[0, 1]` (`0` disables performance traces while keeping error capture). |
 | `RENDER_SHM_SIZE` / `RENDER_MEM_LIMIT` | `512m` / `2g` | Chromium `/dev/shm` and container memory limit on `worker-render`. Raise to `1g`–`2g` / `4g` on `>= 8 GiB` hosts. |
+
+### Web Sentry SourceMaps (BuildKit Secret Upload)
+
+Production images never ship `.map` files (`deploy/Dockerfile` strips `studio/build/**/*.map` before copying into `prod-base`, and `api` returns `404` for `*.map` when `NODE_ENV=production`). To generate `hidden` sourcemaps with Sentry Debug IDs and upload them during container build without baking any credentials into image layers:
+
+```bash
+docker buildx build \
+  -f deploy/Dockerfile \
+  --target api \
+  --build-arg SENTRY_ORG=your-org \
+  --build-arg SENTRY_PROJECT=openmotion-web \
+  --build-arg SENTRY_RELEASE="openmotion@0.0.1" \
+  --secret id=sentry_auth_token,env=SENTRY_AUTH_TOKEN \
+  .
+```
 
 ## Kubernetes + KEDA Deployment (`deploy/k8s/`)
 
