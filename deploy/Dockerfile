@@ -13,7 +13,8 @@ COPY package.json package-lock.json ./
 RUN npm ci --no-audit --no-fund
 
 COPY . .
-RUN npm run build:studio && npm run build:tracking
+ARG STUDIO_SOURCEMAP=false
+RUN STUDIO_SOURCEMAP=${STUDIO_SOURCEMAP} npm run build:studio && npm run build:tracking
 
 # -----------------------------------------------------------------------------
 # Stage 2: fonts-catalog — deterministic font catalog baked identically into
