@@ -30,5 +30,5 @@ export default defineConfig({
     { find: 'canvas', replacement: local('./src/shims/canvasBrowserStub.js') },
     { find: /^\/design-system\//, replacement: local('../packages/design-system/') },
   ] },
-  build: { outDir: 'build', assetsDir: 'editor-assets', emptyOutDir: true, sourcemap: true, chunkSizeWarningLimit: 4500 },
+  build: { outDir: 'build', assetsDir: 'editor-assets', emptyOutDir: true, sourcemap: process.env.STUDIO_SOURCEMAP !== 'false', chunkSizeWarningLimit: 4500 },
 });
