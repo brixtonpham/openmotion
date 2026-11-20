@@ -2,6 +2,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { getConfig } from '../infra/config.ts';
 import { createLogger } from '../infra/logger.ts';
+import { createPlatformModelGateway } from '../services/model-gateway.ts';
 import { startWorkerRuntime, type WorkerRuntimeHandle } from '../workers/worker.ts';
 
 export async function runWorkerEntrypoint(): Promise<WorkerRuntimeHandle> {
@@ -15,10 +16,14 @@ export async function runWorkerEntrypoint(): Promise<WorkerRuntimeHandle> {
     nodeEnv: config.NODE_ENV,
     mediaConcurrency: config.MEDIA_CONCURRENCY,
     renderConcurrency: config.RENDER_CONCURRENCY,
+    modelGatewayMode: config.MODEL_GATEWAY_MODE,
   });
+  const modelGateway =
+    config.WORKER_ROLE === 'media' ? createPlatformModelGateway(config) : undefined;
   return startWorkerRuntime({
     config,
     logger,
+    modelGateway,
     installSignals: true,
   });
 }

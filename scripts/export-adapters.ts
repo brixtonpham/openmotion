@@ -6,7 +6,7 @@ import { packagedSkills } from '../shared/workflow.ts';
 import { isMain } from '../shared/entry.ts';
 import { integrationConfig } from '../shared/integration.ts';
 import type { IntegrationInfo } from '../shared/integration.ts';
-import { zip } from './package.ts';
+import { zip } from './zip.mjs';
 import { designSystemDocuments } from '../packages/design-system/index.js';
 
 // Local adapters reference one installed runtime; these ZIPs are not portable installers.
