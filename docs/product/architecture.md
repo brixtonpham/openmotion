@@ -38,7 +38,7 @@ OpenMotion compiles to a single backend codebase (`src/`) and one static Studio 
 flowchart LR
   Browser["Studio SPA (Browser)"] -->|HTTPS Session Cookie| API["api (Hono)"]
   Agent["External MCP Agents\n(Codex / Claude / Cursor / ChatGPT)"] -->|Streamable HTTP /mcp\nOAuth 2.1 or PAT Bearer| API
-  Browser -->|Direct Presigned PUT / GET| S3["S3 / R2 / MinIO CAS"]
+  Browser -->|Direct Presigned PUT / GET| S3["S3 / R2 / RustFS CAS"]
   Agent -->|Direct Presigned PUT| S3
   API --> PG["PostgreSQL (Drizzle ORM)"]
   API --> Redis["Redis + BullMQ"]
@@ -181,6 +181,6 @@ The following host-local features from the legacy desktop runtime have been remo
 
 Automated checks, containerized integration tests, live upstream billing, and human visual review remain distinct evidence tiers:
 
-- **Static & Unit Gates**: `npm run typecheck:studio`, `npm run build:studio`, `npm run design:check`, `npm run test:studio`, `tests/mcp-onboarding.test.ts`, and `tests/cloud/*` verify contracts, schemas, RBAC, isolation, and UI resilience deterministically (using `MODEL_GATEWAY_MODE=mock` and mocked/containerized Postgres, Redis, and MinIO).
-- **Container Stack Verification**: `docker compose up` validates end-to-end `api` + `worker-media` + `worker-render` + Postgres + Redis + MinIO health, presigned uploads, Streamable HTTP `/mcp`, and MP4 exports.
+- **Static & Unit Gates**: `npm run typecheck:studio`, `npm run build:studio`, `npm run design:check`, `npm run test:studio`, `tests/mcp-onboarding.test.ts`, and `tests/cloud/*` verify contracts, schemas, RBAC, isolation, and UI resilience deterministically (using `MODEL_GATEWAY_MODE=mock` and mocked/containerized Postgres, Redis, and S3-compatible storage such as RustFS).
+- **Container Stack Verification**: `docker compose up` validates end-to-end `api` + `worker-media` + `worker-render` + Postgres + Redis + RustFS (S3) health, presigned uploads, Streamable HTTP `/mcp`, and MP4 exports.
 - **External Platform & Visual Acceptance**: Real OpenDesign OIDC sign-in, live paid OpenDesign Model Gateway execution, public HTTPS ChatGPT Cloud OAuth 2.1 handshakes, and human audiovisual review of rendered films require live environment credentials and human inspection.
