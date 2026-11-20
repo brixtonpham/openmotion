@@ -1,5 +1,6 @@
 import {
   createRemoteJWKSet,
+  decodeProtectedHeader,
   jwtVerify,
   type JWTPayload,
   type JWTVerifyGetKey,
@@ -22,12 +23,29 @@ import {
   type MembershipResolution,
 } from './store.ts';
 
+export const ASYMMETRIC_OIDC_ALGS = [
+  'RS256',
+  'RS384',
+  'RS512',
+  'PS256',
+  'PS384',
+  'PS512',
+  'ES256',
+  'ES384',
+  'ES512',
+  'EdDSA',
+] as const;
+
+export const SYMMETRIC_OIDC_ALGS = ['HS256'] as const;
+
 export interface OidcDiscoveryDocument {
   issuer: string;
   authorization_endpoint: string;
   token_endpoint: string;
-  jwks_uri: string;
+  jwks_uri?: string;
+  userinfo_endpoint?: string;
   end_session_endpoint?: string;
+  id_token_signing_alg_values_supported?: string[];
 }
 
 export interface OidcClientConfig {
@@ -134,7 +152,21 @@ export class OidcService {
       );
     }
     const doc = (await response.json()) as Partial<OidcDiscoveryDocument>;
-    if (!doc.issuer || !doc.authorization_endpoint || !doc.token_endpoint || !doc.jwks_uri) {
+    const jwksUri =
+      typeof doc.jwks_uri === 'string' && doc.jwks_uri.trim().length > 0
+        ? doc.jwks_uri.trim()
+        : undefined;
+    const supportedAlgs = Array.isArray(doc.id_token_signing_alg_values_supported)
+      ? doc.id_token_signing_alg_values_supported.filter((v): v is string => typeof v === 'string')
+      : undefined;
+    const supportsHs256 =
+      Boolean(this.cfg.clientSecret) && (!supportedAlgs || supportedAlgs.includes('HS256'));
+    if (
+      !doc.issuer ||
+      !doc.authorization_endpoint ||
+      !doc.token_endpoint ||
+      (!jwksUri && !this.cachedJwks && !supportsHs256)
+    ) {
       throw new CloudError('SERVICE_UNAVAILABLE', 'OIDC discovery document is incomplete', {
         status: 502,
       });
@@ -143,21 +175,61 @@ export class OidcService {
       issuer: doc.issuer,
       authorization_endpoint: doc.authorization_endpoint,
       token_endpoint: doc.token_endpoint,
-      jwks_uri: doc.jwks_uri,
+      jwks_uri: jwksUri,
+      userinfo_endpoint: doc.userinfo_endpoint,
       end_session_endpoint: doc.end_session_endpoint,
+      id_token_signing_alg_values_supported: supportedAlgs,
     };
     this.cachedDiscovery = { doc: resolved, expiresAt: Date.now() + 15 * 60 * 1000 };
     return resolved;
   }
 
-  async getJwks(): Promise<JWTVerifyGetKey> {
+  async getJwks(): Promise<JWTVerifyGetKey | null> {
     if (this.cachedJwks) return this.cachedJwks;
     const doc = await this.discover();
+    if (!doc.jwks_uri) return null;
     this.cachedJwks = createRemoteJWKSet(new URL(doc.jwks_uri), {
       cooldownDuration: 30_000,
       cacheMaxAge: 5 * 60 * 1000,
     });
     return this.cachedJwks;
+  }
+
+  private async verifyIdToken(idToken: string, doc: OidcDiscoveryDocument): Promise<JWTPayload> {
+    const header = decodeProtectedHeader(idToken);
+    const alg = header.alg;
+
+    if (alg === 'HS256') {
+      const supported = doc.id_token_signing_alg_values_supported;
+      const hs256Allowed =
+        supported && supported.length > 0
+          ? supported.includes('HS256')
+          : !doc.jwks_uri && !this.cachedJwks;
+      if (!this.cfg.clientSecret || !hs256Allowed) {
+        throw new Error('HS256 id_token is not permitted for this OIDC configuration');
+      }
+      const verified = await jwtVerify(idToken, new TextEncoder().encode(this.cfg.clientSecret), {
+        issuer: doc.issuer,
+        audience: this.cfg.clientId,
+        algorithms: [...SYMMETRIC_OIDC_ALGS],
+      });
+      return verified.payload;
+    }
+
+    if (typeof alg === 'string' && (ASYMMETRIC_OIDC_ALGS as readonly string[]).includes(alg)) {
+      const jwks = await this.getJwks();
+      if (!jwks) {
+        throw new Error('No JWKS available to verify asymmetric id_token');
+      }
+      const verified = await jwtVerify(idToken, jwks, {
+        issuer: doc.issuer,
+        audience: this.cfg.clientId,
+        algorithms: [...ASYMMETRIC_OIDC_ALGS],
+      });
+      return verified.payload;
+    }
+
+    throw new Error('Unsupported id_token signing algorithm');
   }
 
   async startLogin(returnTo?: string | null): Promise<{
@@ -199,8 +271,23 @@ export class OidcService {
 
   async completeCallback(
     store: AuthStore,
-    input: { code: string; state: string; txCookieValue?: string | null },
+    input: {
+      code: string;
+      state: string;
+      txCookieValue?: string | null;
+      iss?: string | null;
+      error?: string | null;
+    },
   ): Promise<{ membership: MembershipResolution; returnTo: string }> {
+    if (input.error) {
+      if (input.state) {
+        await this.cache.del(oidcTxCacheKey(input.state));
+      }
+      throw new CloudError('UNAUTHORIZED', `OIDC authorization failed: ${input.error}`, {
+        status: 401,
+      });
+    }
+
     if (!input.code || !input.state || !input.txCookieValue) {
       throw new CloudError('UNAUTHORIZED', 'Missing OIDC callback parameters or state cookie', {
         status: 401,
@@ -228,6 +315,9 @@ export class OidcService {
     }
 
     const doc = await this.discover();
+    if (input.iss && input.iss !== doc.issuer) {
+      throw new CloudError('UNAUTHORIZED', 'OIDC callback issuer mismatch', { status: 401 });
+    }
     const form = new URLSearchParams();
     form.set('grant_type', 'authorization_code');
     form.set('code', input.code);
@@ -263,14 +353,9 @@ export class OidcService {
       });
     }
 
-    const jwks = await this.getJwks();
     let payload: JWTPayload;
     try {
-      const verified = await jwtVerify(tokenJson.id_token, jwks, {
-        issuer: doc.issuer,
-        audience: this.cfg.clientId,
-      });
-      payload = verified.payload;
+      payload = await this.verifyIdToken(tokenJson.id_token, doc);
     } catch {
       throw new CloudError('UNAUTHORIZED', 'OIDC id_token verification failed', { status: 401 });
     }
@@ -314,6 +399,7 @@ export class OidcService {
 
     const doc = await this.discover();
     const jwks = await this.getJwks();
+    if (!jwks) return null;
     const audience = options.expectedAudience ?? this.cfg.audience ?? this.cfg.clientId;
 
     let payload: JWTPayload;
@@ -321,6 +407,7 @@ export class OidcService {
       const verified = await jwtVerify(token, jwks, {
         issuer: doc.issuer,
         ...(audience ? { audience } : {}),
+        algorithms: [...ASYMMETRIC_OIDC_ALGS],
       });
       payload = verified.payload;
     } catch {

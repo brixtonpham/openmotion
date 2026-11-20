@@ -695,3 +695,424 @@ describe('OAuth 2.1 Proxy & Delegated Modes (RFC 9728, RFC 8414, DCR, PKCE S256,
     assert.equal(asmRes.status, 404);
   });
 });
+
+describe('AUTH_MODE=oidc HS256 ID Token Interop (OpenDesign / Vela Better Auth) & Security Guards', () => {
+  const VELA_ISSUER = 'https://amr-api.open-design.ai/api/auth';
+  const VELA_CLIENT_ID = 'openmotion-first-party';
+  const VELA_CLIENT_SECRET = 'vela-hs256-client-secret-minimum-32-chars';
+
+  async function signHs256Jwt(
+    claims: Record<string, unknown>,
+    options: { secret?: string; issuer?: string; audience?: string } = {},
+  ): Promise<string> {
+    return new SignJWT(claims)
+      .setProtectedHeader({ alg: 'HS256', typ: 'JWT' })
+      .setIssuedAt()
+      .setIssuer(options.issuer ?? VELA_ISSUER)
+      .setAudience(options.audience ?? VELA_CLIENT_ID)
+      .setExpirationTime('1h')
+      .sign(new TextEncoder().encode(options.secret ?? VELA_CLIENT_SECRET));
+  }
+
+  function makeVelaConfig(overrides: Record<string, string | undefined> = {}): AppConfig {
+    return makeConfig({
+      OIDC_ISSUER: VELA_ISSUER,
+      OIDC_CLIENT_ID: VELA_CLIENT_ID,
+      OIDC_CLIENT_SECRET: VELA_CLIENT_SECRET,
+      ...overrides,
+    });
+  }
+
+  it('completes OIDC Auth Code + PKCE using dynamic discovery without jwks_uri and verifies HS256 id_token with RFC 9207 iss', async () => {
+    const config = makeVelaConfig();
+    const store = new InMemoryAuthStore();
+    const cache = new InMemoryAuthCache();
+
+    let discoveredUrl = '';
+    let capturedNonce = '';
+    let capturedTokenParams: URLSearchParams | null = null;
+
+    const oidc = new OidcService(
+      {
+        issuer: VELA_ISSUER,
+        clientId: VELA_CLIENT_ID,
+        clientSecret: VELA_CLIENT_SECRET,
+        callbackUrl: 'https://motion.example.test/auth/callback',
+        scopes: 'openid profile email',
+        claimSub: 'sub',
+        claimEmail: 'email',
+        claimName: 'name',
+        fetcher: async (url, init) => {
+          const target = String(url);
+          if (target.endsWith('/.well-known/openid-configuration')) {
+            discoveredUrl = target;
+            return new Response(
+              JSON.stringify({
+                issuer: VELA_ISSUER,
+                authorization_endpoint: `${VELA_ISSUER}/oauth2/authorize`,
+                token_endpoint: `${VELA_ISSUER}/oauth2/token`,
+                userinfo_endpoint: `${VELA_ISSUER}/oauth2/userinfo`,
+                end_session_endpoint: `${VELA_ISSUER}/oauth2/end-session`,
+                id_token_signing_alg_values_supported: ['HS256'],
+                authorization_response_iss_parameter_supported: true,
+              }),
+              { status: 200, headers: { 'Content-Type': 'application/json' } },
+            );
+          }
+          if (target === `${VELA_ISSUER}/oauth2/token`) {
+            capturedTokenParams = new URLSearchParams(String(init?.body ?? ''));
+            const idToken = await signHs256Jwt({
+              sub: 'vela_user_001',
+              email: 'vela.alice@example.test',
+              name: 'Alice Vela',
+              picture: 'https://cdn.open-design.test/avatar.png',
+              sid: 'vela_session_001',
+              nonce: capturedNonce,
+            });
+            return new Response(
+              JSON.stringify({ id_token: idToken, access_token: 'opaque_vela_at', token_type: 'Bearer' }),
+              { status: 200, headers: { 'Content-Type': 'application/json' } },
+            );
+          }
+          return new Response('Not Found', { status: 404 });
+        },
+      },
+      cache,
+    );
+
+    const app = new Hono<AuthEnv>();
+    app.route('/', createAuthRoutes({ config, store, cache, oidc }));
+
+    const loginRes = await app.request('/auth/login?returnTo=/create');
+    assert.equal(loginRes.status, 302);
+    assert.equal(discoveredUrl, `${VELA_ISSUER}/.well-known/openid-configuration`);
+    const authorizeUrl = new URL(loginRes.headers.get('location')!);
+    assert.equal(authorizeUrl.origin + authorizeUrl.pathname, `${VELA_ISSUER}/oauth2/authorize`);
+    const state = authorizeUrl.searchParams.get('state')!;
+    capturedNonce = authorizeUrl.searchParams.get('nonce')!;
+    const txCookie = extractCookieValue(loginRes.headers.getSetCookie(), 'om_oidc_tx')!;
+
+    const cbRes = await app.request(
+      `/auth/callback?code=vela-code-1&state=${encodeURIComponent(state)}&iss=${encodeURIComponent(VELA_ISSUER)}`,
+      { headers: { Cookie: `om_oidc_tx=${encodeURIComponent(txCookie)}` } },
+    );
+    assert.equal(cbRes.status, 302);
+    assert.equal(cbRes.headers.get('location'), '/create');
+    assert.equal(capturedTokenParams!.get('client_id'), VELA_CLIENT_ID);
+    assert.equal(capturedTokenParams!.get('client_secret'), VELA_CLIENT_SECRET);
+    assert.equal(capturedTokenParams!.get('redirect_uri'), 'https://motion.example.test/auth/callback');
+    assert.ok((capturedTokenParams!.get('code_verifier') ?? '').length >= 43);
+
+    const sessionToken = extractCookieValue(cbRes.headers.getSetCookie(), SESSION_COOKIE_NAME)!;
+    const meRes = await app.request('/auth/me', {
+      headers: { Cookie: `${SESSION_COOKIE_NAME}=${sessionToken}` },
+    });
+    assert.equal(meRes.status, 200);
+    const me = (await meRes.json()) as {
+      authenticated: boolean;
+      user: { email: string; displayName: string };
+    };
+    assert.equal(me.authenticated, true);
+    assert.equal(me.user.email, 'vela.alice@example.test');
+    assert.equal(me.user.displayName, 'Alice Vela');
+  });
+
+  it('rejects wrong HS256 secret, algorithm confusion against RS256 JWKS IdP, RFC 9207 iss mismatch, OAuth error, and missing jwks_uri/secret discovery', async () => {
+    const config = makeVelaConfig();
+
+    // 1. Wrong HS256 secret -> 401
+    {
+      const store = new InMemoryAuthStore();
+      const cache = new InMemoryAuthCache();
+      let nonce = '';
+      const oidc = new OidcService(
+        {
+          issuer: VELA_ISSUER,
+          clientId: VELA_CLIENT_ID,
+          clientSecret: VELA_CLIENT_SECRET,
+          callbackUrl: 'https://motion.example.test/auth/callback',
+          scopes: 'openid profile email',
+          claimSub: 'sub',
+          claimEmail: 'email',
+          claimName: 'name',
+          discovery: {
+            issuer: VELA_ISSUER,
+            authorization_endpoint: `${VELA_ISSUER}/oauth2/authorize`,
+            token_endpoint: `${VELA_ISSUER}/oauth2/token`,
+            id_token_signing_alg_values_supported: ['HS256'],
+          },
+          fetcher: async () =>
+            new Response(
+              JSON.stringify({
+                id_token: await signHs256Jwt(
+                  { sub: 'u1', email: 'u1@example.test', nonce },
+                  { secret: 'wrong-client-secret-not-matching-configured' },
+                ),
+              }),
+              { status: 200, headers: { 'Content-Type': 'application/json' } },
+            ),
+        },
+        cache,
+      );
+      const app = new Hono<AuthEnv>();
+      app.route('/', createAuthRoutes({ config, store, cache, oidc }));
+      const loginRes = await app.request('/auth/login');
+      const authUrl = new URL(loginRes.headers.get('location')!);
+      nonce = authUrl.searchParams.get('nonce')!;
+      const txCookie = extractCookieValue(loginRes.headers.getSetCookie(), 'om_oidc_tx')!;
+      const cbRes = await app.request(
+        `/auth/callback?code=c1&state=${encodeURIComponent(authUrl.searchParams.get('state')!)}`,
+        { headers: { Cookie: `om_oidc_tx=${encodeURIComponent(txCookie)}` } },
+      );
+      assert.equal(cbRes.status, 401);
+    }
+
+    // 2. Asymmetric RS256+JWKS IdP receiving HS256 token signed with clientSecret -> 401 (anti alg-confusion)
+    {
+      const store = new InMemoryAuthStore();
+      const cache = new InMemoryAuthCache();
+      const { jwks } = await createEphemeralOidcFixture();
+      let nonce = '';
+      const oidc = new OidcService(
+        {
+          issuer: 'https://idp.example.test',
+          clientId: 'openmotion-cloud-client',
+          clientSecret: 'ephemeral-test-client-secret',
+          callbackUrl: 'https://motion.example.test/auth/callback',
+          scopes: 'openid profile email',
+          claimSub: 'sub',
+          claimEmail: 'email',
+          claimName: 'name',
+          discovery: {
+            issuer: 'https://idp.example.test',
+            authorization_endpoint: 'https://idp.example.test/authorize',
+            token_endpoint: 'https://idp.example.test/token',
+            jwks_uri: 'https://idp.example.test/jwks.json',
+            id_token_signing_alg_values_supported: ['RS256'],
+          },
+          jwks,
+          fetcher: async () =>
+            new Response(
+              JSON.stringify({
+                id_token: await signHs256Jwt(
+                  { sub: 'attacker', email: 'attacker@example.test', nonce },
+                  {
+                    secret: 'ephemeral-test-client-secret',
+                    issuer: 'https://idp.example.test',
+                    audience: 'openmotion-cloud-client',
+                  },
+                ),
+              }),
+              { status: 200, headers: { 'Content-Type': 'application/json' } },
+            ),
+        },
+        cache,
+      );
+      const app = new Hono<AuthEnv>();
+      app.route('/', createAuthRoutes({ config: makeConfig(), store, cache, oidc }));
+      const loginRes = await app.request('/auth/login');
+      const authUrl = new URL(loginRes.headers.get('location')!);
+      nonce = authUrl.searchParams.get('nonce')!;
+      const txCookie = extractCookieValue(loginRes.headers.getSetCookie(), 'om_oidc_tx')!;
+      const cbRes = await app.request(
+        `/auth/callback?code=c2&state=${encodeURIComponent(authUrl.searchParams.get('state')!)}`,
+        { headers: { Cookie: `om_oidc_tx=${encodeURIComponent(txCookie)}` } },
+      );
+      assert.equal(cbRes.status, 401);
+    }
+
+    // 3. RFC 9207 iss mismatch AND OAuth error param (consumes tx state on error)
+    {
+      const store = new InMemoryAuthStore();
+      const cache = new InMemoryAuthCache();
+      let tokenCalls = 0;
+      const oidc = new OidcService(
+        {
+          issuer: VELA_ISSUER,
+          clientId: VELA_CLIENT_ID,
+          clientSecret: VELA_CLIENT_SECRET,
+          callbackUrl: 'https://motion.example.test/auth/callback',
+          scopes: 'openid profile email',
+          claimSub: 'sub',
+          claimEmail: 'email',
+          claimName: 'name',
+          discovery: {
+            issuer: VELA_ISSUER,
+            authorization_endpoint: `${VELA_ISSUER}/oauth2/authorize`,
+            token_endpoint: `${VELA_ISSUER}/oauth2/token`,
+            id_token_signing_alg_values_supported: ['HS256'],
+          },
+          fetcher: async () => {
+            tokenCalls += 1;
+            return new Response('should not be called', { status: 500 });
+          },
+        },
+        cache,
+      );
+      const app = new Hono<AuthEnv>();
+      app.route('/', createAuthRoutes({ config, store, cache, oidc }));
+
+      const login1 = await app.request('/auth/login');
+      const state1 = new URL(login1.headers.get('location')!).searchParams.get('state')!;
+      const tx1 = extractCookieValue(login1.headers.getSetCookie(), 'om_oidc_tx')!;
+      const mismatchIss = await app.request(
+        `/auth/callback?code=c3&state=${encodeURIComponent(state1)}&iss=${encodeURIComponent('https://evil.example.net/api/auth')}`,
+        { headers: { Cookie: `om_oidc_tx=${encodeURIComponent(tx1)}` } },
+      );
+      assert.equal(mismatchIss.status, 401);
+      assert.equal(tokenCalls, 0);
+
+      const login2 = await app.request('/auth/login');
+      const state2 = new URL(login2.headers.get('location')!).searchParams.get('state')!;
+      const tx2 = extractCookieValue(login2.headers.getSetCookie(), 'om_oidc_tx')!;
+      const errorCb = await app.request(
+        `/auth/callback?error=login_required&state=${encodeURIComponent(state2)}`,
+        { headers: { Cookie: `om_oidc_tx=${encodeURIComponent(tx2)}` } },
+      );
+      assert.equal(errorCb.status, 401);
+      // Consumed transaction cannot be replayed with a code
+      const replayAfterError = await app.request(
+        `/auth/callback?code=c4&state=${encodeURIComponent(state2)}`,
+        { headers: { Cookie: `om_oidc_tx=${encodeURIComponent(tx2)}` } },
+      );
+      assert.equal(replayAfterError.status, 401);
+      assert.equal(tokenCalls, 0);
+    }
+
+    // 4. Discovery omitting both jwks_uri and clientSecret fails with 502 SERVICE_UNAVAILABLE
+    {
+      const cache = new InMemoryAuthCache();
+      const oidcNoSecret = new OidcService(
+        {
+          issuer: VELA_ISSUER,
+          clientId: VELA_CLIENT_ID,
+          callbackUrl: 'https://motion.example.test/auth/callback',
+          scopes: 'openid profile email',
+          claimSub: 'sub',
+          claimEmail: 'email',
+          claimName: 'name',
+          fetcher: async () =>
+            new Response(
+              JSON.stringify({
+                issuer: VELA_ISSUER,
+                authorization_endpoint: `${VELA_ISSUER}/oauth2/authorize`,
+                token_endpoint: `${VELA_ISSUER}/oauth2/token`,
+              }),
+              { status: 200, headers: { 'Content-Type': 'application/json' } },
+            ),
+        },
+        cache,
+      );
+      await assert.rejects(
+        () => oidcNoSecret.discover(),
+        (err: unknown) =>
+          Boolean(err && typeof err === 'object' && 'status' in err && (err as { status: number }).status === 502),
+      );
+    }
+  });
+
+  it('rejects HS256 JWTs on /mcp and /auth/me when IdP omits jwks_uri and isolates multi-tenant workspaces across HS256 OIDC users', async () => {
+    const config = makeVelaConfig();
+    const store = new InMemoryAuthStore();
+    const cache = new InMemoryAuthCache();
+
+    let activeSub = 'vela_alice';
+    let activeEmail = 'alice.vela@example.test';
+    let activeName = 'Alice Vela';
+    let currentNonce = '';
+
+    const oidc = new OidcService(
+      {
+        issuer: VELA_ISSUER,
+        clientId: VELA_CLIENT_ID,
+        clientSecret: VELA_CLIENT_SECRET,
+        callbackUrl: 'https://motion.example.test/auth/callback',
+        scopes: 'openid profile email',
+        claimSub: 'sub',
+        claimEmail: 'email',
+        claimName: 'name',
+        discovery: {
+          issuer: VELA_ISSUER,
+          authorization_endpoint: `${VELA_ISSUER}/oauth2/authorize`,
+          token_endpoint: `${VELA_ISSUER}/oauth2/token`,
+          id_token_signing_alg_values_supported: ['HS256'],
+        },
+        fetcher: async () =>
+          new Response(
+            JSON.stringify({
+              id_token: await signHs256Jwt({
+                sub: activeSub,
+                email: activeEmail,
+                name: activeName,
+                nonce: currentNonce,
+              }),
+              access_token: 'opaque_at',
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } },
+          ),
+      },
+      cache,
+    );
+
+    const app = new Hono<AuthEnv>();
+    app.route('/', createAuthRoutes({ config, store, cache, oidc }));
+    app.post('/mcp', createMcpBearerAuthMiddleware({ config, store, cache, oidc }), (c) => {
+      return c.json({ ok: true, workspaceId: getAuthContext(c).workspaceId });
+    });
+
+    // Even a validly-signed HS256 JWT (with clientSecret!) is NEVER accepted as a Bearer token on /mcp or /auth/me
+    const hs256Bearer = await signHs256Jwt({
+      sub: 'vela_alice',
+      email: 'alice.vela@example.test',
+      name: 'Alice Vela',
+    });
+    const mcpBearerRes = await app.request('/mcp', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${hs256Bearer}` },
+    });
+    assert.equal(mcpBearerRes.status, 401);
+
+    const meBearerRes = await app.request('/auth/me', {
+      headers: { Authorization: `Bearer ${hs256Bearer}` },
+    });
+    assert.equal(meBearerRes.status, 401);
+
+    // Multi-tenant isolation across two HS256 OIDC users (Alice & Bob)
+    async function signInUser(sub: string, email: string, name: string) {
+      activeSub = sub;
+      activeEmail = email;
+      activeName = name;
+      const loginRes = await app.request('/auth/login');
+      const authUrl = new URL(loginRes.headers.get('location')!);
+      currentNonce = authUrl.searchParams.get('nonce')!;
+      const txCookie = extractCookieValue(loginRes.headers.getSetCookie(), 'om_oidc_tx')!;
+      const cbRes = await app.request(
+        `/auth/callback?code=code-${sub}&state=${encodeURIComponent(authUrl.searchParams.get('state')!)}&iss=${encodeURIComponent(VELA_ISSUER)}`,
+        { headers: { Cookie: `om_oidc_tx=${encodeURIComponent(txCookie)}` } },
+      );
+      assert.equal(cbRes.status, 302);
+      const sessionCookie = extractCookieValue(cbRes.headers.getSetCookie(), SESSION_COOKIE_NAME)!;
+      const meRes = await app.request('/auth/me', {
+        headers: { Cookie: `${SESSION_COOKIE_NAME}=${sessionCookie}` },
+      });
+      assert.equal(meRes.status, 200);
+      const me = (await meRes.json()) as { activeWorkspaceId: string; user: { id: string } };
+      return { sessionCookie, workspaceId: me.activeWorkspaceId, userId: me.user.id };
+    }
+
+    const alice = await signInUser('vela_alice', 'alice.vela@example.test', 'Alice Vela');
+    const bob = await signInUser('vela_bob', 'bob.vela@example.test', 'Bob Vela');
+    assert.notEqual(alice.userId, bob.userId);
+    assert.notEqual(alice.workspaceId, bob.workspaceId);
+
+    // Cross-workspace access attempt via X-OpenMotion-Workspace-Id is rejected with 403 WORKSPACE_FORBIDDEN
+    const crossTenant = await app.request('/auth/me', {
+      headers: {
+        Cookie: `${SESSION_COOKIE_NAME}=${bob.sessionCookie}`,
+        'X-OpenMotion-Workspace-Id': alice.workspaceId,
+      },
+    });
+    assert.equal(crossTenant.status, 403);
+    assert.equal(((await crossTenant.json()) as { code: string }).code, 'WORKSPACE_FORBIDDEN');
+  });
+});

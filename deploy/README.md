@@ -110,7 +110,7 @@ Production manifests live under [`deploy/k8s/`](k8s/kustomization.yaml) and targ
 
 ### 1. Provision Secrets & Config
 
-1. Review [`deploy/k8s/configmap.yaml`](k8s/configmap.yaml) and update `APP_PUBLIC_ORIGIN`, `PREVIEW_PUBLIC_ORIGIN`, `OIDC_ISSUER`, `OIDC_CLIENT_ID`, `OIDC_CALLBACK_URL`, `MCP_OAUTH_ISSUER`, `S3_ENDPOINT`, `S3_PUBLIC_ENDPOINT`, and `S3_BUCKET` for your cluster.
+1. Review [`deploy/k8s/configmap.yaml`](k8s/configmap.yaml) and update `APP_PUBLIC_ORIGIN`, `PREVIEW_PUBLIC_ORIGIN`, `OIDC_ISSUER` (OpenMotion supports both asymmetric JWKS IdPs and HS256 ID tokens issued by OpenDesign / Vela Better Auth with `disableJwtPlugin: true`; pair with `MCP_OAUTH_MODE=proxy`), `OIDC_CLIENT_ID`, `OIDC_CALLBACK_URL`, `MCP_OAUTH_ISSUER`, `S3_ENDPOINT`, `S3_PUBLIC_ENDPOINT`, and `S3_BUCKET` for your cluster.
 2. Provision both `openmotion-secrets` and `openmotion-keda-redis-auth` in namespace `openmotion` using [`deploy/k8s/secret.example.yaml`](k8s/secret.example.yaml) as a template (via External Secrets Operator, Sealed Secrets, or SOPS — never commit live credentials).
 3. Ensure your S3/R2 bucket has the canonical CORS policy applied for both `APP_PUBLIC_ORIGIN` and `PREVIEW_PUBLIC_ORIGIN` (run `scripts/init-s3.ts` with `S3_CORS_ALLOWED_ORIGINS=$PREVIEW_PUBLIC_ORIGIN` or configure the same `GET`/`HEAD`/`PUT` + `Range`/`ETag`/`Content-Range` rules via Terraform).
 4. Update `deploy/k8s/ingress.yaml` with both your main Studio domain (`motion.example.com`) and dedicated cookie-less preview domain (`preview.openmotion.example.com`) plus TLS certificate secret, and update `deploy/k8s/networkpolicy.yaml` if PostgreSQL, Redis, or S3 run outside the cluster (pin exact PrivateLink / VPC endpoint CIDRs rather than opening `0.0.0.0/0` to `worker-render`).

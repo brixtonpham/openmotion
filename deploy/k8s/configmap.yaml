@@ -32,6 +32,7 @@ data:
   S3_PRESIGN_CACHE_WINDOW_SEC: "3600"
 
   # Auth & OIDC (production strictly requires AUTH_MODE=oidc)
+  # For OpenDesign / Vela Better Auth OIDC, set OIDC_ISSUER to "https://amr-api.open-design.ai/api/auth"
   AUTH_MODE: "oidc"
   ALLOW_INSECURE_DEV_AUTH: "false"
   TRUST_PROXY_HOPS: "1"

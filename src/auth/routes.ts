@@ -127,6 +127,8 @@ export function createAuthRoutes(deps: AuthRoutesDeps): Hono<AuthEnv> {
     }
     const code = c.req.query('code') ?? '';
     const state = c.req.query('state') ?? '';
+    const iss = c.req.query('iss') ?? null;
+    const oauthError = c.req.query('error') ?? null;
     const cookies = parseCookies(c.req.header('cookie'));
     const txCookieValue = cookies[OIDC_TX_COOKIE_NAME] ?? null;
 
@@ -135,6 +137,8 @@ export function createAuthRoutes(deps: AuthRoutesDeps): Hono<AuthEnv> {
         code,
         state,
         txCookieValue,
+        iss,
+        error: oauthError,
       });
 
       const session = await createBrowserSession(deps.store, {
@@ -159,6 +163,7 @@ export function createAuthRoutes(deps: AuthRoutesDeps): Hono<AuthEnv> {
       return new Response(null, { status: 302, headers });
     } catch (error) {
       if (isCloudError(error)) {
+        c.header('Set-Cookie', clearCookie(OIDC_TX_COOKIE_NAME, secureCookie, '/auth'));
         return c.json(error.toJSON(), error.status as 400 | 401 | 403 | 500 | 502);
       }
       throw error;
