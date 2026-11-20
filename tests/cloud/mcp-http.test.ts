@@ -71,7 +71,15 @@ class InMemoryImportAssetsStore implements ImportAssetsStore {
     { inputHash: string; state: string; responsePayload: Record<string, unknown> | null }
   >();
   readonly tickets = new Map<string, UploadTicketRecord>();
-  readonly jobs: Array<{ id: string; workspaceId: string; projectId: string; inputPayload: Record<string, unknown> }> = [];
+  readonly jobs: Array<{
+    id: string;
+    workspaceId: string;
+    projectId: string;
+    state: 'queued' | 'failed';
+    errorCode?: string;
+    errorMessage?: string;
+    inputPayload: Record<string, unknown>;
+  }> = [];
   readonly zeroCopyCommits: Array<{ workspaceId: string; projectId: string; assetId: string; versionId: string }> = [];
 
   async assertActiveProject(workspaceId: string, projectId: string) {
@@ -131,6 +139,17 @@ class InMemoryImportAssetsStore implements ImportAssetsStore {
     return true;
   }
 
+  async revertUploadTicketProcessing(
+    workspaceId: string,
+    ticketId: string,
+    previousState: 'issued' | 'uploaded',
+  ) {
+    const rec = this.tickets.get(`${workspaceId}:${ticketId}`);
+    if (rec && rec.state === 'processing') {
+      rec.state = previousState;
+    }
+  }
+
   async createMediaIngestJob(input: {
     id: string;
     workspaceId: string;
@@ -138,7 +157,21 @@ class InMemoryImportAssetsStore implements ImportAssetsStore {
     requestId: string;
     inputPayload: Record<string, unknown>;
   }) {
-    this.jobs.push(input);
+    this.jobs.push({ ...input, state: 'queued' });
+  }
+
+  async markMediaIngestJobFailed(
+    workspaceId: string,
+    jobId: string,
+    errorCode: string,
+    errorMessage: string,
+  ) {
+    const job = this.jobs.find((j) => j.workspaceId === workspaceId && j.id === jobId);
+    if (job && job.state === 'queued') {
+      job.state = 'failed';
+      job.errorCode = errorCode;
+      job.errorMessage = errorMessage;
+    }
   }
 
   async commitLibraryAssetZeroCopy(input: {
@@ -541,6 +574,13 @@ describe('Streamable HTTP /mcp Multi-Replica Sessions, 22 Tools, Security & 10 M
         },
       },
       {
+        name: 'openmotion_assets',
+        arguments: {
+          action: 'brand_kit',
+          brandKit: { operation: 'create', requestId: 'req-bk-alias', url: 'https://example.com' },
+        },
+      },
+      {
         name: 'openmotion_assets_use',
         arguments: {
           action: 'transcript',
@@ -549,6 +589,18 @@ describe('Streamable HTTP /mcp Multi-Replica Sessions, 22 Tools, Security & 10 M
             projectId: randomUUID(),
             sourcePath: 'assets/speech.wav',
             requestId: 'req-asr-1',
+          },
+        },
+      },
+      {
+        name: 'openmotion_assets',
+        arguments: {
+          action: 'transcript',
+          transcript: {
+            command: 'submit',
+            projectId: randomUUID(),
+            sourcePath: 'assets/speech.wav',
+            requestId: 'req-asr-alias',
           },
         },
       },
@@ -795,6 +847,96 @@ describe('3-Way Cloud openmotion_import_assets & Streamable HTTP Config Contract
     });
     assert.equal(replayed.replayed, true);
     assert.equal(enqueued.length, 2);
+  });
+
+  it('rolls back upload ticket & marks jobs failed without locking receipt on queue enqueue failure, allowing retry with same requestId', async () => {
+    const config = makeMcpConfig();
+    const importStore = new InMemoryImportAssetsStore();
+    const stagedSizes = new Map<string, number>();
+    const enqueued: Array<{ name: string; payload: Record<string, unknown> }> = [];
+    let failEnqueue = true;
+
+    const workspaceId = randomUUID();
+    const projectId = randomUUID();
+    importStore.activeProjects.add(`${workspaceId}:${projectId}`);
+
+    const importService = new CloudImportAssetsService({
+      store: importStore,
+      storage: createMockStorage(stagedSizes),
+      queues: {
+        async enqueueMediaIngest(name, payload) {
+          if (failEnqueue) {
+            throw new Error('Redis connection refused');
+          }
+          enqueued.push({ name, payload: payload as unknown as Record<string, unknown> });
+          return {} as never;
+        },
+      },
+      config,
+      urlValidation: {
+        resolveDns: true,
+        dnsLookup: async () => [{ address: '93.184.216.34', family: 4 }],
+      },
+    });
+
+    const auth = {
+      workspaceId,
+      userId: randomUUID(),
+      role: 'editor' as const,
+      scopes: [...PAT_SCOPES],
+      authMode: 'oidc' as const,
+      authMethod: 'pat' as const,
+    };
+
+    const prepared = await importService.prepareUpload(auth, {
+      action: 'prepare_upload',
+      projectId,
+      requestId: 'req-prep-rollback',
+      files: [{ itemId: 'img-1', filename: 'logo.png', mimeType: 'image/png', bytes: 2048 }],
+    });
+    const ticketId = prepared.tickets[0].ticketId;
+    const ticket = importStore.tickets.get(`${workspaceId}:${ticketId}`)!;
+    stagedSizes.set(ticket.s3StagingKey, 2048);
+
+    // Attempt 1: Redis/BullMQ enqueue fails -> ticket reverts to 'issued', jobs marked 'failed', no completed receipt saved
+    const failedBatch = await importService.importItems(auth, {
+      projectId,
+      requestId: 'req-retryable-import',
+      items: [
+        { itemId: 'upload-1', source: { kind: 'upload_ticket', ticketId } },
+        { itemId: 'url-1', source: { kind: 'url', url: 'https://cdn.example.com/clip.png' } },
+      ],
+    });
+
+    assert.equal(failedBatch.status, 'failed');
+    assert.equal(failedBatch.items[0].error?.code, 'QUEUE_ENQUEUE_FAILED');
+    assert.equal(failedBatch.items[1].error?.code, 'QUEUE_ENQUEUE_FAILED');
+    assert.equal(ticket.state, 'issued');
+    assert.equal(importStore.jobs.length, 2);
+    assert.ok(importStore.jobs.every((j) => j.state === 'failed' && j.errorCode === 'QUEUE_ENQUEUE_FAILED'));
+    assert.equal(
+      await importStore.findReceipt(workspaceId, 'phase1:import_assets', 'req-retryable-import'),
+      null,
+    );
+
+    // Attempt 2: Queue recovers -> exact same requestId retries cleanly and transitions ticket + enqueues both jobs
+    failEnqueue = false;
+    const recoveredBatch = await importService.importItems(auth, {
+      projectId,
+      requestId: 'req-retryable-import',
+      items: [
+        { itemId: 'upload-1', source: { kind: 'upload_ticket', ticketId } },
+        { itemId: 'url-1', source: { kind: 'url', url: 'https://cdn.example.com/clip.png' } },
+      ],
+    });
+
+    assert.equal(recoveredBatch.status, 'processing');
+    assert.equal(recoveredBatch.replayed, undefined);
+    assert.equal(ticket.state, 'processing');
+    assert.equal(enqueued.length, 2);
+    assert.ok(
+      await importStore.findReceipt(workspaceId, 'phase1:import_assets', 'req-retryable-import'),
+    );
   });
 
   it('configures .mcp.json and shared/integration.ts for Streamable HTTP while preserving union stdio compatibility', async () => {

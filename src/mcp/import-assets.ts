@@ -210,6 +210,11 @@ export interface ImportAssetsStore {
   }): Promise<UploadTicketRecord>;
   findUploadTicket(workspaceId: string, ticketId: string): Promise<UploadTicketRecord | null>;
   markUploadTicketProcessing(workspaceId: string, ticketId: string): Promise<boolean>;
+  revertUploadTicketProcessing(
+    workspaceId: string,
+    ticketId: string,
+    previousState: 'issued' | 'uploaded',
+  ): Promise<void>;
   createMediaIngestJob(input: {
     id: string;
     workspaceId: string;
@@ -217,6 +222,12 @@ export interface ImportAssetsStore {
     requestId: string;
     inputPayload: Record<string, unknown>;
   }): Promise<void>;
+  markMediaIngestJobFailed(
+    workspaceId: string,
+    jobId: string,
+    errorCode: string,
+    errorMessage: string,
+  ): Promise<void>;
   commitLibraryAssetZeroCopy(input: {
     workspaceId: string;
     projectId: string;
@@ -380,6 +391,19 @@ export function createPgImportAssetsStore(db: Database): ImportAssetsStore {
       return rows.length > 0;
     },
 
+    async revertUploadTicketProcessing(workspaceId, ticketId, previousState) {
+      await db
+        .update(uploadTickets)
+        .set(asUpdate(uploadTickets, { state: previousState, updatedAt: sql`now()` }))
+        .where(
+          and(
+            eq(uploadTickets.workspaceId, workspaceId),
+            eq(uploadTickets.id, ticketId),
+            eq(uploadTickets.state, 'processing'),
+          ),
+        );
+    },
+
     async createMediaIngestJob(input) {
       await db.insert(jobs).values(
         asInsert(jobs, {
@@ -393,6 +417,29 @@ export function createPgImportAssetsStore(db: Database): ImportAssetsStore {
           inputPayload: input.inputPayload,
         }),
       );
+    },
+
+    async markMediaIngestJobFailed(workspaceId, jobId, errorCode, errorMessage) {
+      await db
+        .update(jobs)
+        .set(
+          asUpdate(jobs, {
+            state: 'failed',
+            stage: 'failed',
+            failureStage: 'enqueue',
+            errorCode: errorCode.slice(0, 128),
+            errorMessage: errorMessage.slice(0, 1000),
+            terminalAt: sql`now()`,
+            updatedAt: sql`now()`,
+          }),
+        )
+        .where(
+          and(
+            eq(jobs.workspaceId, workspaceId),
+            eq(jobs.id, jobId),
+            eq(jobs.state, 'queued'),
+          ),
+        );
     },
 
     async commitLibraryAssetZeroCopy(input) {
@@ -905,11 +952,13 @@ export class CloudImportAssetsService {
     const results: CloudImportItemResult[] = [];
     let latestRevision: string | undefined;
     let latestVersionId: string | undefined;
+    let enqueueFailedCount = 0;
 
     for (const item of input.items) {
       const outcome = await this.processSingleItem(auth, input.projectId, requestId, item);
       if (outcome.projectRevision) latestRevision = outcome.projectRevision;
       if (outcome.projectVersionId) latestVersionId = outcome.projectVersionId;
+      if (outcome.enqueueFailed) enqueueFailedCount += 1;
       results.push(outcome.result);
     }
 
@@ -936,14 +985,19 @@ export class CloudImportAssetsService {
       ...(latestVersionId ? { versionId: latestVersionId } : {}),
     };
 
-    await this.deps.store.saveCompletedReceipt({
-      workspaceId: auth.workspaceId,
-      scope,
-      requestId,
-      inputHash,
-      resourceId: input.projectId,
-      responsePayload: payload as unknown as Record<string, unknown>,
-    });
+    // Do not lock the requestId into a completed receipt when every item failed queue enqueue,
+    // allowing the caller to safely retry with the same requestId once Redis/BullMQ recovers.
+    const allFailedEnqueue = results.length > 0 && enqueueFailedCount === results.length;
+    if (!allFailedEnqueue) {
+      await this.deps.store.saveCompletedReceipt({
+        workspaceId: auth.workspaceId,
+        scope,
+        requestId,
+        inputHash,
+        resourceId: input.projectId,
+        responsePayload: payload as unknown as Record<string, unknown>,
+      });
+    }
 
     return payload;
   }
@@ -957,6 +1011,7 @@ export class CloudImportAssetsService {
     result: CloudImportItemResult;
     projectRevision?: string;
     projectVersionId?: string;
+    enqueueFailed?: boolean;
   }> {
     try {
       const source = item.source;
@@ -1008,6 +1063,7 @@ export class CloudImportAssetsService {
           );
         }
 
+        const previousState: 'issued' | 'uploaded' = ticket.state;
         const transitioned = await this.deps.store.markUploadTicketProcessing(
           auth.workspaceId,
           ticket.id,
@@ -1021,32 +1077,58 @@ export class CloudImportAssetsService {
         const jobId = randomUUID();
         const displayName = (item.name?.trim() || ticket.filename).slice(0, 200);
         const expectedSha256 = source.expectedSha256 ?? ticket.expectedSha256 ?? undefined;
+        let jobCreated = false;
 
-        await this.deps.store.createMediaIngestJob({
-          id: jobId,
-          workspaceId: auth.workspaceId,
-          projectId,
-          requestId,
-          inputPayload: {
-            kind: 'upload_ticket',
+        try {
+          await this.deps.store.createMediaIngestJob({
+            id: jobId,
+            workspaceId: auth.workspaceId,
+            projectId,
+            requestId,
+            inputPayload: {
+              kind: 'upload_ticket',
+              uploadId: ticket.id,
+              itemId: item.itemId,
+              name: displayName,
+              ...(expectedSha256 ? { expectedSha256 } : {}),
+            },
+          });
+          jobCreated = true;
+
+          await this.deps.queues.enqueueMediaIngest('upload_commit', {
+            jobId,
+            workspaceId: auth.workspaceId,
             uploadId: ticket.id,
-            itemId: item.itemId,
+            userId: auth.userId,
+            purpose: 'project_asset',
+            targetProjectId: projectId,
             name: displayName,
+            requestId,
             ...(expectedSha256 ? { expectedSha256 } : {}),
-          },
-        });
-
-        await this.deps.queues.enqueueMediaIngest('upload_commit', {
-          jobId,
-          workspaceId: auth.workspaceId,
-          uploadId: ticket.id,
-          userId: auth.userId,
-          purpose: 'project_asset',
-          targetProjectId: projectId,
-          name: displayName,
-          requestId,
-          ...(expectedSha256 ? { expectedSha256 } : {}),
-        });
+          });
+        } catch (enqueueError) {
+          const message =
+            enqueueError instanceof Error ? enqueueError.message : 'Failed to enqueue upload commit job';
+          await this.deps.store
+            .revertUploadTicketProcessing(auth.workspaceId, ticket.id, previousState)
+            .catch(() => {});
+          if (jobCreated) {
+            await this.deps.store
+              .markMediaIngestJobFailed(auth.workspaceId, jobId, 'QUEUE_ENQUEUE_FAILED', message)
+              .catch(() => {});
+          }
+          return {
+            enqueueFailed: true,
+            result: {
+              itemId: item.itemId,
+              status: 'failed',
+              kind: 'upload_ticket',
+              ticketId: ticket.id,
+              ...(jobCreated ? { importJobId: jobId } : {}),
+              error: { code: 'QUEUE_ENQUEUE_FAILED', message },
+            },
+          };
+        }
 
         return {
           result: {
@@ -1083,15 +1165,34 @@ export class CloudImportAssetsService {
           },
         });
 
-        await this.deps.queues.enqueueMediaIngest('url_fetch', {
-          jobId,
-          workspaceId: auth.workspaceId,
-          url: validatedUrl,
-          targetProjectId: projectId,
-          itemId: item.itemId,
-          name: displayName,
-          requestId,
-        });
+        try {
+          await this.deps.queues.enqueueMediaIngest('url_fetch', {
+            jobId,
+            workspaceId: auth.workspaceId,
+            url: validatedUrl,
+            targetProjectId: projectId,
+            itemId: item.itemId,
+            name: displayName,
+            requestId,
+          });
+        } catch (enqueueError) {
+          const message =
+            enqueueError instanceof Error ? enqueueError.message : 'Failed to enqueue URL fetch job';
+          await this.deps.store
+            .markMediaIngestJobFailed(auth.workspaceId, jobId, 'QUEUE_ENQUEUE_FAILED', message)
+            .catch(() => {});
+          return {
+            enqueueFailed: true,
+            result: {
+              itemId: item.itemId,
+              status: 'failed',
+              kind: 'url',
+              url: validatedUrl,
+              importJobId: jobId,
+              error: { code: 'QUEUE_ENQUEUE_FAILED', message },
+            },
+          };
+        }
 
         return {
           result: {

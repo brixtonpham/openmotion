@@ -433,8 +433,15 @@ export async function exchangeOAuthToken(
         status: 400,
       });
     }
-    // Rotate refresh token: revoke previous row before issuing a fresh pair.
-    await store.revokeOAuthTokenById(existing.id);
+    // Rotate refresh token atomically: revoke previous row before issuing a fresh pair.
+    const revoked = await store.revokeOAuthTokenById(existing.id);
+    if (!revoked) {
+      throw new CloudError(
+        'INVALID_ARGUMENT',
+        'invalid_grant: refresh token already used or revoked',
+        { status: 400 },
+      );
+    }
 
     return mintOAuthTokenPair(store, {
       clientId: client.clientId,

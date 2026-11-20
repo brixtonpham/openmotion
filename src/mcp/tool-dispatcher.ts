@@ -335,7 +335,8 @@ export class McpToolDispatcher {
         requireToolScopes(ctx.auth, ['projects:read']);
         throw featureDeferredP2('openmotion_manage_project.comments');
       }
-      if (name === 'openmotion_assets_use' && argsObj.action === 'brand_kit') {
+      const isAssetsUseTool = name === 'openmotion_assets_use' || name === 'openmotion_assets';
+      if (isAssetsUseTool && argsObj.action === 'brand_kit') {
         const brandKit = (argsObj.brandKit ?? {}) as Record<string, unknown>;
         const operation = String(brandKit.operation ?? brandKit.command ?? '');
         if (['create', 'rescan'].includes(operation)) {
@@ -343,7 +344,7 @@ export class McpToolDispatcher {
           throw featureDeferredP2('brand_kit_website_capture');
         }
       }
-      if (name === 'openmotion_assets_use' && argsObj.action === 'transcript') {
+      if (isAssetsUseTool && argsObj.action === 'transcript') {
         const transcript = (argsObj.transcript ?? {}) as Record<string, unknown>;
         if (transcript.command === 'submit' && !this.config.OPENDESIGN_ASR_URL) {
           requireToolScopes(ctx.auth, ['media:generate']);
@@ -375,7 +376,7 @@ export class McpToolDispatcher {
         });
       }
 
-      if (name === 'openmotion_assets_use' && argsObj.action === 'read' && Array.isArray(result.content)) {
+      if (isAssetsUseTool && argsObj.action === 'read' && Array.isArray(result.content)) {
         return assetReadToolResult(result as unknown as AssetReadResult) as McpToolCallResponse;
       }
 

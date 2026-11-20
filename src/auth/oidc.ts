@@ -4,6 +4,7 @@ import {
   type JWTPayload,
   type JWTVerifyGetKey,
 } from 'jose';
+import { isUuid } from '../../shared/project-validation.ts';
 import type { AuthContext, PatScope } from '../contracts/auth.ts';
 import { CloudError } from '../contracts/errors.ts';
 import type { AppConfig } from '../infra/config.ts';
@@ -336,10 +337,16 @@ export class OidcService {
       ? readStringClaim(payload, this.cfg.claimWorkspace)
       : null;
 
+    if (options.requestedWorkspaceId && !isUuid(options.requestedWorkspaceId)) {
+      throw new CloudError('INVALID_ARGUMENT', 'Invalid workspace ID', { status: 400 });
+    }
+
     let membership: MembershipResolution | null = null;
     const existingUser = await store.findUserByOidcSub(sub);
-    if (existingUser && options.requestedWorkspaceId) {
-      membership = await store.findMembership(options.requestedWorkspaceId, existingUser.id);
+    if (options.requestedWorkspaceId) {
+      membership = existingUser
+        ? await store.findMembership(options.requestedWorkspaceId, existingUser.id)
+        : null;
       if (!membership) {
         throw new CloudError(
           'WORKSPACE_FORBIDDEN',

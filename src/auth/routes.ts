@@ -372,13 +372,19 @@ export function createAuthRoutes(deps: AuthRoutesDeps): Hono<AuthEnv> {
       return c.json({ error: 'access_denied', error_description: 'Authentication required' }, 401);
     }
 
-    // Verify single-use consent token when cache is available.
-    if (deps.cache && fields.consent_token) {
+    // Require and verify single-use consent token whenever cache is available.
+    if (deps.cache) {
+      if (!fields.consent_token) {
+        return c.json({ error: 'invalid_request', error_description: 'Missing consent_token' }, 400);
+      }
       const key = `om:oauth:consent:${sha256Hex(fields.consent_token)}`;
       const stored = await deps.cache.get(key);
       await deps.cache.del(key);
       if (!stored) {
-        return c.json({ error: 'invalid_request', error_description: 'Consent token expired' }, 400);
+        return c.json(
+          { error: 'invalid_request', error_description: 'Consent token expired or already used' },
+          400,
+        );
       }
       const parsed = JSON.parse(stored) as { userId: string; clientId: string };
       if (!timingSafeStringEqual(parsed.userId, auth.userId) || parsed.clientId !== fields.client_id) {

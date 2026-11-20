@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { generateKeyPairSync } from 'node:crypto';
+import { generateKeyPairSync, randomUUID } from 'node:crypto';
 import { describe, it } from 'node:test';
 import { Hono } from 'hono';
 import { SignJWT, createLocalJWKSet, exportJWK } from 'jose';
@@ -263,6 +263,44 @@ describe('AUTH_MODE=oidc Authorization Code + PKCE, Browser Sessions, CSRF & JWK
     assert.equal(mcpJwtRes.status, 200);
     assert.equal(((await mcpJwtRes.json()) as { authMethod: string }).authMethod, 'oidc_jwt');
 
+    // Step 5b: Direct OIDC Bearer JWT validates X-OpenMotion-Workspace-Id strictly (400 invalid UUID, 403 non-member)
+    const invalidWsRes = await app.request('/mcp', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${directJwt}`,
+        'X-OpenMotion-Workspace-Id': 'not-a-uuid',
+      },
+    });
+    assert.equal(invalidWsRes.status, 400);
+    assert.equal(((await invalidWsRes.json()) as { code: string }).code, 'INVALID_ARGUMENT');
+
+    const foreignWsRes = await app.request('/mcp', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${directJwt}`,
+        'X-OpenMotion-Workspace-Id': randomUUID(),
+      },
+    });
+    assert.equal(foreignWsRes.status, 403);
+    assert.equal(((await foreignWsRes.json()) as { code: string }).code, 'WORKSPACE_FORBIDDEN');
+
+    // Brand-new OIDC user specifying an unowned workspace UUID must also be rejected with 403 (never auto-provisioned into wrong workspace)
+    const brandNewJwt = await signJwt({
+      sub: 'opendesign-brand-new-99',
+      email: 'bob@example.test',
+      name: 'Bob New',
+    });
+    const brandNewForbidden = await app.request('/mcp', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${brandNewJwt}`,
+        'X-OpenMotion-Workspace-Id': randomUUID(),
+      },
+    });
+    assert.equal(brandNewForbidden.status, 403);
+    assert.equal(((await brandNewForbidden.json()) as { code: string }).code, 'WORKSPACE_FORBIDDEN');
+    assert.equal(await store.findUserByOidcSub('opendesign-brand-new-99'), null);
+
     // Step 6: CSRF Origin defense blocks cross-origin and null-origin cookie mutations
     const badOriginLogout = await app.request('/auth/logout', {
       method: 'POST',
@@ -456,6 +494,29 @@ describe('OAuth 2.1 Proxy & Delegated Modes (RFC 9728, RFC 8414, DCR, PKCE S256,
     const consentTokenMatch = /name="consent_token" value="([^"]+)"/.exec(consentHtml);
     assert.ok(consentTokenMatch);
 
+    // Omitting consent_token when cache is active MUST be rejected (prevents CSRF bypass)
+    const missingConsentBody = new URLSearchParams({
+      client_id: client.client_id,
+      redirect_uri: 'https://chatgpt.com/connector_platform_oauth_redirect',
+      response_type: 'code',
+      code_challenge: codeChallenge,
+      code_challenge_method: 'S256',
+      scope: 'mcp:tools projects:read',
+      state: 'st-xyz',
+      resource: 'https://motion.example.test/mcp',
+      decision: 'approve',
+    });
+    const missingConsentRes = await app.request('/oauth/authorize', {
+      method: 'POST',
+      headers: {
+        Cookie: `${SESSION_COOKIE_NAME}=${session.token}`,
+        Origin: 'https://motion.example.test',
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: missingConsentBody.toString(),
+    });
+    assert.equal(missingConsentRes.status, 400);
+
     const approveBody = new URLSearchParams({
       consent_token: consentTokenMatch[1],
       client_id: client.client_id,
@@ -483,6 +544,18 @@ describe('OAuth 2.1 Proxy & Delegated Modes (RFC 9728, RFC 8414, DCR, PKCE S256,
     const authCode = redirectUrl.searchParams.get('code')!;
     assert.equal(redirectUrl.searchParams.get('state'), 'st-xyz');
     assert.ok(authCode.length > 20);
+
+    // Replaying the same single-use consent_token MUST fail with 400
+    const replayConsentRes = await app.request('/oauth/authorize', {
+      method: 'POST',
+      headers: {
+        Cookie: `${SESSION_COOKIE_NAME}=${session.token}`,
+        Origin: 'https://motion.example.test',
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: approveBody.toString(),
+    });
+    assert.equal(replayConsentRes.status, 400);
 
     // Wrong PKCE verifier fails (and single-use code is consumed!)
     // First test fresh code with valid verifier:
@@ -534,18 +607,48 @@ describe('OAuth 2.1 Proxy & Delegated Modes (RFC 9728, RFC 8414, DCR, PKCE S256,
     assert.equal(mcpData.workspaceId, seeded.workspace.id);
     assert.deepEqual(mcpData.scopes, ['mcp:tools', 'projects:read']);
 
-    // Refresh token rotation invalidates previous refresh & access tokens
-    const rotatedRes = await app.request('/oauth/token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        grant_type: 'refresh_token',
-        refresh_token: tokens.refresh_token,
-        client_id: client.client_id,
-      }).toString(),
+    // Concurrent refresh token rotation race: even when both callers read the same active row
+    // simultaneously before revocation, strictly ONE succeeds and the other fails with 400.
+    const origFindByRefresh = store.findActiveOAuthTokenByRefreshHash.bind(store);
+    let releaseBarrier!: () => void;
+    let arrived = 0;
+    const barrier = new Promise<void>((resolve) => {
+      releaseBarrier = resolve;
     });
-    assert.equal(rotatedRes.status, 200);
-    const rotated = (await rotatedRes.json()) as { access_token: string; refresh_token: string };
+    store.findActiveOAuthTokenByRefreshHash = async (hash) => {
+      const found = await origFindByRefresh(hash);
+      arrived += 1;
+      if (arrived === 2) releaseBarrier();
+      await barrier;
+      return found;
+    };
+
+    const [raceA, raceB] = await Promise.all([
+      app.request('/oauth/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          grant_type: 'refresh_token',
+          refresh_token: tokens.refresh_token,
+          client_id: client.client_id,
+        }).toString(),
+      }),
+      app.request('/oauth/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          grant_type: 'refresh_token',
+          refresh_token: tokens.refresh_token,
+          client_id: client.client_id,
+        }).toString(),
+      }),
+    ]);
+    store.findActiveOAuthTokenByRefreshHash = origFindByRefresh;
+
+    const statuses = [raceA.status, raceB.status].sort((a, b) => a - b);
+    assert.deepEqual(statuses, [200, 400]);
+    const winnerRes = raceA.status === 200 ? raceA : raceB;
+    const rotated = (await winnerRes.json()) as { access_token: string; refresh_token: string };
     assert.notEqual(rotated.access_token, tokens.access_token);
 
     const oldRefreshReplay = await app.request('/oauth/token', {
