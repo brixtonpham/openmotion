@@ -1,11 +1,18 @@
 import { and, eq, inArray, lte, sql } from 'drizzle-orm';
-import type { BlobGcJobName, BlobGcPayloadMap } from '../contracts/jobs.ts';
+import {
+  DEFAULT_BLOB_GC_GRACE_SECONDS,
+  type BlobGcJobName,
+  type BlobGcPayloadMap,
+} from '../contracts/jobs.ts';
 import type { StoragePort } from '../contracts/storage.ts';
 import {
   finalizeBlobDeletion,
   markZeroRefForDeletion,
+  reconcileDriftedBlobRefCounts,
   resurrectBlobIfReferenced,
   type ClaimedGcBlob,
+  type MarkUnreferencedBlobsOptions,
+  type ReconcileBlobRefCountsResult,
 } from '../db/cas.ts';
 import type { Database } from '../db/client.ts';
 import { asUpdate } from '../db/helpers.ts';
@@ -18,9 +25,13 @@ import {
 } from '../infra/storage.ts';
 
 export interface BlobGcCasOps {
+  reconcileDriftedBlobRefCounts?(
+    db: Database,
+    options?: { batchSize?: number },
+  ): Promise<ReconcileBlobRefCountsResult>;
   markZeroRefForDeletion(
     db: Database,
-    options: { graceSeconds: number; batchSize: number },
+    options: MarkUnreferencedBlobsOptions,
   ): Promise<ClaimedGcBlob[]>;
   finalizeBlobDeletion(db: Database, workspaceId: string, sha256: string): Promise<boolean>;
   resurrectBlobIfReferenced(db: Database, workspaceId: string, sha256: string): Promise<boolean>;
@@ -39,6 +50,8 @@ export interface SweepUnreferencedBlobsResult {
   failed: number;
   thumbnailsDeleted: number;
   derivedDeleted: number;
+  reconciledLive: number;
+  markedUnreferenced: number;
 }
 
 export interface SweepExpiredUploadsResult {
@@ -51,27 +64,45 @@ export interface SweepExpiredReceiptsResult {
 }
 
 const DEFAULT_CAS_OPS: BlobGcCasOps = {
+  reconcileDriftedBlobRefCounts,
   markZeroRefForDeletion,
   finalizeBlobDeletion,
   resurrectBlobIfReferenced,
 };
 
 /**
- * Race-free two-phase CAS blob garbage collection:
- * 1. Phase 1: `markZeroRefForDeletion` transitions eligible `ref_count = 0` rows (`gc_state = 'active'`)
- *    whose grace period elapsed into `gc_state = 'deleting'` via `FOR UPDATE SKIP LOCKED`.
+ * Authoritative Mark-and-Sweep CAS blob garbage collection:
+ * 0. Reconcile pass: `reconcileDriftedBlobRefCounts` heals any blob whose `ref_count` drifted
+ *    to 0 despite live references (`project_files`/`project_version_files`/`asset_versions`),
+ *    and starts the grace clock on truly unreferenced blobs whose `ref_count` drifted > 0.
+ * 1. Phase 1: `markZeroRefForDeletion` transitions eligible unreferenced rows (`gc_state = 'active'`)
+ *    whose grace period (default 7 days = 604800s) elapsed AND that pass strict `NOT EXISTS` across
+ *    all live reference tables into `gc_state = 'deleting'` via `FOR UPDATE OF wb SKIP LOCKED`.
  * 2. Phase 2 (no PG tx held): Deletes S3 `workspaces/{wid}/blobs/{sha256}`,
  *    `workspaces/{wid}/thumbnails/{sha256}/`, and `workspaces/{wid}/derived/{sha256}/`.
  *    On transient S3 failure, restores `gc_state = 'active'` via `resurrectBlobIfReferenced`.
- * 3. Phase 3: Calls `finalizeBlobDeletion` to delete the PG row only if still `deleting` & `ref_count = 0`.
+ * 3. Phase 3: Calls `finalizeBlobDeletion` to delete the PG row only if still `deleting`, `ref_count = 0`,
+ *    and still unreferenced across all live reference tables.
  */
 export async function sweepUnreferencedBlobs(
   deps: BlobGcDeps,
   payload: BlobGcPayloadMap['sweep_unreferenced_blobs'],
 ): Promise<SweepUnreferencedBlobsResult> {
   const cas = deps.casOps ?? DEFAULT_CAS_OPS;
+  const reconciled = cas.reconcileDriftedBlobRefCounts
+    ? await cas.reconcileDriftedBlobRefCounts(deps.db, { batchSize: payload.batchSize })
+    : { healedLive: 0, markedUnreferenced: 0 };
+
+  if (reconciled.healedLive > 0 || reconciled.markedUnreferenced > 0) {
+    deps.logger.warn('CAS GC reconciled drifted workspace_blobs ref_counts', {
+      healedLive: reconciled.healedLive,
+      markedUnreferenced: reconciled.markedUnreferenced,
+    });
+  }
+
+  const graceSeconds = payload.graceSeconds ?? DEFAULT_BLOB_GC_GRACE_SECONDS;
   const claimed = await cas.markZeroRefForDeletion(deps.db, {
-    graceSeconds: payload.graceSeconds,
+    graceSeconds,
     batchSize: payload.batchSize,
   });
 
@@ -98,7 +129,7 @@ export async function sweepUnreferencedBlobs(
       if (finalized) {
         deleted += 1;
       } else {
-        deps.logger.warn('CAS GC finalize skipped (blob no longer deleting/zero-ref)', {
+        deps.logger.warn('CAS GC finalize skipped (blob no longer deleting/unreferenced)', {
           workspaceId: blob.workspaceId,
           sha256: blob.sha256,
         });
@@ -126,8 +157,12 @@ export async function sweepUnreferencedBlobs(
     failed,
     thumbnailsDeleted,
     derivedDeleted,
+    reconciledLive: reconciled.healedLive,
+    markedUnreferenced: reconciled.markedUnreferenced,
   };
 }
+
+export const runBlobGcSweep = sweepUnreferencedBlobs;
 
 /**
  * Clean up abandoned upload staging objects whose tickets expired before confirmation.

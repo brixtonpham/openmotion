@@ -1,6 +1,7 @@
 import { Queue, QueueEvents, type JobsOptions } from 'bullmq';
 import type { Redis } from 'ioredis';
 import {
+  DEFAULT_BLOB_GC_GRACE_SECONDS,
   QUEUE_NAMES,
   blobGcJobSchemas,
   mediaGenerateJobSchemas,
@@ -82,6 +83,11 @@ export function buildRenderThumbnailJobId(
   return `thumb__${workspaceId}__${projectId}__${cacheKey}`;
 }
 
+export function buildPreviewProxyJobId(workspaceId: string, sha256: string): string {
+  // BullMQ v5 rejects custom jobIds containing ':'.
+  return `proxy__${workspaceId}__${sha256}`;
+}
+
 export class QueueService {
   readonly mediaIngest: Queue;
   readonly mediaGenerate: Queue;
@@ -118,9 +124,22 @@ export class QueueService {
     options?: JobsOptions,
   ) {
     const validated = validateMediaIngestPayload(name, payload);
-    const jobId =
-      options?.jobId ?? ('jobId' in validated && typeof validated.jobId === 'string' ? validated.jobId : undefined);
-    return this.mediaIngest.add(name, validated, { ...options, ...(jobId ? { jobId } : {}) });
+    const defaultJobId =
+      name === 'generate_preview_proxy'
+        ? buildPreviewProxyJobId(
+            validated.workspaceId,
+            (validated as MediaIngestPayloadMap['generate_preview_proxy']).sha256,
+          )
+        : 'jobId' in validated && typeof validated.jobId === 'string'
+          ? validated.jobId
+          : undefined;
+    const jobId = options?.jobId ?? defaultJobId;
+    const defaultPriority = name === 'generate_preview_proxy' ? 10 : undefined;
+    return this.mediaIngest.add(name, validated, {
+      ...(defaultPriority !== undefined ? { priority: defaultPriority } : {}),
+      ...options,
+      ...(jobId ? { jobId } : {}),
+    });
   }
 
   async enqueueMediaGenerate<K extends MediaGenerateJobName>(
@@ -169,7 +188,7 @@ export class QueueService {
     return this.blobGc.add(name, validated, options);
   }
 
-  async scheduleBlobGcRepeatable(graceSeconds: number): Promise<void> {
+  async scheduleBlobGcRepeatable(graceSeconds: number = DEFAULT_BLOB_GC_GRACE_SECONDS): Promise<void> {
     await this.blobGc.upsertJobScheduler(
       'blob-gc-sweep-unreferenced',
       { every: 15 * 60_000 },
