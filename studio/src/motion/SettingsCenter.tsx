@@ -208,7 +208,14 @@ function ResourceSettings({ about, openConnections }: { about: boolean; openConn
   const [version, setVersion] = useState<string>();
   useEffect(() => {
     let active = true;
-    void gatewayRequest<{ version: string }>('health').then(data => { if (active) setVersion(data.version); }).catch(() => {});
+    void fetch('/api/health')
+      .then(async res => {
+        if (!res.ok) throw new Error('unavailable');
+        return (await res.json()) as { version?: string };
+      })
+      .catch(() => gatewayRequest<{ version?: string }>('health'))
+      .then(data => { if (active && data?.version) setVersion(data.version); })
+      .catch(() => {});
     return () => { active = false; };
   }, []);
   const links = [

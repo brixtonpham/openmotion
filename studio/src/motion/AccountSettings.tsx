@@ -24,7 +24,7 @@ export interface CloudWorkspaceSummary {
 
 export interface CloudAccountSummary extends AccountSummary {
   authMode?: 'oidc' | 'dev';
-  authMethod?: 'session_cookie' | 'bearer_pat' | 'oauth_access_token' | 'dev_bypass';
+  authMethod?: 'session_cookie' | 'pat' | 'oauth_bearer' | 'oidc_jwt' | 'dev_bypass';
   activeWorkspace?: CloudWorkspaceSummary | null;
   workspaces?: CloudWorkspaceSummary[];
   mediaEntitlement?: 'included' | 'not-included' | 'unknown';
@@ -82,7 +82,15 @@ interface CloudSummaryApiResponse {
 }
 
 const DEFAULT_CONSOLE_URL = 'https://open-design.ai';
-const DEFAULT_PAT_SCOPES = ['mcp:read', 'mcp:write', 'projects:read', 'projects:write', 'assets:read', 'assets:write', 'models:generate', 'exports:write'];
+const DEFAULT_PAT_SCOPES = [
+  'projects:read',
+  'projects:write',
+  'assets:read',
+  'assets:write',
+  'exports:write',
+  'media:generate',
+  'mcp:tools',
+] as const;
 
 function subscriptionUrl(consoleUrl: string, entrySource = 'openmotion_manage_subscription') {
   const url = new URL((consoleUrl || DEFAULT_CONSOLE_URL).replace(/\/+$/, '') + '/dashboard');
@@ -310,12 +318,18 @@ export function AccountSettings({ subscription = false, openProviders }: { subsc
     setCreatingToken(true);
     try {
       const expiresInDays = tokenExpiryDays === 'never' ? undefined : Number(tokenExpiryDays);
-      const response = await gatewayRequest<{ token: string; record: PersonalAccessTokenRecord }>('tokens', 'POST', {
+      // Omit explicit `scopes` so `createPat()` intersects DEFAULT_PAT_SCOPES with the user's live workspace role (incl. viewers).
+      const response = await gatewayRequest<{
+        id?: string;
+        name?: string;
+        token: string;
+        scopes?: string[];
+        record?: PersonalAccessTokenRecord;
+      }>('tokens', 'POST', {
         name: trimmed,
-        scopes: DEFAULT_PAT_SCOPES,
         ...(expiresInDays ? { expiresInDays } : {}),
       });
-      setCreatedToken({ token: response.token, name: response.record.name });
+      setCreatedToken({ token: response.token, name: response.name ?? response.record?.name ?? trimmed });
       setTokenName('');
       await loadTokens();
       toast.showToast(t('Personal access token created'), 'info');

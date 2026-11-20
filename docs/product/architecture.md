@@ -32,7 +32,7 @@ Core product principles:
 
 ## 2. Container-First Runtime Topology
 
-OpenMotion compiles to a single backend codebase (`src/`) and one static Studio SPA bundle (`studio/dist/`), deployed via workload-split process roles from a single container image (local Docker Compose via [`deploy/README.md`](../../deploy/README.md) or Kubernetes):
+OpenMotion compiles to a single backend codebase (`src/`) and one static Studio SPA bundle (`studio/build/`), deployed via workload-split process roles from a single container image (local Docker Compose via [`deploy/README.md`](../../deploy/README.md) or Kubernetes):
 
 ```mermaid
 flowchart LR
@@ -72,16 +72,16 @@ flowchart LR
 
 ### PostgreSQL (Source of Truth for Metadata & Auth)
 
-Managed with Drizzle ORM migrations (`src/db/`):
+Managed with Drizzle ORM migrations (`src/db/schema/`):
 
-- **Identity & Multi-Tenancy**: `users`, `workspaces`, `workspace_members` (roles: `owner`, `admin`, `editor`, `viewer`), `sessions`, `personal_access_tokens` (prefix + SHA-256 hash, scopes, expiration, last-used, revocation), `oauth_clients`, `oauth_codes`, `oauth_tokens`.
-- **Projects & Revisions**: `projects`, `project_files` / `project_versions` (immutable snapshots with monotonic `revision` and `currentVersionId`), `idempotency_keys` (scoped deduplication for mutating `requestId` calls).
-- **Assets & Transfers**: `assets`, `asset_versions` (pinned version identities pointing to immutable CAS object keys), `upload_tickets` (time-bounded presigned staging state machine: `issued` -> `confirmed` -> `committed` / `failed`).
-- **Async Jobs & Catalog**: `media_jobs`, `export_jobs`, `template_catalog`.
+- **Identity & Multi-Tenancy**: `users`, `workspaces`, `workspace_members` (roles: `owner`, `admin`, `editor`, `viewer`), `auth_sessions`, `personal_access_tokens` (prefix + SHA-256 hash, scopes, expiration, last-used, revocation), `oauth_clients`, `oauth_authorization_codes`, `oauth_tokens`.
+- **Projects, Sessions & Revisions**: `sessions`, `session_messages`, `projects`, `work_rounds`, `project_files`, `project_versions`, `project_version_files`, `project_history_entries` (immutable snapshots with monotonic `revision` and `currentVersionId`).
+- **Assets, Blobs & Transfers**: `workspace_blobs`, `assets`, `asset_versions` (pinned version identities pointing to immutable CAS blobs), `upload_tickets` (time-bounded presigned staging state machine: `issued` -> `confirmed` -> `committed` / `failed`).
+- **Async Jobs, Idempotency & Catalog**: unified `jobs`, `idempotency_receipts` (scoped deduplication for mutating `requestId` calls), `catalog_templates`, `catalog_template_files`.
 
 ### S3-Compatible Content-Addressed Storage (CAS)
 
-- Immutable media blobs, project source files, version snapshots, and rendered MP4 artifacts are stored under workspace-scoped content-addressed keys (`blobs/sha256/...`, staging prefixes for presigned uploads, and export artifacts).
+- Immutable media blobs, project source files, version snapshots, and rendered MP4 artifacts are stored under content-addressed keys (`workspaces/{wid}/blobs/{sha256}` and `catalog/blobs/{sha256}` in `src/infra/storage.ts`, plus staging prefixes for presigned uploads and export artifacts).
 - **Direct browser & Agent transfers**: Clients never proxy large binary uploads through `api` memory. Uploads follow a 3-step presigned workflow:
   1. `POST /motion-api/assets/uploads/tickets` (or MCP `openmotion_import_assets` `action=prepare_upload`) returns `{ uploadId, uploadUrl, headers, expiresAt, maxBytes }`.
   2. Client executes `PUT <uploadUrl>` directly against object storage.
@@ -89,7 +89,7 @@ Managed with Drizzle ORM migrations (`src/db/`):
 
 ### Diskless Option B Studio API (`src/studio/`)
 
-Studio's editor routes (`/api/projects/*`, `/api/files/*`, `/api/render/*`, `/api/environment/ffmpeg`) operate purely against Postgres + S3 CAS with zero local `MOTION_DATA_DIR` project filesystem dependencies:
+Studio's editor routes (`/api/projects/*`, `/api/projects/:id/files/*`, `/api/render/*`, `/api/environment/ffmpeg`) operate purely against Postgres + S3 CAS with zero local `MOTION_DATA_DIR` project filesystem dependencies:
 
 - File reads/writes and DOM edits enforce optimistic revision locks and snapshot versions in Postgres + S3.
 - Live preview streams project HTML/CSS/JS and pinned assets over authenticated Studio routes.

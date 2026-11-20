@@ -216,12 +216,12 @@ it('creates the conversation before generating an artifact and retains it when g
   localStorage.setItem('motion.home.draft.v1', 'New film');
   const original = fetcher.getMockImplementation()!;
   fetcher.mockImplementation(async (url: string, init?: RequestInit) => {
-    if (url === '/design-api/sessions' && init?.method === 'POST') return new Response(JSON.stringify({ sessionId: 'new-session' }));
+    if (url === '/motion-api/sessions' && init?.method === 'POST') return new Response(JSON.stringify({ sessionId: 'new-session' }));
     if (url.endsWith('/artifacts')) return new Response(JSON.stringify({ error: 'Generation failed' }), { status: 503 });
     return original(url, init);
   });
   await act(() => workspace.startSession('New film', 'product-promo'));
-  expect(writes().map(call => call[0])).toEqual(['/design-api/sessions', '/design-api/sessions/new-session/artifacts']);
+  expect(writes().map(call => call[0])).toEqual(['/motion-api/sessions', '/motion-api/sessions/new-session/artifacts']);
   expect(navigate).toHaveBeenCalledWith('/?session=new-session');
   expect(localStorage.getItem('motion.home.draft.v1')).toBeNull();
   expect(sessionStorage.getItem('opendesign.session-error:new-session')).toBe('Generation failed');

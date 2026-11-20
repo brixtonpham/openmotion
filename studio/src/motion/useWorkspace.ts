@@ -13,7 +13,7 @@ export type WorkspaceStatus = { revision: string; projectId: string; projectTitl
   historyRestoreError?: { requestId: string; message: string } | null };
 export type ProjectCatalog = { activeId: string; projects: SavedProject[]; sessions?: CreativeSession[]; activeSessionId?: string };
 export async function motionApi<T>(path: string, init?: RequestInit, projectId?: string): Promise<T> {
-  const response = await diagnosticFetch((path.startsWith('/sessions') || path.startsWith('/modes') ? '/design-api' : '/motion-api') + path
+  const response = await diagnosticFetch('/motion-api' + path
     + (projectId ? (path.includes('?') ? '&' : '?') + 'projectId=' + encodeURIComponent(projectId) : ''), init);
   let data: Record<string, unknown> = {};
   try {

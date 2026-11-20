@@ -34,14 +34,23 @@ async function open(account: Partial<CloudAccountSummary> & Record<string, unkno
         id: 'pat-new',
         name: String(body?.name ?? 'CI'),
         tokenPrefix: 'om_pat_abcd',
-        scopes: (body?.scopes as string[]) ?? ['mcp:read'],
+        scopes: ['projects:read', 'projects:write', 'assets:read', 'assets:write', 'exports:write', 'media:generate', 'mcp:tools'],
         expiresAt: null,
         lastUsedAt: null,
         revokedAt: null,
         createdAt: '2026-11-20T00:00:00.000Z',
       };
       hooks.tokens = [created, ...hooks.tokens];
-      return { token: 'om_pat_abcd_secret_once', record: created };
+      // Matches flat CreatedPatResult returned by POST /motion-api/tokens (src/auth/pat.ts)
+      return {
+        id: created.id,
+        name: created.name,
+        tokenPrefix: created.tokenPrefix,
+        token: 'om_pat_abcd_secret_once',
+        scopes: created.scopes,
+        expiresAt: created.expiresAt,
+        createdAt: created.createdAt,
+      };
     }
     if (path.startsWith('tokens/') && method === 'DELETE') {
       const id = path.slice('tokens/'.length);
@@ -119,8 +128,13 @@ it('creates, copies once, and revokes Personal Access Tokens (PAT)', async () =>
     input.dispatchEvent(new Event('input', { bubbles: true }));
   });
   await act(async () => page.querySelector('form')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })));
-  expect(hooks.request).toHaveBeenCalledWith('tokens', 'POST', expect.objectContaining({ name: 'Cursor Laptop' }));
+  const createCall = hooks.request.mock.calls.find(([p, m]) => p === 'tokens' && m === 'POST');
+  expect(createCall?.[2]).toEqual({ name: 'Cursor Laptop', expiresInDays: 90 });
+  expect(page.textContent).toContain('media:generate');
+  expect(page.textContent).toContain('mcp:tools');
+  expect(page.textContent).not.toContain('mcp:read');
   expect(page.querySelector('[data-pat-created="true"]')?.textContent).toContain('om_pat_abcd_secret_once');
+  expect(page.querySelector('[data-pat-created="true"]')?.textContent).toContain('Cursor Laptop');
   await act(async () => findButton(page, 'Copy token')!.click());
   expect(copy).toHaveBeenCalledWith('om_pat_abcd_secret_once');
   await act(async () => findButton(page, 'Revoke')!.click());
