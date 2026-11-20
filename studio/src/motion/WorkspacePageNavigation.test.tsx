@@ -62,8 +62,8 @@ beforeEach(() => {
     if (url.pathname.endsWith('/projects') && !init?.method) return Response.json(catalog);
     if (url.pathname.includes('/sessions/')) return Response.json(catalog.sessions.find(item => url.pathname.endsWith(item.id)));
     if (url.pathname.includes('/projects/') && url.pathname.endsWith('/open')) return Response.json({ projectId: url.pathname.split('/').at(-2), revision: 'r' });
-    // The OpenAI preset carries media kinds, so it stays visible in the provider list.
-    if (url.pathname.endsWith('/settings/providers')) return Response.json({ providers: [provider, { ...provider, id: 'openai', label: 'OpenAI', protocol: 'openai', category: 'multimodal', kinds: ['text', 'image', 'audio'] }], models: [], defaults: {} });
+    if (url.pathname.endsWith('/models/catalog')) return Response.json({ provider: 'opendesign', mode: 'opendesign', models: [], defaults: {} });
+    if (url.pathname.endsWith('/models/status')) return Response.json({ providers: [{ ...provider, id: 'opendesign', available: true, configured: true, enabled: true }], routes: {}, agents: [], capabilities: [] });
     if (url.pathname.endsWith('/integration')) return Response.json(info);
     if (url.pathname.endsWith('/brand-kits')) return Response.json({ kits: [] });
     if (url.pathname.endsWith('/brand-kits/catalog')) return Response.json({ schemaVersion: 1, entries: [] });
@@ -162,14 +162,15 @@ it('keeps one history entry per page and returns to the resolved editor after a 
   expect(history.length).toBe(initialLength + 3);
 });
 
-it('restores provider details and returns to the providers list through history', async () => {
-  await mount(); await click('Model providers');
-  await act(async () => [...container.querySelectorAll<HTMLButtonElement>('.om-provider-item')].find(node => node.textContent?.includes('OpenAI'))!.click());
-  expect(page().provider).toBe('openai');
-  await mount(1); expect(container.querySelector('.om-provider-items [aria-current=page]')?.textContent).toContain('OpenAI');
-  expect(container.querySelector('.om-provider-settings')?.getAttribute('data-detail')).toBe('true');
-  await traverse(-1); expect(page().provider).toBeNull();
-  expect(container.querySelector('.om-provider-settings')?.getAttribute('data-detail')).toBe('false');
+it('opens the unified Model gateway page and preserves it across reloads and history', async () => {
+  await mount(); await click('Model gateway');
+  expect(page().settings).toBe('providers');
+  expect(container.textContent).toContain('OpenDesign Model Gateway');
+  await mount(1);
+  expect(page().settings).toBe('providers');
+  expect(container.textContent).toContain('OpenDesign Model Gateway');
+  await traverse(-1);
+  expect(page().settings).toBeNull();
 });
 
 it('uses browser history across settings, reloads and new navigation branches', async () => {
@@ -487,8 +488,8 @@ it('shows read-only audio model artwork and enters speech through the type card'
   const fallback = fetcher.getMockImplementation()!;
   fetcher.mockImplementation(async (input: string, init?: RequestInit) => {
     const path = new URL(input, location.origin).pathname;
-    if (path === '/motion-api/models') return Response.json({ models: [speech], nextOffset: null });
-    if (path === '/motion-api/models/capabilities') return Response.json({ providers: [{ id: 'voice', available: true }], routes: {} });
+    if (path === '/motion-api/models' || path === '/motion-api/models/catalog') return Response.json({ models: [speech], nextOffset: null });
+    if (path === '/motion-api/models/capabilities' || path === '/motion-api/models/status') return Response.json({ providers: [{ id: 'voice', available: true }], routes: {} });
     return fallback(input, init);
   });
   await mount();
@@ -519,7 +520,7 @@ it('opens a Cinema still from Explore and restores its studio when changing hist
   expect(page().explore).toBe(true);
   await click('Generate with Open Design MCP');
   const clients = [...document.querySelectorAll<HTMLButtonElement>('.om-creative-client-menu button')];
-  expect(clients.some(button => button.textContent?.includes('ChatGPT'))).toBe(false);
+  expect(clients.some(button => button.textContent?.includes('ChatGPT'))).toBe(true);
   const client = clients.find(button => button.textContent === 'Claude Code')!;
   await act(async () => client.click());
   expect(page()).toMatchObject({ explore: false, settings: 'mcp', client: 'claude' });
@@ -1115,8 +1116,8 @@ it('opens model cases with a compatible provider and the same prompt from both d
   const other = { ...image, id: 'other:gpt-image-2.6-flare', provider: 'other' };
   fetcher.mockImplementation(async (input: string, init?: RequestInit) => {
     const path = new URL(input, location.origin).pathname;
-    if (path === '/motion-api/models') return Response.json({ models: [other, edit, image], nextOffset: null });
-    if (path === '/motion-api/models/capabilities') return Response.json({ providers: [{ id: 'cloud', available: true }], routes: {} });
+    if (path === '/motion-api/models' || path === '/motion-api/models/catalog') return Response.json({ models: [other, edit, image], nextOffset: null });
+    if (path === '/motion-api/models/capabilities' || path === '/motion-api/models/status') return Response.json({ providers: [{ id: 'cloud', available: true }], routes: {} });
     return baseFetch(input, init);
   });
   await mount(); await click('Explore');
@@ -1153,8 +1154,8 @@ it.each([
   const baseFetch = fetcher.getMockImplementation()!;
   fetcher.mockImplementation(async (input: string, init?: RequestInit) => {
     const path = new URL(input, location.origin).pathname;
-    if (path === '/motion-api/models') return Response.json({ models: [model], nextOffset: null });
-    if (path === '/motion-api/models/capabilities') return Response.json({ providers: [{ id: 'cloud', available: true }], routes: {} });
+    if (path === '/motion-api/models' || path === '/motion-api/models/catalog') return Response.json({ models: [model], nextOffset: null });
+    if (path === '/motion-api/models/capabilities' || path === '/motion-api/models/status') return Response.json({ providers: [{ id: 'cloud', available: true }], routes: {} });
     return baseFetch(input, init);
   });
   history.replaceState(null, '', firstUrl.replace('#', '&page=model&model=' + encodeURIComponent(model.id) + '#'));

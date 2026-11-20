@@ -12,8 +12,6 @@ import { gatewayRequest, type Modality } from './gatewayClient';
 import { assetRequest } from './assetClient';
 import { IconButton } from 'open-design-ui/icon-button';
 import { AssetTaskHistory } from './AssetTaskHistory';
-import type { AssetChatSummary, AssetTaskMode } from './assetTasks';
-import { AssetConversation } from './AssetConversation';
 import { AssetGenerationCard, creationKinds } from './AssetCreationVisuals';
 import { GenerationParameters, emptyParameters, parameterInputImageRatio, requestParameters, shotParameters, type ParameterDraft } from './GenerationParameters';
 import { notifyProvidersChanged } from './useProviderDirectory';
@@ -24,12 +22,11 @@ import { studioExamples, sceneLayout } from './sceneShowcase';
 import { needsImage, supportsScene } from './creativeStudios';
 
 export interface AssetDraft { modality: Modality; prompt: string; shotPreferences?: { aspect: string; duration?: number }; model?: string; parameters?: Record<string, unknown>; target?: { asset: LibraryAsset; versionId: string }; references: { reference: AssetReference; name: string }[] }
-export function AssetComposer({ active, studio, draft, setDraft, agentReferences, setAgentReferences, jobs, mode, onMode, taskIds, history, selectingTask, onNew, onChatChanged, onChatStarted, onCancel, onView, onRetrySave, onResume, onReference, onUploadReference, onCreated, onError, onClose }: {
+
+export function AssetComposer({ active, studio, draft, setDraft, jobs, taskId, history, selectingTask, onNew, onCancel, onView, onRetrySave, onResume, onReference, onUploadReference, onCreated, onError, onClose }: {
   active: boolean; studio?: StudioCreation; draft: AssetDraft; setDraft: Dispatch<SetStateAction<AssetDraft>>; jobs: GenerationJob[];
-  agentReferences: AssetDraft['references']; setAgentReferences: (references: AssetDraft['references']) => void;
-  mode: AssetTaskMode; onMode: (mode: AssetTaskMode) => void; taskIds: { direct?: string; agent?: string };
+  taskId?: string;
   history: Omit<ComponentProps<typeof AssetTaskHistory>, 'trigger'>; selectingTask: boolean; onNew: () => void;
-  onChatChanged: (chat: AssetChatSummary) => void; onChatStarted: (id: string) => void;
   onCancel: (job: GenerationJob) => void; onView: (job: GenerationJob) => void; onRetrySave?: (job: GenerationJob) => Promise<void>; onReference: () => void; onUploadReference?: () => void;
   onCreated: (job: GenerationJob) => void; onResume?: (job: GenerationJob) => Promise<void>; onError: (message: string) => void; onClose: () => void;
 }) {
@@ -40,13 +37,13 @@ export function AssetComposer({ active, studio, draft, setDraft, agentReferences
   const promptId = useId();
   const libraryCatalog = useMediaCatalog(active && !studio);
   const { catalog: gateway, failed, retry } = studio?.catalog ?? libraryCatalog;
-  const [busy, setBusy] = useState(false), [agentSending, setAgentSending] = useState(false);
+  const [busy, setBusy] = useState(false);
   const [parameterDrafts, setParameterDrafts] = useState<Record<string, ParameterDraft>>(() => draft.model && draft.parameters ? { [draft.model]: { values: {}, advanced: JSON.stringify(draft.parameters, null, 2) } } : {});
   const mounted = useRef(true);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   const [syncing, setSyncing] = useState(false);
   const selectedTask = history.tasks.find(task => task.key === history.selectedKey);
-  const switching = busy || agentSending || selectingTask;
+  const switching = busy || selectingTask;
   const compatible = gateway?.models.filter(model => model.modality === draft.modality && (!scene || supportsScene(model, scene))) ?? [];
   const available = compatible.filter(model => gateway?.status.providers.some(provider => provider.id === model.provider && provider.available));
   const preferred = modelId ? compatible.find(model => model.id === modelId)
@@ -55,15 +52,14 @@ export function AssetComposer({ active, studio, draft, setDraft, agentReferences
   const selectedProvider = selected ? gateway?.status.providers.find(provider => provider.id === selected.provider) : undefined;
   const preferredProvider = preferred ? gateway?.status.providers.find(provider => provider.id === preferred.provider) : undefined;
   const unconfiguredPreferred = Boolean(studio && gateway && preferred && !selected && preferredProvider && !preferredProvider.available);
-  const accountNotIncluded = selected?.provider === 'account' && selectedProvider?.mediaEntitlement === 'not-included';
+  const accountNotIncluded = (selected?.provider === 'account' || selected?.provider === 'opendesign') && selectedProvider?.mediaEntitlement === 'not-included';
   const choices = studio ? compatible : available;
   const maximumReferences = selected ? modelReferenceLimit(selected) : 0;
   const unknownReferences = selected?.provider === 'opendesign' && selected.modality === 'image' && selected.supportsImageReference === undefined;
   const cloudModelMissing = !!gateway && !!modelId?.startsWith('opendesign:') && !selected;
   const syncModels = async () => {
-    const provider = selected?.provider ?? (cloudModelMissing ? 'opendesign' : undefined);
-    if (!provider || syncing) return; setSyncing(true);
-    try { await gatewayRequest(`settings/providers/${provider}/sync`, 'POST', {}); notifyProvidersChanged(); }
+    if (syncing) return; setSyncing(true);
+    try { await gatewayRequest('models/catalog?refresh=true', 'GET'); notifyProvidersChanged(); }
     catch (error) { onError((error as Error).message); }
     finally { if (mounted.current) setSyncing(false); }
   };
@@ -72,7 +68,7 @@ export function AssetComposer({ active, studio, draft, setDraft, agentReferences
   const parameters = selected ? parameterDrafts[selected.id] ?? shotParameters(selected, shotPreferences) : emptyParameters;
   const inputImageRatio = selected && parameterInputImageRatio(selected, parameters, draft.references.length > 0);
   const kind = creationKinds.find(k => k.id === draft.modality)!;
-  const latest = jobs.find(job => job.id === taskIds.direct);
+  const latest = jobs.find(job => job.id === taskId);
   const submit = async () => {
     if (!selected || !draft.prompt.trim() || busy || invalidReferences) return; setBusy(true);
     const studioContext = studio ? { studio: studio.destination.studio.id, scene: studio.destination.scene.id, model: selected.id } : undefined;
@@ -109,20 +105,18 @@ export function AssetComposer({ active, studio, draft, setDraft, agentReferences
     </div>}
   </div>;
 
-  return <aside className="om-asset-composer om-creation-surface" data-active={active} data-mode={mode} aria-label={t('Create asset')}>
+  return <aside className="om-asset-composer om-creation-surface" data-active={active} data-mode="direct" aria-label={t('Create asset')}>
     {scene ? <header className={canvas ? "om-sr-only" : "om-studio-form-heading"} data-landing={studio?.destination.landing}>
       {!canvas && scene.modality === 'image' && <img src={studioExamples(studio!.destination)[0].poster} alt="" />}
       {!studio?.destination.landing && <h2 className="om-title">{t(scene.label)}</h2>}
       <p className="om-muted">{t(scene.hint)}</p>
     </header> : <header className="om-task-toolbar">
       <h2 className="om-sr-only">{t(draft.target ? 'Create a new version' : 'Creative studio')}</h2>
-      {/* Temporarily hide the Agent tab; existing conversations remain available in Tasks. */}
-      <div className="om-choice-tabs om-task-modes" role="group" aria-label={t('Task type')}>{(['direct'] as const).map(value => <Tooltip label={t(value === 'direct' ? 'Direct generation' : 'Agent conversation')} wrap key={value}><Button variant="plain" className="om-nav-item" aria-pressed={mode === value} aria-label={t(value === 'direct' ? 'Direct generation' : 'Agent conversation')} disabled={switching} onClick={() => onMode(value)}><RemixIcon name={value === 'direct' ? 'sparkling-line' : 'chat-1-line'} size={15} /><span>{t(value === 'direct' ? 'Generate' : 'Agent')}</span></Button></Tooltip>)}</div>
+      <div className="om-choice-tabs om-task-modes" role="group" aria-label={t('Task type')}><Tooltip label={t('Direct generation')} wrap><Button variant="plain" className="om-nav-item" aria-pressed aria-label={t('Direct generation')} disabled={switching}><RemixIcon name="sparkling-line" size={15} /><span>{t('Generate')}</span></Button></Tooltip></div>
       <AssetTaskHistory tooltip={selectedTask?.title ?? t('New task')} {...history} trigger={<Button variant="plain" className="om-nav-item om-task-picker" aria-label={t('Select task')} disabled={switching}><span>{selectingTask ? t('Loading tasks…') : selectedTask?.title ?? t('New task')}</span><RemixIcon name="arrow-down-s-line" size={14} /></Button>} />
       <Tooltip label={t('New task')} wrap><IconButton aria-label={t('New task')} icon={<RemixIcon name="add-line" size={17} />} disabled={switching} onClick={onNew} /></Tooltip>
       <Tooltip label={t('Close creator')} wrap><IconButton aria-label={t('Close creator')} icon={<RemixIcon name="close-line" size={17} />} onClick={onClose} /></Tooltip>
     </header>}
-    {!scene && <div className="om-asset-chat-panel" hidden={mode !== 'agent'}><AssetConversation conversationId={taskIds.agent} onChanged={onChatChanged} onStarted={onChatStarted} onSending={setAgentSending} active={active && mode === 'agent'} references={agentReferences.map(r => r.reference)} referenceControls={referenceControls(agentReferences, setAgentReferences)} jobs={jobs} onCancel={onCancel} onView={onView} onRetrySave={onRetrySave} onResume={onResume} onError={onError} /></div>}{mode === 'direct' && <>
       {latest && <div className="om-asset-current-job"><AssetGenerationCard job={latest} onCancel={onCancel} onView={onView} onRetrySave={onRetrySave} onResume={onResume} /></div>}
       <div className="om-asset-direct">
       {draft.target && <div className="om-card om-asset-edit-target"><span><RemixIcon name="history-line" size={16} />{draft.target.asset.name} · V{draft.target.asset.versions.findIndex(v => v.id === draft.target!.versionId) + 1}</span><Button variant="plain" className="om-nav-item" onClick={() => setDraft({ ...draft, target: undefined })}>{t('Create separately')}</Button></div>}
@@ -143,7 +137,7 @@ export function AssetComposer({ active, studio, draft, setDraft, agentReferences
           defaultModel={gateway.status.routes[draft.modality]} disabled={busy}
           onChoose={model => studio ? studio.chooseModel(model) : setDraft({ ...draft, model })} /> : <>
           {modelHeading}
-          {failed ? <Button variant="ghost" className="om-button h-auto" onClick={retry}><RemixIcon name="refresh-line" size={16} />{t('Retry loading models')}</Button> : !gateway ? <Skeleton className="om-asset-model-skeleton" /> : <div className="om-creation-setup"><RemixIcon name="plug-line" size={20} /><p className="om-muted">{t('Configure a provider or sign in to use media models.')}</p><Button variant="ghost" className="om-button h-auto" onClick={openModelSettings}>{t('Model providers')}</Button></div>}
+          {failed ? <Button variant="ghost" className="om-button h-auto" onClick={retry}><RemixIcon name="refresh-line" size={16} />{t('Retry loading models')}</Button> : !gateway ? <Skeleton className="om-asset-model-skeleton" /> : <div className="om-creation-setup"><RemixIcon name="plug-line" size={20} /><p className="om-muted">{t('Sign in with OpenDesign to use platform media models.')}</p><Button variant="ghost" className="om-button h-auto" onClick={openModelSettings}>{t('Model gateway')}</Button></div>}
         </>}
       </div>
       {unconfiguredPreferred && <div className="om-creation-setup" role="status">
@@ -153,7 +147,7 @@ export function AssetComposer({ active, studio, draft, setDraft, agentReferences
           {preferredProvider!.id === 'account' ? t('Sign in with OpenDesign') : t('Configure {provider}', { provider: preferredProvider!.label ?? preferredProvider!.id })}
         </Button>
       </div>}
-      {studio && gateway && !available.length && compatible.length > 0 && !unconfiguredPreferred && <Button variant="ghost" className="om-button h-auto" onClick={openModelSettings}>{t('Configure a provider or sign in to use media models.')}</Button>}
+      {studio && gateway && !available.length && compatible.length > 0 && !unconfiguredPreferred && <Button variant="ghost" className="om-button h-auto" onClick={openModelSettings}>{t('Model gateway')}</Button>}
       {accountNotIncluded && <div className="om-creation-setup" role="status">
         <RemixIcon name="bank-card-line" size={20} />
         <p className="om-muted">{t('Signed in; multimodal generation requires OpenDesign Plus or above')}</p>
@@ -168,7 +162,6 @@ export function AssetComposer({ active, studio, draft, setDraft, agentReferences
       {unknownReferences || cloudModelMissing ? <p className="om-muted" role="status">{unknownReferences && t('Image editing capability is unknown. Sync models to check reference support.')} <Button variant="ghost" className="om-button h-auto" disabled={syncing} onClick={() => void syncModels()}>{t(syncing ? 'Working…' : 'Sync models')}</Button></p> : selected && draft.references.length > 0 && <p className="om-muted">{t(maximumReferences ? draft.modality === 'video' ? 'This video model uses one image as its first frame.' : 'This model edits up to {count} image references.' : 'This model cannot use asset references. Choose an image model that supports editing, or remove the references.', { count: maximumReferences })}</p>}
       {inputImageRatio && <p className="om-muted" role="status">{t('Aspect ratio follows the first frame.')} {t('Fixed ratio choices are unavailable while a first frame is attached. Remove it to restore your text-to-video ratio.')}</p>}
 
-    </div><div className="om-creation-submit">{selected && <GenerationParameters key={selected.id} model={selected} draft={parameters} hasInputImage={draft.references.length > 0} onChange={value => { setParameterDrafts(current => ({ ...current, [selected.id]: value })); try { setDraft({ ...draft, model: selected.id, parameters: requestParameters(value, selected, draft.references.length > 0) }); } catch { /* Keep invalid JSON or conflicting parameters in the local editor until corrected. */ } }} />}<Button variant="plain" className="om-button om-creation-submit-button" data-primary disabled={busy || !selected || !draft.prompt.trim() || invalidReferences} onClick={() => void submit()}><RemixIcon name="sparkling-fill" size={19} />{t(busy ? 'Submitting your idea…' : kind.action)}<RemixIcon name="arrow-right-line" size={18} /></Button>{!canvas && <p className="om-creation-save-note"><RemixIcon name="stack-line" size={13} />{t('Saved automatically to your library')}</p>}<p className="om-eyebrow om-creation-billing">{t('Model usage is billed to your configured account.')}</p></div>
-    </>}
+    </div><div className="om-creation-submit">{selected && <GenerationParameters key={selected.id} model={selected} draft={parameters} hasInputImage={draft.references.length > 0} onChange={value => { setParameterDrafts(current => ({ ...current, [selected.id]: value })); try { setDraft({ ...draft, model: selected.id, parameters: requestParameters(value, selected, draft.references.length > 0) }); } catch { /* Keep invalid JSON or conflicting parameters in the local editor until corrected. */ } }} />}<Button variant="plain" className="om-button om-creation-submit-button" data-primary disabled={busy || !selected || !draft.prompt.trim() || invalidReferences} onClick={() => void submit()}><RemixIcon name="sparkling-fill" size={19} />{t(busy ? 'Submitting your idea…' : kind.action)}<RemixIcon name="arrow-right-line" size={18} /></Button>{!canvas && <p className="om-creation-save-note"><RemixIcon name="stack-line" size={13} />{t('Saved automatically to your library')}</p>}<p className="om-eyebrow om-creation-billing">{t('Model usage is billed to your OpenDesign platform account.')}</p></div>
   </aside>;
 }

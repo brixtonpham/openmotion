@@ -5,12 +5,61 @@ import { readFileSync } from 'node:fs';
 import { mcpCapabilities, mcpScenarios, platformExportExample, mcpBenefits, mcpReviewGuide, mcpFaq, mcpClientComparison } from '../studio/src/motion/mcpCapabilities.ts';
 import { assetNamingInstruction } from '../shared/asset-names.ts';
 import { phase1Tools } from '../shared/phase1-tools.ts';
-import { agentGuide, type IntegrationInfo } from '../shared/integration.ts';
+import {
+  agentGuide,
+  buildCloudIntegrationInfo,
+  integrationConfig,
+  isIntegrationInfo,
+  isStreamableHttpTransport,
+  manualConnection,
+  setupPrompt,
+  supportsChatgptCloud,
+  type IntegrationInfo,
+} from '../shared/integration.ts';
 
-test('MCP onboarding covers every public domain tool and scenarios only compose real tools', () => {
+test('MCP onboarding covers every public domain tool (22 registered) and scenarios only compose real tools', () => {
   const described = mcpCapabilities.flatMap(capability => [...capability.tools]);
+  assert.equal(phase1Tools.length, 22);
   assert.deepEqual([...new Set(described)].sort(), phase1Tools.map(tool => tool.name).sort());
   for (const capability of mcpCapabilities) assert.equal(new Set(capability.tools).size, capability.tools.length);
+});
+
+test('Streamable HTTP /mcp integration info validates and configures all clients including ChatGPT Cloud', () => {
+  const localHttp = buildCloudIntegrationInfo({
+    publicOrigin: 'http://127.0.0.1:4173',
+    version: '1.0.0',
+    workspaceId: 'ws-dev',
+    authMode: 'dev',
+    tools: phase1Tools,
+  });
+  assert.equal(isIntegrationInfo(localHttp), true);
+  assert.equal(isStreamableHttpTransport(localHttp.transport), true);
+  assert.equal(localHttp.transport.type === 'streamable-http' && localHttp.transport.url, 'http://127.0.0.1:4173/mcp');
+  assert.equal(supportsChatgptCloud(localHttp), false);
+  assert.throws(() => integrationConfig(localHttp, 'chatgpt'), /HTTPS/);
+  assert.match(manualConnection(localHttp, 'codex', 'en'), /codex mcp add openmotion --url 'http:\/\/127\.0\.0\.1:4173\/mcp'/);
+  assert.match(manualConnection(localHttp, 'claude', 'en'), /claude mcp add --transport http openmotion 'http:\/\/127\.0\.0\.1:4173\/mcp'/);
+  assert.match(integrationConfig(localHttp, 'mcp').text, /"type": "http"/);
+  assert.match(integrationConfig(localHttp, 'deepseek').text, /transport: streamable-http/);
+  assert.doesNotMatch(setupPrompt(localHttp, 'codex', 'en'), /docker exec -i/);
+  assert.match(setupPrompt(localHttp, 'codex', 'en'), /upload_ticket/);
+
+  const cloudHttps = buildCloudIntegrationInfo({
+    publicOrigin: 'https://motion.open-design.ai',
+    version: '1.0.0',
+    workspaceId: 'ws-prod',
+    authMode: 'oidc',
+    oauth2Enabled: true,
+    patEnabled: true,
+    tools: phase1Tools,
+  });
+  assert.equal(isIntegrationInfo(cloudHttps), true);
+  assert.equal(supportsChatgptCloud(cloudHttps), true);
+  const chatgptCfg = integrationConfig(cloudHttps, 'chatgpt');
+  assert.equal(chatgptCfg.filename, 'openmotion-chatgpt.json');
+  assert.match(chatgptCfg.text, /"authentication": "oauth2"/);
+  assert.match(chatgptCfg.text, /https:\/\/motion\.open-design\.ai\/mcp/);
+  assert.match(manualConnection(cloudHttps, 'chatgpt', 'en'), /OAuth 2\.1/);
 });
 
 test('every capability and benefit has a real shared icon', () => {
@@ -68,19 +117,43 @@ test('reference-image and audio guidance is translated in every interface langua
   }
 });
 
-test('connection guidance exposes the maintained media workflow without asking for credentials', () => {
-  const info: IntegrationInfo = { name: 'OpenMotion', version: '1.0.0', dataDirectory: '/fixture/data', previewUrl: 'http://127.0.0.1:4567', tools: phase1Tools,
-    transport: { type: 'stdio', command: 'node', args: ['/fixture/mcp.ts'], cwd: '/fixture', env: { MOTION_DATA_DIR: '/fixture/data' } } };
-  const guide = agentGuide(info, 'codex');
-  assert.ok(guide.includes(reviewCommentsPrompt({ dataDirectory: info.dataDirectory, previewUrl: info.previewUrl })));
+test('cloud Streamable HTTP and legacy connection guidance expose the maintained media workflow and 3-way cloud import', () => {
+  const cloudInfo = buildCloudIntegrationInfo({
+    publicOrigin: 'https://motion.open-design.ai',
+    version: '1.0.0',
+    workspaceId: 'ws-1',
+    authMode: 'oidc',
+    tools: phase1Tools,
+  });
+  const cloudGuide = agentGuide(cloudInfo, 'codex');
+  assert.ok(cloudGuide.includes(reviewCommentsPrompt({ dataDirectory: cloudInfo.dataDirectory, previewUrl: cloudInfo.previewUrl })));
+  for (const token of [
+    'https://motion.open-design.ai/mcp',
+    'prepare_upload',
+    'upload_ticket',
+    'library_asset',
+    'OpenDesign Model Gateway',
+    'openmotion_media_use',
+    'openmotion_assets_use generate',
+    'FEATURE_DEFERRED_P2',
+  ]) {
+    assert.ok(cloudGuide.includes(token), token);
+  }
+
+  const stdioInfo: IntegrationInfo = {
+    name: 'OpenMotion', version: '1.0.0', dataDirectory: '/fixture/data', previewUrl: 'http://127.0.0.1:4567', tools: phase1Tools,
+    transport: { type: 'stdio', command: 'node', args: ['/fixture/mcp.ts'], cwd: '/fixture', env: { MOTION_DATA_DIR: '/fixture/data' } },
+  };
+  const guide = agentGuide(stdioInfo, 'codex');
+  assert.ok(guide.includes(reviewCommentsPrompt({ dataDirectory: stdioInfo.dataDirectory, previewUrl: stdioInfo.previewUrl })));
   for (const operation of ['openmotion_media_use', 'inspect', 'reference', 'models', 'schema', 'generate', 'status', 'cancel', 'requestId', 'jobId']) assert.ok(guide.includes(operation), operation);
   assert.doesNotMatch(guide, /不公开生成/);
-  assert.match(guide, /Keep credentials in Settings/);
   assert.match(guide, /openmotion_assets_use generate/);
 });
 
-test('media example preserves setup and task continuation across supported languages', async () => {
+test('media example uses unified OpenDesign Model Gateway and preserves setup continuation across languages', async () => {
   const media = mcpCapabilities.find(capability => capability.id === 'media')!;
+  const assets = mcpCapabilities.find(capability => capability.id === 'assets')!;
   const translations = JSON.parse(readFileSync(new URL('../studio/src/i18n/mcp-ui.json', import.meta.url), 'utf8'));
   assert.match(media.prompt, /inspect/);
   assert.match(media.prompt, /Plus or above/);
@@ -88,11 +161,15 @@ test('media example preserves setup and task continuation across supported langu
   assert.match(media.prompt, /Only when signed in.*unknown, continue model discovery/);
   assert.match(media.prompt, /mediaEntitlement/);
   assert.match(media.prompt, /OpenDesign Cloud/);
+  assert.match(media.prompt, /OpenDesign Model Gateway/);
+  assert.doesNotMatch(media.prompt, /BYOK API key/);
   assert.match(media.prompt, /target=providers/);
-  assert.match(media.prompt, /once I have saved/);
   assert.match(media.prompt, /inspect again/);
   assert.match(media.prompt, /original request/);
+  assert.match(assets.description, /prepare_upload \+ upload_ticket.*HTTPS URL.*library_asset/);
   assert.ok(translations['zh-CN'][media.prompt]);
+  assert.ok(translations['zh-CN'][assets.description]);
+
   const skill = readFileSync(new URL('../skills/openmotion-media/SKILL.md', import.meta.url), 'utf8');
   const setupLink = skill.match(/\[Discovery and setup\]\(([^)]+)\)/);
   assert.ok(setupLink, 'Media entry must expose provider setup');
@@ -114,21 +191,23 @@ test('asset naming scenario is localized in all eleven interface languages', () 
   }
 });
 
-test('final-video selection and recovery are localized throughout the handbook', () => {
+test('Streamable HTTP client comparison and final-video recovery are localized across all interface languages', () => {
   const answer = mcpFaq.find(([question]) => question === 'What if the final video cannot load?')![1];
   const matrix = mcpClientComparison.find(([capability]) => capability === 'Inline template cards and final video')!;
+  const connectionRow = mcpClientComparison.find(([capability]) => capability === 'Connection')!;
   const translations = JSON.parse(readFileSync(new URL('../studio/src/i18n/mcp-ui.json', import.meta.url), 'utf8'));
+  assert.match(connectionRow[1], /Streamable HTTP \(\/mcp\)/);
+  assert.match(connectionRow[3], /HTTPS \+ OAuth 2\.1/);
   assert.match(answer, /Codex normally shows it in the final reply/);
   assert.match(answer, /never both for the same video/);
   assert.match(answer, /without rendering again/);
   for (const [language, values] of Object.entries(translations) as [string, Record<string, string>][]) {
-    for (const key of [answer, matrix[1], matrix[2]]) {
-      assert.ok(values[key]?.trim(), `${language}: missing final-video guidance`);
-      assert.notEqual(values[key], key, `${language}: English fallback`);
+    for (const key of [answer, matrix[1], matrix[2], connectionRow[3]]) {
+      assert.ok(values[key]?.trim(), `${language}: missing localized guidance for "${key}"`);
+      assert.notEqual(values[key], key, `${language}: English fallback for "${key}"`);
     }
   }
 });
-
 
 test('canvas and caption controls expose atomic operations and an actionable handbook example', () => {
   const capability = mcpCapabilities.find(item => item.id === 'canvas-captions')!;
@@ -153,7 +232,6 @@ test('fullscreen guidance distinguishes browser presentation from an Agent proje
     for (const key of [capability.title, capability.description, capability.prompt]) assert.ok(values[key]?.trim() && values[key] !== key, `${language}: missing fullscreen guidance`);
   }
 });
-
 
 test('timeline hover inspection remains a localized, non-mutating preview scenario', () => {
   const capability = mcpCapabilities.find(item => item.id === 'timeline-hover')!;

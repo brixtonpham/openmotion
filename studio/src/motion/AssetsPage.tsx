@@ -11,8 +11,7 @@ import { StudioToastViewport } from '../components/StudioToastViewport';
 import { AssetBrowserContent, useAssetBrowser, AssetPicker, type AssetKind } from './AssetBrowser';
 import { AssetGalleryToolbar } from './AssetGalleryToolbar';
 import { AssetTaskMenu } from './AssetTaskHistory';
-import { assetTasks, mergeAssetJobs, type AssetChatSummary, type AssetTask, type AssetTaskMode } from './assetTasks';
-import { gatewayRequest } from './gatewayClient';
+import { assetTasks, mergeAssetJobs, type AssetTask } from './assetTasks';
 import { AssetComposer, type AssetDraft } from './AssetComposer';
 import { assetRequest, uploadLibraryAsset } from './assetClient';
 import { AssetUploadError } from './assetUploadError';
@@ -23,6 +22,7 @@ import type { StudioCreation } from './CreativeWorkspace';
 import { sceneLayout } from './sceneShowcase';
 import { StudioIdeas } from './StudioIdeas';
 import './assets.css';
+
 export function AssetsPage({ active, hasProject = false, studio, routeId, routeVersion, onAssetRoute }: { routeId?: string | null; routeVersion?: string | null; onAssetRoute?: (id: string | null, version: string | null) => void; active: boolean; hasProject?: boolean; studio?: StudioCreation }) {
   const { t } = useI18n(), toast = useToast();
   const [kind, setKind] = useState<AssetKind>(studio?.destination.scene.modality ?? 'all'), [revision, setRevision] = useState(0), [creating, setCreating] = useState(Boolean(studio)), [picking, setPicking] = useState(false), [uploading, setUploading] = useState(false), [selected, setSelected] = useState<LibraryAsset>(), [versionId, setVersionId] = useState(''), [jobs, setJobs] = useState<GenerationJob[]>([]);
@@ -30,9 +30,8 @@ export function AssetsPage({ active, hasProject = false, studio, routeId, routeV
   const layout = studio && sceneLayout(studio.destination.scene);
   const [studioTab, setStudioTab] = useState<'guide' | 'library'>();
   const [mobileView, setMobileView] = useState<'library' | 'create'>('create');
-  const [agentReferences, setAgentReferences] = useState<AssetDraft['references']>([]);
-  const [mode, setMode] = useState<AssetTaskMode>('direct'), [taskIds, setTaskIds] = useState<{ direct?: string; agent?: string }>({}), [taskEpoch, setTaskEpoch] = useState(0);
-  const [conversations, setConversations] = useState<AssetChatSummary[]>([]), [historyLoading, setHistoryLoading] = useState(true), [historyError, setHistoryError] = useState<string>(), [historyRetry, setHistoryRetry] = useState(0), [selectingTask, setSelectingTask] = useState(false);
+  const [taskId, setTaskId] = useState<string | undefined>(), [taskEpoch, setTaskEpoch] = useState(0);
+  const [historyLoading, setHistoryLoading] = useState(true), [historyError, setHistoryError] = useState<string>(), [historyRetry, setHistoryRetry] = useState(0), [selectingTask, setSelectingTask] = useState(false);
   const studioForm = studio && !selected ? studio : undefined;
   const scoped = Boolean(studio), lastStudioDraft = useRef(draft);
   useLayoutEffect(() => {
@@ -45,8 +44,6 @@ export function AssetsPage({ active, hasProject = false, studio, routeId, routeV
   const selectedAsset = useRef<LibraryAsset | undefined>(undefined), assetReadRequest = useRef(0);
   const pendingWrites = useRef(new Set<string>()), [updatingAssets, setUpdatingAssets] = useState<Set<string>>(new Set());
   const browser = useAssetBrowser({ kind, revision, active });
-  // One page view each time the library is shown; the page stays mounted while hidden. Inside a Design, Cinema or
-  // Sound Studio the same page is that Studio's form, so it reports the Studio and scene instead of the library.
   useEffect(() => {
     if (!active) return;
     if (studio) reportCreativePageView('creative_studio', hasProject, { ...destinationTarget(studio.destination), landing: Boolean(studio.destination.landing) });
@@ -61,18 +58,14 @@ export function AssetsPage({ active, hasProject = false, studio, routeId, routeV
     if (galleryScroll.current.key === browser.data.key) gallery.current.scrollTop = galleryScroll.current.top;
     galleryScroll.current = undefined;
   }, [selected, browser.data]);
-  const tasks = assetTasks(jobs, conversations), selectedKey = taskIds[mode] ? `${mode}:${taskIds[mode]}` : undefined;
-  const chatChanged = useCallback((chat: AssetChatSummary) => setConversations(current => {
-    if ((current.find(item => item.id === chat.id)?.updatedAt ?? -1) > chat.updatedAt) return current;
-    return [chat, ...current.filter(item => item.id !== chat.id)];
-  }), []);
+  const tasks = assetTasks(jobs), selectedKey = taskId ? `direct:${taskId}` : undefined;
   const referenceUpload = useRef<HTMLInputElement>(null), upload = useRef<HTMLInputElement>(null), replace = useRef<HTMLInputElement>(null), knownJobs = useRef<GenerationJob[]>([]);
   const refresh = useCallback(() => setRevision(v => v + 1), []), onError = useCallback((message: string) => toast.showToast(message), [toast.showToast]);
   const missingVersion = t('Asset version unavailable');
   const clearPreview = useCallback(() => {
     selectionRequest.current++; assetReadRequest.current++; selectedAsset.current = undefined;
     setSelectingTask(false); setSelected(undefined); setVersionId(''); setCreating(scoped);
-    if (scoped) { setMode('direct'); setDraft(lastStudioDraft.current); setTaskIds({}); }
+    if (scoped) { setDraft(lastStudioDraft.current); setTaskId(undefined); }
   }, [scoped]);
   const closePreview = useCallback(() => {
     clearPreview();
@@ -115,22 +108,21 @@ export function AssetsPage({ active, hasProject = false, studio, routeId, routeV
     const poll = async () => {
       if (pending || document.hidden) return; pending = true;
       try {
-        const [jobResult, chatResult] = await Promise.allSettled([assetRequest<{ jobs: GenerationJob[] }>({ action: 'jobs' }), gatewayRequest<{ conversations: AssetChatSummary[] }>('assets/conversations')]);
+        const result = await assetRequest<{ jobs: GenerationJob[] }>({ action: 'jobs' });
         if (cancelled) return;
-        if (chatResult.status === 'fulfilled') setConversations(current => {
-          const merged = new Map(current.map(chat => [chat.id, chat]));
-          for (const chat of chatResult.value.conversations) if ((merged.get(chat.id)?.updatedAt ?? 0) <= chat.updatedAt) merged.set(chat.id, chat);
-          return [...merged.values()];
-        });
-        setHistoryError(jobResult.status === 'rejected' || chatResult.status === 'rejected' ? 'Could not load task history' : undefined);
-        if (jobResult.status === 'rejected') return;
-        const next = mergeAssetJobs(knownJobs.current, jobResult.value.jobs);
+        setHistoryError(undefined);
+        const next = mergeAssetJobs(knownJobs.current, result.jobs ?? []);
         if (JSON.stringify(next) !== JSON.stringify(knownJobs.current)) {
           const outputsChanged = JSON.stringify(next.flatMap(job => job.libraryAssets ?? [])) !== JSON.stringify(knownJobs.current.flatMap(job => job.libraryAssets ?? []));
           knownJobs.current = next; setJobs(next);
           if (outputsChanged) refresh();
         }
-      } catch { if (!cancelled) setHistoryError('Could not load task history'); } finally { pending = false; if (!cancelled) setHistoryLoading(false); }
+      } catch {
+        if (!cancelled) setHistoryError('Could not load task history');
+      } finally {
+        pending = false;
+        if (!cancelled) setHistoryLoading(false);
+      }
     };
     void poll(); const timer = setInterval(() => void poll(), 2500); return () => { cancelled = true; clearInterval(timer); };
   }, [active, refresh, historyRetry]);
@@ -175,7 +167,6 @@ export function AssetsPage({ active, hasProject = false, studio, routeId, routeV
     assetReadRequest.current++;
     try {
       const { asset } = await assetRequest<{ asset: LibraryAsset }>({ action: 'update', assetId, changes });
-      // A completed write only reconciles its own asset, never a later selection.
       if (selectedAsset.current?.id === assetId && asset.updatedAt >= selectedAsset.current.updatedAt) {
         if (Boolean(asset.trashedAt) !== Boolean(selectedAsset.current.trashedAt)) closePreview();
         else {
@@ -231,11 +222,10 @@ export function AssetsPage({ active, hasProject = false, studio, routeId, routeV
   };
   const viewJob = (job: GenerationJob) => { if (job.libraryAssets?.[0]) void openReference(job.libraryAssets[0]); };
   const version = selected && assetVersion(selected, versionId);
-  const startDraft = (next: AssetDraft, nextMode: AssetTaskMode = 'direct') => {
+  const startDraft = (next: AssetDraft) => {
     setMobileView('create');
-    selectionRequest.current++; setSelectingTask(false); setDraft(next); setMode(nextMode);
-    if (nextMode === 'agent') setAgentReferences([]);
-    setTaskIds(current => ({ ...current, [nextMode]: undefined })); setTaskEpoch(value => value + 1); setCreating(true);
+    selectionRequest.current++; setSelectingTask(false); setDraft(next);
+    setTaskId(undefined); setTaskEpoch(value => value + 1); setCreating(true);
   };
   const edit = () => {
     if (!selected || !version) return;
@@ -250,24 +240,21 @@ export function AssetsPage({ active, hasProject = false, studio, routeId, routeV
   const selectTask = async (task: AssetTask) => {
     const request = ++selectionRequest.current; setSelectingTask(true);
     try {
-      let nextDraft = draft;
-      if (task.mode === 'direct') {
-        const job = task.jobs[0], referenceIds = job.library?.references ?? [];
-        const references = await Promise.all(referenceIds.map(async reference => {
-          const { asset } = await assetRequest<{ asset: LibraryAsset }>({ action: 'get', assetId: reference.assetId });
-          if (!assetVersion(asset, reference.versionId)) throw new Error(t('A referenced version is no longer available.'));
-          return { reference, name: asset.name };
-        }));
-        let target: AssetDraft['target'];
-        if (job.library?.parentVersionId && !job.library.createNew) {
-          const { asset } = await assetRequest<{ asset: LibraryAsset }>({ action: 'get', assetId: job.library.assetId });
-          if (!assetVersion(asset, job.library.parentVersionId)) throw new Error(t('A referenced version is no longer available.'));
-          target = { asset, versionId: job.library.parentVersionId };
-        }
-        nextDraft = { modality: job.modality, prompt: job.prompt, model: job.model.id, parameters: job.parameters, references, target };
+      const job = task.jobs[0], referenceIds = job.library?.references ?? [];
+      const references = await Promise.all(referenceIds.map(async reference => {
+        const { asset } = await assetRequest<{ asset: LibraryAsset }>({ action: 'get', assetId: reference.assetId });
+        if (!assetVersion(asset, reference.versionId)) throw new Error(t('A referenced version is no longer available.'));
+        return { reference, name: asset.name };
+      }));
+      let target: AssetDraft['target'];
+      if (job.library?.parentVersionId && !job.library.createNew) {
+        const { asset } = await assetRequest<{ asset: LibraryAsset }>({ action: 'get', assetId: job.library.assetId });
+        if (!assetVersion(asset, job.library.parentVersionId)) throw new Error(t('A referenced version is no longer available.'));
+        target = { asset, versionId: job.library.parentVersionId };
       }
+      const nextDraft: AssetDraft = { modality: job.modality, prompt: job.prompt, model: job.model.id, parameters: job.parameters, references, target };
       if (request !== selectionRequest.current) return;
-      setDraft(nextDraft); setMode(task.mode); if (task.mode === 'agent') setAgentReferences([]); setTaskIds(current => ({ ...current, [task.mode]: task.id }));
+      setDraft(nextDraft); setTaskId(task.id);
       setTaskEpoch(value => value + 1); setCreating(true); setMobileView('create');
     } catch (error) { if (request === selectionRequest.current) onError((error as Error).message); }
     finally { if (request === selectionRequest.current) setSelectingTask(false); }
@@ -276,11 +263,10 @@ export function AssetsPage({ active, hasProject = false, studio, routeId, routeV
   const studioEmpty = studio && (layout === 'canvas' && !hasGuide ? <StudioIdeas destination={studio.destination} onPrompt={applyPrompt} /> : <p className="om-muted">{t('No assets yet')}</p>);
   const history = { tasks, selectedKey, loading: historyLoading, error: historyError, onRetry: () => { setHistoryLoading(true); setHistoryRetry(value => value + 1); }, onSelect: (task: AssetTask) => { tracking.reportAssetsClick('asset_tasks', 'select_task', { task_mode: task.mode }); void selectTask(task); } };
   const taskMenu = <AssetTaskMenu {...history} disabled={selectingTask} />;
-  const composer = <AssetComposer studio={studioForm} key={taskEpoch} active={active} draft={draft} setDraft={setDraft} agentReferences={agentReferences} setAgentReferences={setAgentReferences} jobs={jobs} mode={mode} onMode={next => { if (next !== mode) tracking.reportAssetsClick('asset_create', 'mode_switch', { task_mode: next }); setMode(next); }} taskIds={taskIds} history={history} selectingTask={selectingTask}
-    onNew={() => startDraft(mode === 'agent' ? draft : { modality: draft.modality, prompt: '', references: [] }, mode)} onChatChanged={chatChanged}
-    onChatStarted={id => setTaskIds(current => ({ ...current, agent: id }))}
-    onCancel={cancelJob} onRetrySave={retrySave} onResume={resumeJob} onView={viewJob} onUploadReference={studioForm && !uploading ? () => referenceUpload.current?.click() : undefined} onReference={() => { tracking.reportAssetsClick('asset_create', 'add_reference', { task_mode: mode }); setPicking(true); }} onCreated={job => {
-      knownJobs.current = mergeAssetJobs(knownJobs.current, [job]); setJobs(knownJobs.current); setTaskIds(current => ({ ...current, direct: job.id }));
+  const composer = <AssetComposer studio={studioForm} key={taskEpoch} active={active} draft={draft} setDraft={setDraft} jobs={jobs} taskId={taskId} history={history} selectingTask={selectingTask}
+    onNew={() => startDraft({ modality: draft.modality, prompt: '', references: [] })}
+    onCancel={cancelJob} onRetrySave={retrySave} onResume={resumeJob} onView={viewJob} onUploadReference={studioForm && !uploading ? () => referenceUpload.current?.click() : undefined} onReference={() => { tracking.reportAssetsClick('asset_create', 'add_reference', { task_mode: 'direct' }); setPicking(true); }} onCreated={job => {
+      knownJobs.current = mergeAssetJobs(knownJobs.current, [job]); setJobs(knownJobs.current); setTaskId(job.id);
       refresh(); toast.showToast(t('Generation started. Track it in Tasks.'), 'info');
     }} onError={onError} onClose={() => { selectionRequest.current++; setSelectingTask(false); setCreating(false); }} />;
   return <div className="om-assets-page" data-scene-layout={layout} data-creating={creating} data-previewing={Boolean(selected)} data-mobile-view={mobileView}>
@@ -321,9 +307,10 @@ export function AssetsPage({ active, hasProject = false, studio, routeId, routeV
       });
     }} />
     <input ref={replace} type="file" accept={`${selected?.modality ?? 'image'}/*`} hidden onChange={e => { void importFiles(Array.from(e.target.files ?? []), true); e.target.value = ''; }} />
-    {active && picking && <AssetPicker imageOnly={Boolean(studioForm)} revision={revision} onClose={() => setPicking(false)} onPick={(reference, asset) => { const items = mode === 'agent' ? agentReferences : draft.references;
-      const references = [...items.filter(r => r.reference.assetId !== reference.assetId || r.reference.versionId !== reference.versionId), { reference, name: asset.name }];
-      if (mode === 'agent') setAgentReferences(references); else setDraft({ ...draft, references }); setPicking(false); }} />}
+    {active && picking && <AssetPicker imageOnly={Boolean(studioForm)} revision={revision} onClose={() => setPicking(false)} onPick={(reference, asset) => {
+      const references = [...draft.references.filter(r => r.reference.assetId !== reference.assetId || r.reference.versionId !== reference.versionId), { reference, name: asset.name }];
+      setDraft({ ...draft, references }); setPicking(false);
+    }} />}
     <StudioToastViewport {...toast} />
   </div>;
 }

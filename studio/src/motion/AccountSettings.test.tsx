@@ -2,69 +2,133 @@
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, expect, it, vi } from 'vitest';
-import type { AccountSummary } from '../../../shared/provider-directory';
 import { I18nProvider, type Locale } from '../i18n/I18n';
-import { AccountSettings } from './AccountSettings';
-import { GITHUB_REPOSITORY } from './githubRepository';
+import { AccountSettings, type CloudAccountSummary, type PersonalAccessTokenRecord } from './AccountSettings';
 
-const hooks = vi.hoisted(() => ({ account: undefined as unknown, request: vi.fn() }));
+const hooks = vi.hoisted(() => ({
+  summary: undefined as unknown,
+  tokens: [] as PersonalAccessTokenRecord[],
+  request: vi.fn(),
+}));
 vi.mock('./gatewayClient', () => ({ gatewayRequest: hooks.request }));
 vi.mock('./useProviderDirectory', () => ({ notifyProvidersChanged: vi.fn() }));
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 let root: Root | undefined;
-afterEach(() => { act(() => root?.unmount()); root = undefined; document.body.innerHTML = ''; vi.clearAllMocks(); });
+afterEach(() => {
+  act(() => root?.unmount());
+  root = undefined;
+  document.body.innerHTML = '';
+  vi.clearAllMocks();
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+});
 
-const activation = 'https://open-design.ai/activate?code=TEST-123';
-async function open(account: Partial<AccountSummary>, locale: Locale = 'en') {
-  hooks.account = { consoleUrl: 'https://open-design.ai/cloud', ...account };
-  hooks.request.mockImplementation(async () => hooks.account);
-  const container = document.createElement('div'); document.body.append(container); root = createRoot(container);
+async function open(account: Partial<CloudAccountSummary> & Record<string, unknown>, locale: Locale = 'en', tokens: PersonalAccessTokenRecord[] = []) {
+  hooks.summary = { consoleUrl: 'https://open-design.ai/cloud', ...account };
+  hooks.tokens = tokens;
+  hooks.request.mockImplementation(async (path: string, method = 'GET', body?: Record<string, unknown>) => {
+    if (path.startsWith('account/summary')) return hooks.summary;
+    if (path === 'tokens' && method === 'GET') return { tokens: hooks.tokens };
+    if (path === 'tokens' && method === 'POST') {
+      const created: PersonalAccessTokenRecord = {
+        id: 'pat-new',
+        name: String(body?.name ?? 'CI'),
+        tokenPrefix: 'om_pat_abcd',
+        scopes: (body?.scopes as string[]) ?? ['mcp:read'],
+        expiresAt: null,
+        lastUsedAt: null,
+        revokedAt: null,
+        createdAt: '2026-11-20T00:00:00.000Z',
+      };
+      hooks.tokens = [created, ...hooks.tokens];
+      return { token: 'om_pat_abcd_secret_once', record: created };
+    }
+    if (path.startsWith('tokens/') && method === 'DELETE') {
+      const id = path.slice('tokens/'.length);
+      hooks.tokens = hooks.tokens.filter(item => item.id !== id);
+      return { ok: true, id };
+    }
+    if (path === 'account/workspaces/switch' && method === 'POST') {
+      return { ok: true };
+    }
+    return hooks.summary;
+  });
+  const container = document.createElement('div');
+  document.body.append(container);
+  root = createRoot(container);
   await act(async () => root!.render(<I18nProvider initialLocale={locale}><AccountSettings openProviders={() => {}} /></I18nProvider>));
   return container;
 }
-const button = (container: HTMLElement, label: string) => [...container.querySelectorAll<HTMLElement>('.om-settings-actions .om-button')].find(item => item.textContent === label);
-const actions = (container: HTMLElement) => [...container.querySelectorAll('.om-settings-actions .om-button')].map(item => item.textContent);
 
-it('leaves the activation page to the browser and leads with the link only when the browser did not open', async () => {
-  let page = await open({ state: 'authorizing', authorizationUrl: activation, userCode: 'TEST-123', browserOpened: true });
-  expect(page.querySelector('[role=status]')?.textContent).toBe('Waiting for browser authorization…TEST-123');
-  const fallback = button(page, "Didn't open? Click here") as HTMLAnchorElement;
-  expect(fallback.href).toBe(activation); expect(fallback.hasAttribute('data-primary')).toBe(false);
-  expect(actions(page)).toEqual(["Didn't open? Click here", 'Cancel']);
-  act(() => root!.unmount()); document.body.innerHTML = '';
-  page = await open({ state: 'authorizing', authorizationUrl: activation, userCode: 'TEST-123', browserOpened: false });
-  expect(button(page, 'Continue in browser')?.hasAttribute('data-primary')).toBe(true);
-  expect(page.querySelectorAll(`a[href="${activation}"]`)).toHaveLength(1);
+const findButton = (container: HTMLElement, label: string) =>
+  [...container.querySelectorAll<HTMLButtonElement>('button')].find(item => item.textContent?.trim() === label);
+
+it('shows Local Dev Mode banner when AUTH_MODE=dev and hides OIDC sign-out', async () => {
+  const page = await open({
+    authenticated: true,
+    authMode: 'dev',
+    authMethod: 'dev_bypass',
+    user: { id: 'u1', email: 'dev@localhost', displayName: 'Local Developer' },
+    activeWorkspace: { id: 'ws-dev', slug: 'default', name: 'Local Workspace', role: 'owner' },
+    workspaces: [{ id: 'ws-dev', slug: 'default', name: 'Local Workspace', role: 'owner' }],
+  });
+  expect(page.querySelector('[data-dev-mode="true"]')?.textContent).toContain('AUTH_MODE=dev');
+  expect(page.textContent).toContain('Local Dev Mode');
+  expect(findButton(page, 'Sign out')).toBeUndefined();
 });
 
-it('says it is connecting until the link exists, then syncing with nothing left to click', async () => {
-  let page = await open({ state: 'authorizing' }, 'zh-CN');
-  expect(page.querySelector('[role=status]')?.textContent).toBe('正在连接 OpenDesign，请稍候…');
-  expect(page.textContent).not.toMatch(/组件|下载/);
-  expect(actions(page)).toEqual(['取消']);
-  act(() => root!.unmount()); document.body.innerHTML = '';
-  page = await open({ state: 'authorizing', syncing: true, browserOpened: true }, 'zh-CN');
-  expect(page.querySelector('[role=status]')?.textContent).toBe('已授权，正在同步账户信息…');
-  expect(page.querySelector('.om-account-summary h2')?.textContent).toBe('正在完成登录');
-  expect(actions(page)).toEqual(['取消']); expect((button(page, '取消') as HTMLButtonElement).disabled).toBe(true);
+it('switches workspaces and signs out cleanly in OIDC mode', async () => {
+  const fetchSpy = vi.fn(async () => {
+    hooks.summary = { authenticated: false, authMode: 'oidc', consoleUrl: 'https://open-design.ai/cloud' };
+    return Response.json({ ok: true });
+  });
+  vi.stubGlobal('fetch', fetchSpy);
+  const page = await open({
+    authenticated: true,
+    authMode: 'oidc',
+    authMethod: 'session_cookie',
+    user: { id: 'u1', email: 'ada@example.test', displayName: 'Ada' },
+    activeWorkspace: { id: 'ws-1', slug: 'studio-a', name: 'Studio A', role: 'owner' },
+    workspaces: [
+      { id: 'ws-1', slug: 'studio-a', name: 'Studio A', role: 'owner' },
+      { id: 'ws-2', slug: 'studio-b', name: 'Studio B', role: 'editor' },
+    ],
+    billing: { plan: 'pro', mediaEntitlement: 'included', balanceUsd: 12 },
+  });
+  expect(page.textContent).toContain('Studio A');
+  expect(page.textContent).toContain('Studio B');
+  await act(async () => findButton(page, 'Switch workspace')!.click());
+  expect(hooks.request).toHaveBeenCalledWith('account/workspaces/switch', 'POST', { workspaceId: 'ws-2' });
+  await act(async () => findButton(page, 'Sign out')!.click());
+  expect(fetchSpy).toHaveBeenCalledWith('/auth/logout', expect.objectContaining({ method: 'POST' }));
+  expect(page.querySelector('.om-plan-guide')).not.toBeNull();
 });
 
-it('offers a retry after a connection failure, and sign-in again with a feedback link after rejected credentials', async () => {
-  let page = await open({ state: 'signed-out', errorCode: 'setup_failed', error: "Can't connect to OpenDesign right now. Check your network and try again." });
-  expect(actions(page)).toEqual(['Retry']); expect(page.querySelector('[role=alert]')?.textContent).toContain("Can't connect to OpenDesign");
-  await act(async () => button(page, 'Retry')!.click());
-  expect(hooks.request).toHaveBeenCalledWith('settings/account/login', 'POST', {});
-  act(() => root!.unmount()); document.body.innerHTML = '';
-  page = await open({ state: 'signed-out', errorCode: 'credentials_rejected', error: 'Account credentials could not be verified. Sign in again, and contact us if this keeps happening.' });
-  expect(actions(page)).toEqual(['Sign in again', 'Report an issue']);
-  expect((button(page, 'Report an issue') as HTMLAnchorElement).href).toBe(`${GITHUB_REPOSITORY}/issues/new/choose`);
-  act(() => root!.unmount()); document.body.innerHTML = '';
-  page = await open({ state: 'signed-out', errorCode: 'authorization_expired', error: 'Browser authorization expired or was cancelled. Sign in again.' });
-  expect(actions(page)).toEqual(['Sign in again']);
+it('creates, copies once, and revokes Personal Access Tokens (PAT)', async () => {
+  const copy = vi.fn(async () => {});
+  Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: copy } });
+  const page = await open({
+    authenticated: true,
+    authMode: 'oidc',
+    authMethod: 'session_cookie',
+    user: { id: 'u1', email: 'ada@example.test', displayName: 'Ada' },
+  });
+  const input = page.querySelector<HTMLInputElement>('input[aria-label="Token name"]')!;
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(input, 'Cursor Laptop');
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+  await act(async () => page.querySelector('form')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })));
+  expect(hooks.request).toHaveBeenCalledWith('tokens', 'POST', expect.objectContaining({ name: 'Cursor Laptop' }));
+  expect(page.querySelector('[data-pat-created="true"]')?.textContent).toContain('om_pat_abcd_secret_once');
+  await act(async () => findButton(page, 'Copy token')!.click());
+  expect(copy).toHaveBeenCalledWith('om_pat_abcd_secret_once');
+  await act(async () => findButton(page, 'Revoke')!.click());
+  expect(hooks.request).toHaveBeenCalledWith('tokens/pat-new', 'DELETE');
 });
 
 it('shows the account email once, under the name only when the account has a different one', async () => {
-  const identity = async (user: AccountSummary['user']) => {
+  const identity = async (user: CloudAccountSummary['user']) => {
     const page = await open({ state: 'signed-in', user, plan: 'pro', balance: '1.00' });
     const result = [page.querySelector('.om-account-identity h1')?.textContent, page.querySelector('.om-account-identity p')?.textContent];
     act(() => root!.unmount()); document.body.innerHTML = '';
@@ -82,7 +146,7 @@ it('explains that account models still work when the plan and balance cannot be 
 
 it('passes a fresh subscription entry on ordinary and middle clicks without account credentials', async () => {
   const page = await open({ state: 'signed-in', user: { email: 'ada@example.test' }, plan: 'plus', balance: '12.00' });
-  const link = page.querySelector<HTMLAnchorElement>('.om-settings-section a')!;
+  const link = [...page.querySelectorAll<HTMLAnchorElement>('a')].find(a => a.textContent?.includes('Manage subscription'))!;
   link.addEventListener('click', event => event.preventDefault());
   link.addEventListener('auxclick', event => event.preventDefault());
   const ids = new Set<string>();
@@ -119,7 +183,7 @@ it('replaces missing billing metrics with a dashboard link on 403 and restores t
   expect(url.origin + url.pathname).toBe('https://open-design.ai/cloud/dashboard');
   expect(url.searchParams.get('billing')).toBe('plan');
   expect(url.searchParams.get('od_origin')).toBe('openmotion');
-  hooks.account = { state: 'signed-in', plan: 'pro', balance: '0.00', consoleUrl: 'https://open-design.ai/cloud' };
+  hooks.summary = { state: 'signed-in', plan: 'pro', balance: '0.00', consoleUrl: 'https://open-design.ai/cloud' };
   await act(async () => page.querySelector<HTMLButtonElement>('button[aria-busy]')!.click());
   expect(page.querySelector('.om-account-metrics')?.textContent).toContain('$0.00');
   expect(page.textContent).not.toContain('账单服务拒绝了本次查询');
@@ -131,7 +195,6 @@ it('shows what signing in unlocks to signed-out people', async () => {
   expect(page.querySelector('.om-plan-guide .om-badge')?.textContent).toBe('Plus 及以上');
   expect(page.querySelector('.om-plan-guide .om-button')?.textContent).toBe('使用 OpenDesign 登录');
   expect([...page.querySelectorAll('.om-account-capabilities li')].map(item => item.textContent)).toEqual(['图片', '视频', '配音', '音乐']);
-  expect(page.querySelector('.om-plan-guide p')?.textContent).toBe('登录后升级到 Plus，即可在 OpenMotion 里直接生成图片、视频、配音和音乐，不用配置 API 密钥。');
   expect(page.querySelector('[data-guide="upgrade"]')).toBeNull();
 });
 
@@ -143,7 +206,6 @@ it('offers Free and Go accounts an upgrade through the registered entry source, 
     expect(new URL(upgrade.href).searchParams.get('od_entry_source')).toBe('openmotion_manage_subscription');
     expect(upgrade.textContent).toContain('Upgrade to Plus');
     expect(new URL(manage.href).searchParams.get('od_entry_source')).toBe('openmotion_manage_subscription');
-    expect(page.querySelector('.om-settings-section a')).toBeNull();
     expect(page.querySelector('.om-account-summary h2')?.textContent).toBe('Connected to OpenDesign');
   }
   const paid = await open({ state: 'signed-in', user: { email: 'ada@example.test' }, plan: 'plus', balance: '12.00' });

@@ -13,6 +13,7 @@ import { useToast } from '../../hooks/useToast';
 import { useI18n } from '../../i18n/I18n';
 import { scenesForStudio } from '../../motion/creativeStudios';
 import { useIntegrationInfo } from '../../motion/useIntegrationInfo';
+import { isDeferredP2Error } from '../../motion/p2Deferred';
 import { BrandKitPicker, type SelectedBrandKit } from '../BrandKitPicker';
 import { designClient } from '../designClient';
 import { DesignProjectList } from '../DesignProjectList';
@@ -59,6 +60,7 @@ export function DesignScenePage({
   const [templates, setTemplates] = useState<DesignTemplateSummary[]>([]);
   const [templateQuery, setTemplateQuery] = useState('');
   const [templatesLoading, setTemplatesLoading] = useState(false);
+  const [deferred, setDeferred] = useState(false);
   const [creating, setCreating] = useState(false);
   const [remixingId, setRemixingId] = useState<string | null>(null);
   const [manualPrompt, setManualPrompt] = useState<string | null>(null);
@@ -89,8 +91,13 @@ export function DesignScenePage({
     let cancelled = false;
     setTemplatesLoading(true);
     designClient.listTemplates({ scenario: scenario.id, q: templateQuery.trim() || undefined, limit: 24 })
-      .then(res => { if (!cancelled && Array.isArray(res?.items)) setTemplates(res.items); })
-      .catch(() => { if (!cancelled) setTemplates([]); })
+      .then(res => { if (!cancelled && Array.isArray(res?.items)) { setDeferred(false); setTemplates(res.items); } })
+      .catch(err => {
+        if (!cancelled) {
+          if (isDeferredP2Error(err)) setDeferred(true);
+          setTemplates([]);
+        }
+      })
       .finally(() => { if (!cancelled) setTemplatesLoading(false); });
     return () => { cancelled = true; };
   }, [scenario?.id, templateQuery]);
@@ -237,7 +244,12 @@ export function DesignScenePage({
       });
       onOpenProject(project.id);
     } catch (err) {
-      showToast(err instanceof Error ? err.message : t('Could not create project'), 'error', 'feedback');
+      if (isDeferredP2Error(err)) {
+        setDeferred(true);
+        showToast(t('Design Studio is coming in Phase 2.'), 'info', 'feedback');
+      } else {
+        showToast(err instanceof Error ? err.message : t('Could not create project'), 'error', 'feedback');
+      }
     } finally {
       setCreating(false);
     }
@@ -253,7 +265,12 @@ export function DesignScenePage({
       });
       onOpenProject(project.id);
     } catch (err) {
-      showToast(err instanceof Error ? err.message : t('Could not remix template'), 'error', 'feedback');
+      if (isDeferredP2Error(err)) {
+        setDeferred(true);
+        showToast(t('Design Studio is coming in Phase 2.'), 'info', 'feedback');
+      } else {
+        showToast(err instanceof Error ? err.message : t('Could not remix template'), 'error', 'feedback');
+      }
     } finally {
       setRemixingId(null);
     }
@@ -380,6 +397,14 @@ export function DesignScenePage({
 
                 {templatesLoading ? (
                   <div className="om-design-muted">{t('Loading templates…')}</div>
+                ) : deferred ? (
+                  <div className="om-design-item-card" role="status" data-deferred-p2="true" style={{ padding: 24, alignItems: 'center', textAlign: 'center', gap: 8 }}>
+                    <RemixIcon name="time-line" size={22} />
+                    <strong>{t('Design Studio is coming in Phase 2')}</strong>
+                    <p className="om-design-muted" style={{ margin: 0, maxWidth: 460 }}>
+                      {t('Cloud HTML Design Studio templates and project creation are scheduled for Phase 2.')}
+                    </p>
+                  </div>
                 ) : templates.length === 0 ? (
                   <div className="om-design-muted">{t('No matching templates.')}</div>
                 ) : (

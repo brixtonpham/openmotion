@@ -401,7 +401,13 @@ Configuration snippet:
 \`\`\`${host === 'deepseek' ? 'yaml' : host === 'codex' ? 'toml' : 'json'}
 ${configSnippet}\`\`\`
 
-Authenticate using OAuth 2.1 discovery or a workspace Personal Access Token in the \`Authorization: Bearer <token>\` header. Browser session cookies are never accepted on \`/mcp\`.
+Authenticate using OAuth 2.1 discovery (\`${info.transport.auth.resourceMetadataUrl ?? info.previewUrl + '/.well-known/oauth-protected-resource/mcp'}\`) or a workspace Personal Access Token in the \`Authorization: Bearer <token>\` header. Browser session cookies are never accepted on \`/mcp\`.
+
+## API Discovery
+
+\`\`\`sh
+${apiDiscoveryCommand(info)}
+\`\`\`
 
 ## Tools
 
@@ -409,8 +415,16 @@ ${info.tools.map(tool => `- ${tool.name}: ${tool.description}`).join('\n')}
 
 ## Cloud Asset Import & Unified OpenDesign Model Gateway
 
-- Use \`openmotion_import_assets\` with \`action=prepare_upload\` + \`upload_ticket\`, SSRF-checked public HTTPS \`url\`, or zero-copy \`library_asset\` (\`assetId\` + \`versionId\`). Local host paths (\`sourcePath\`) are unsupported in cloud mode.
-- Media generation routes through the unified OpenDesign Model Gateway (no BYOK API keys required in workspace settings).
+- Use \`openmotion_import_assets\` in one of three cloud modes: (1) presigned upload (\`action=prepare_upload\` + \`upload_ticket\`), (2) SSRF-checked public HTTPS \`url\`, or (3) zero-copy workspace \`library_asset\` (\`assetId\` + \`versionId\`). Local host paths (\`sourcePath\`) are unsupported in cloud mode.
+- For NEW generated media, use \`openmotion_media_use\` (\`inspect\` / \`reference\` / \`models\` / \`schema\`) to discover the unified OpenDesign Model Gateway, then \`openmotion_assets_use generate\` with the full model ID, \`status\` / \`cancel\` / \`resume\` with the original \`jobId\` and a stable \`requestId\`, and \`import_to_project\` for chosen versions. Media generation is provisioned through OpenDesign without BYOK API keys in workspace settings.
+- Explicit guide-example continuation is a separate, user-selected scope from recreating a reference. ${templateGuideContinuationInstruction}
+
+## Phase 1 Active vs Phase 2 Planned
+
+- **Phase 1 Active**: Projects, versions, revision-checked HTML/CSS/JS edits, S3 CAS assets & 3-way cloud import, templates, skills, unified OpenDesign media generation, and remote-worker MP4 exports.
+- **Phase 2 Planned (\`501 FEATURE_DEFERRED_P2\`)**: Cloud HTML Design Studio (\`openmotion_design_*\`), automated Brand Kit website capture, cloud ASR transcription jobs (manual captions & SRT/VTT import work in P1), and frame-anchored review comments.
+
+${reviewCommentsPrompt({ dataDirectory: info.dataDirectory, previewUrl: info.previewUrl })}
 
 ${workflowEntryGuide}
 `;

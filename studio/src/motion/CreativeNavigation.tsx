@@ -7,7 +7,7 @@ import { Popover } from '../components/ui/Popover';
 import { useI18n } from '../i18n/I18n';
 import { RemixIcon } from '../icons/RemixIcons';
 import { creativeStudios, studioIconTone, mediaLabels, sceneDestination, studioScenes, supportsScene, type StudioDestination } from './creativeStudios';
-import { mcpClients, supportsLocalConnection, type McpClient } from './mcpClients';
+import { mcpClients, type McpClient } from './mcpClients';
 import { useMediaCatalog } from './useMediaCatalog';
 import { Tooltip } from '../components/ui/Tooltip';
 import { ModelAvatar } from './settingsPrimitives';
@@ -173,7 +173,7 @@ export function CreativeNavigation({ specialty, onChooseStudio, destination, mot
             {id === 'mcp' ? <>
               <h2 lang="en">{menuLabel}</h2>
               <div className="om-mcp-client-grid">
-                {mcpClients.filter(supportsLocalConnection).map(client => <Button variant="plain" className="om-nav-item" key={client.id} onClick={() => { track('select_client', { ...where, client: client.id }); choose(() => onOpenPage('mcp', client.id)); }}>
+                {mcpClients.map(client => <Button variant="plain" className="om-nav-item" key={client.id} onClick={() => { track('select_client', { ...where, client: client.id }); choose(() => onOpenPage('mcp', client.id)); }}>
                   <McpClientAvatar client={client} /><span>{t(client.name)}</span>
                 </Button>)}
               </div>

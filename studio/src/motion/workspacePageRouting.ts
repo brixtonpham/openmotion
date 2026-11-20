@@ -8,7 +8,7 @@ import { exploreCommunities, findLandingScene, findMediaStudio, findTechniqueStu
 import { sceneDestination, studioDestination, type StudioDestination } from './creativeStudios';
 
 /** Application pages live in the query; the project hash belongs to the editor. */
-export const settingsSections = ['account', 'subscription', 'providers', 'models', 'local', 'general', 'appearance', 'privacy', 'about', 'help', 'mcp', 'brand-kit'] as const;
+export const settingsSections = ['account', 'subscription', 'providers', 'models', 'general', 'appearance', 'privacy', 'about', 'help', 'mcp', 'brand-kit'] as const;
 export type SettingsSection = typeof settingsSections[number];
 export type ExploreFilters = { community: ExploreCommunity['id'] | null; medium: StudioScene['modality'] | null };
 export { findTemplateCollection, type TemplateCollection } from './templateCollections';

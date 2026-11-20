@@ -15,8 +15,19 @@ export type ProjectCatalog = { activeId: string; projects: SavedProject[]; sessi
 export async function motionApi<T>(path: string, init?: RequestInit, projectId?: string): Promise<T> {
   const response = await diagnosticFetch((path.startsWith('/sessions') || path.startsWith('/modes') ? '/design-api' : '/motion-api') + path
     + (projectId ? (path.includes('?') ? '&' : '?') + 'projectId=' + encodeURIComponent(projectId) : ''), init);
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.error || '本地工作室连接失败');
+  let data: Record<string, unknown> = {};
+  try {
+    data = (await response.json()) as Record<string, unknown>;
+  } catch {
+    // Non-JSON error body.
+  }
+  if (!response.ok) {
+    const message = typeof data.error === 'string' ? data.error : 'Workspace connection failed';
+    const error = new Error(message) as Error & { status?: number; code?: string };
+    error.status = response.status;
+    if (typeof data.code === 'string') error.code = data.code;
+    throw error;
+  }
   return data as T;
 }
 export function navigateWorkspace(url: string, replace = false) {
