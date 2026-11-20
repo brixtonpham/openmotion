@@ -18,7 +18,9 @@ import { infoInMemory, timelineInMemory } from '../engine/inspect.ts';
 import { lintProjectInMemory } from '../engine/lint-project.ts';
 import { getMimeType } from '../etag.ts';
 
-const SAFE_VENDOR_PATH_RE = /^[a-zA-Z0-9._/-]{1,200}$/;
+const SAFE_VENDOR_PATH_RE = /^[a-zA-Z0-9._/@-]{1,200}$/;
+const VERSIONED_GSAP_PREFIX_RE = /^gsap@[a-zA-Z0-9._-]+\/(?:dist\/)?/;
+const SAFE_GSAP_ASSET_FILE_RE = /^[a-zA-Z0-9._-]+\.(?:js|mjs|cjs|map)$/;
 
 type StoredSelection = SelectionEvent & { selection?: unknown };
 
@@ -62,7 +64,11 @@ export function createStudioSystemRoutes(deps: StudioSystemRouteDeps): Hono<{ Va
     try {
       if (cleaned.startsWith('gsap/')) {
         const gsapRoot = path.dirname(req.resolve('gsap/package.json'));
-        const fileName = cleaned.slice('gsap/'.length);
+        const rawFileName = cleaned.slice('gsap/'.length);
+        const fileName = rawFileName.replace(VERSIONED_GSAP_PREFIX_RE, '');
+        if (!SAFE_GSAP_ASSET_FILE_RE.test(fileName) || fileName.includes('..')) {
+          return null;
+        }
         const candidates = [
           path.resolve(gsapRoot, 'dist', fileName),
           path.resolve(gsapRoot, fileName),

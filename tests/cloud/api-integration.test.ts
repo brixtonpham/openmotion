@@ -1351,8 +1351,19 @@ describe('Cloud API Entrypoint — Static Assets, Read-Only GSAP & API 404 vs SP
     assert.equal(gsapRes.status, 200);
     assert.match(gsapRes.headers.get('content-type') ?? '', /javascript/);
 
+    const gsapVersionedPluginRes = await app.request(
+      '/api/vendor/gsap/gsap@3.15.0/dist/MotionPathPlugin.min.js',
+    );
+    assert.equal(gsapVersionedPluginRes.status, 200);
+    assert.match(gsapVersionedPluginRes.headers.get('content-type') ?? '', /javascript/);
+
     const gsapTraversal = await app.request('/api/vendor/gsap/%2e%2e/%2e%2e/package.json');
     assert.ok(gsapTraversal.status === 400 || gsapTraversal.status === 404);
+
+    const gsapVersionedTraversal = await app.request(
+      '/api/vendor/gsap/gsap@3.15.0/dist/%2e%2e/%2e%2e/package.json',
+    );
+    assert.ok(gsapVersionedTraversal.status === 400 || gsapVersionedTraversal.status === 404);
 
     const hfConfigRes = await app.request('/__hyperframes_config');
     assert.equal(hfConfigRes.status, 200);
@@ -1954,6 +1965,7 @@ describe('Cloud API Entrypoint — Unified Config & Cookie-less Preview Subdomai
     for (const allowedPath of [
       '/api/runtime.js',
       '/api/vendor/gsap/gsap.min.js',
+      '/api/vendor/gsap/gsap@3.15.0/dist/MotionPathPlugin.min.js',
       '/api/fonts',
       '/api/health/live',
     ]) {
