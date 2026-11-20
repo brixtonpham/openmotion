@@ -79,6 +79,14 @@
 [data-motion-studio] .om-subtitle { margin: 0; font-size: var(--motion-text-body); font-weight: var(--motion-weight-semibold); color: var(--motion-strong); }
 [data-motion-studio] .om-navigation-title { margin: 0; font-size: var(--motion-text-body); font-weight: var(--motion-weight-semibold); color: var(--motion-strong); }
 [data-motion-studio] .om-product-brand { width: 165px; height: 28px; margin: 0; background: var(--motion-strong); mask: url('../brand/openmotion-logo.svg') center / contain no-repeat; }
+[data-motion-studio] .om-opendesign-mark {
+  display: inline-block;
+  flex: none;
+  width: var(--motion-space-16);
+  height: var(--motion-space-16);
+  background-color: currentColor;
+  mask: url('../providers/opendesign.svg') center / contain no-repeat;
+}
 [data-motion-studio] .om-code-block { margin: 0; padding: var(--motion-space-16); background: var(--motion-panel); border: 1px solid var(--motion-border-subtle); border-radius: var(--motion-radius-md); font-family: var(--motion-font-mono); font-size: var(--motion-text-sm); line-height: var(--motion-leading-prose); white-space: pre-wrap; overflow-wrap: anywhere; }
 [data-motion-studio] .om-eyebrow { color: var(--motion-dim); font-size: var(--motion-text-xs); font-weight: var(--motion-weight-medium); }
 [data-motion-studio] .om-avatar { display: inline-grid; place-items: center; flex-shrink: 0; width: var(--motion-space-32); height: var(--motion-space-32); background: var(--motion-inset); color: var(--motion-strong); border: 1px solid var(--motion-border); border-radius: var(--motion-radius-lg); font-size: var(--motion-text-body); font-weight: var(--motion-weight-semibold); }

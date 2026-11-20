@@ -3,7 +3,6 @@ import { IconButton } from 'open-design-ui/icon-button';
 import * as tracking from './pageTracking';
 import { Tooltip } from "../components/ui/Tooltip";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
-import { designSystemAsset, providerIcons } from '../../../packages/design-system/index.js';
 import type { AccountSummary } from '../../../shared/provider-directory';
 import { RemixIcon } from '../icons/RemixIcons';
 import { useI18n } from '../i18n/I18n';
@@ -160,7 +159,7 @@ export function AccountStatus({ account, busy, action, showToast }: { account: A
   const retry = failure === 'setup_failed' || failure === 'connector_unavailable';
   const signInIcon = expired || failure
     ? <RemixIcon name={retry ? 'refresh-line' : 'login-box-line'} size={17} />
-    : <img src={designSystemAsset(providerIcons.opendesign.file)} width={17} height={17} alt="" />;
+    : <span className="om-opendesign-mark" aria-hidden="true" />;
   const signIn = <Button variant="ghost" className="om-button h-auto" data-primary disabled={busy} onClick={() => void action('login')}>{signInIcon}{t(retry ? 'Retry' : expired || failure ? 'Sign in again' : 'Sign in with OpenDesign')}</Button>;
   // When the service cannot install the sign-in component itself, this command installs it where the service looks,
   // independent of the terminal's PATH; Retry then finds it without a restart.
