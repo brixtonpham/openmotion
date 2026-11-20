@@ -51,6 +51,14 @@ import {
   type AuthMiddlewareDeps,
   type AuthStore,
 } from '../auth/index.ts';
+import {
+  PREVIEW_TOKEN_QUERY_PARAM,
+  buildPreviewAuthContext,
+  extractPreviewToken,
+  resolvePreviewTokenSecret,
+  signPreviewToken,
+  verifyPreviewToken,
+} from '../auth/preview-token.ts';
 import { hasMinRole, hasScope, type AuthContext } from '../contracts/auth.ts';
 import { CloudError, featureDeferredP2, isCloudError } from '../contracts/errors.ts';
 import type { StoragePort } from '../contracts/storage.ts';
@@ -68,7 +76,7 @@ import {
   createRedisClient,
 } from '../infra/redis.ts';
 import { ShutdownCoordinator } from '../infra/shutdown.ts';
-import { StorageService } from '../infra/storage.ts';
+import { StorageService, resolveCorsAllowedOrigins } from '../infra/storage.ts';
 import {
   CloudImportAssetsService,
   InMemoryMcpSessionStore,
@@ -105,6 +113,7 @@ import { WorkRoundsService } from '../services/work-rounds-service.ts';
 import { WorkspaceService } from '../services/workspace-service.ts';
 import {
   createDisklessStudioApp,
+  type DisklessStudioDeps,
   type StudioEventBusPort,
   type StudioQueuesPort,
 } from '../studio/index.ts';
@@ -112,6 +121,81 @@ import {
 const DEFAULT_RUNTIME_ROOT = fileURLToPath(new URL('../../', import.meta.url));
 const MAX_ACTIVE_MEDIA_GENERATIONS = 20;
 const WELCOME_CACHE_LIMIT = 10_000;
+const PREVIEW_PROJECT_PATH_RE = /^\/api\/projects\/([^/]+)\/preview(?:\/.*)?$/;
+const PREVIEW_FONT_VIEWER_ID = '00000000-0000-4000-8000-000000000000';
+
+export function resolveApiCorsAllowedOrigins(
+  config: Pick<AppConfig, 'APP_PUBLIC_ORIGIN' | 'PREVIEW_PUBLIC_ORIGIN'>,
+): string[] {
+  return resolveCorsAllowedOrigins(
+    config.APP_PUBLIC_ORIGIN,
+    config.PREVIEW_PUBLIC_ORIGIN ? [config.PREVIEW_PUBLIC_ORIGIN] : [],
+  );
+}
+
+function resolveIncomingRequestHost(request: Request, trustProxyHops: number): string {
+  if (trustProxyHops > 0) {
+    const forwardedHost = request.headers.get('x-forwarded-host');
+    if (forwardedHost) {
+      const first = forwardedHost.split(',')[0]?.trim().toLowerCase();
+      if (first) return first;
+    }
+  }
+  const hostHeader = request.headers.get('host')?.trim().toLowerCase();
+  if (hostHeader) return hostHeader;
+  try {
+    return new URL(request.url).host.toLowerCase();
+  } catch {
+    return '';
+  }
+}
+
+function normalizeHostForOrigin(rawHost: string, expectedOrigin: URL): string {
+  const lower = rawHost.trim().toLowerCase();
+  if (expectedOrigin.protocol === 'https:' && lower.endsWith(':443')) {
+    return lower.slice(0, -4);
+  }
+  if (expectedOrigin.protocol === 'http:' && lower.endsWith(':80')) {
+    return lower.slice(0, -3);
+  }
+  return lower;
+}
+
+function applyIsolatedPreviewHeaders(
+  response: Response,
+  appOrigin: string,
+  allowedCorsOrigins: ReadonlySet<string>,
+  requestOrigin: string | null,
+): Response {
+  const apply = (headers: Headers): void => {
+    headers.set('Content-Security-Policy', `frame-ancestors 'self' ${appOrigin};`);
+    headers.set('Referrer-Policy', 'no-referrer');
+    headers.set('X-Content-Type-Options', 'nosniff');
+    headers.delete('Set-Cookie');
+    if (requestOrigin && allowedCorsOrigins.has(requestOrigin)) {
+      headers.set('Access-Control-Allow-Origin', requestOrigin);
+      const existingVary = headers.get('Vary');
+      if (!existingVary) {
+        headers.set('Vary', 'Origin');
+      } else if (!existingVary.toLowerCase().includes('origin')) {
+        headers.set('Vary', `${existingVary}, Origin`);
+      }
+    }
+  };
+
+  try {
+    apply(response.headers);
+    return response;
+  } catch {
+    const clonedHeaders = new Headers(response.headers);
+    apply(clonedHeaders);
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: clonedHeaders,
+    });
+  }
+}
 
 const STATIC_MIME_TYPES: Readonly<Record<string, string>> = {
   '.html': 'text/html; charset=utf-8',
@@ -1705,12 +1789,14 @@ export function createApiApp(deps: CreateApiAppDeps): { app: Hono<AuthEnv>; serv
     storage,
     hotTextCache: deps.hotTextCache,
     eventBus,
+    historyCoalesceWindowMs: config.HISTORY_COALESCE_WINDOW_MS,
   });
   const history = new VersionHistoryService({
     db,
     storage,
     hotTextCache: deps.hotTextCache,
     eventBus,
+    historyCoalesceWindowMs: config.HISTORY_COALESCE_WINDOW_MS,
   });
   const workspace = new WorkspaceService({
     db,
@@ -1823,7 +1909,21 @@ export function createApiApp(deps: CreateApiAppDeps): { app: Hono<AuthEnv>; serv
     }
   };
 
+  const appOriginUrl = new URL(config.APP_PUBLIC_ORIGIN);
+  const previewOriginUrl = config.PREVIEW_PUBLIC_ORIGIN ? new URL(config.PREVIEW_PUBLIC_ORIGIN) : null;
+  const previewHostIsolationEnabled = Boolean(
+    previewOriginUrl && previewOriginUrl.host.toLowerCase() !== appOriginUrl.host.toLowerCase(),
+  );
+  const corsAllowedOrigins = resolveApiCorsAllowedOrigins(config);
+  const corsAllowedOriginSet = new Set(corsAllowedOrigins);
+  const previewTokenSecret = resolvePreviewTokenSecret(config);
+  const previewHostRequests = new WeakSet<Request>();
+
   const authWithWelcome = async (c: Context<AuthEnv>, next: () => Promise<void>) => {
+    if (previewHostRequests.has(c.req.raw)) {
+      await next();
+      return;
+    }
     let ranNext = false;
     const response = await authMiddleware(c, async () => {
       const auth = c.get('auth');
@@ -1836,6 +1936,14 @@ export function createApiApp(deps: CreateApiAppDeps): { app: Hono<AuthEnv>; serv
     if (!ranNext && response) return response;
   };
 
+  const fontsAuthMiddleware = async (c: Context<AuthEnv>, next: () => Promise<void>) => {
+    if (previewHostRequests.has(c.req.raw)) {
+      await next();
+      return;
+    }
+    return authMiddleware(c, next);
+  };
+
   const app = new Hono<AuthEnv>();
 
   app.onError((error, c) => {
@@ -1844,6 +1952,119 @@ export function createApiApp(deps: CreateApiAppDeps): { app: Hono<AuthEnv>; serv
     }
     logger.error('Unhandled API error', { error, method: c.req.method, path: c.req.path });
     return c.json({ code: 'INTERNAL_ERROR', error: 'Internal server error' }, 500);
+  });
+
+  // -------------------------------------------------------------------------
+  // 0. Cookie-less Preview Subdomain Isolation Middleware (c5)
+  //    Active whenever PREVIEW_PUBLIC_ORIGIN is configured on a distinct host.
+  //    Never reads or sets session cookies; blocks all API/Auth/MCP/mutating routes.
+  // -------------------------------------------------------------------------
+  app.use('*', async (c, next) => {
+    if (!previewHostIsolationEnabled || !previewOriginUrl) {
+      await next();
+      return;
+    }
+
+    const incomingHost = resolveIncomingRequestHost(c.req.raw, config.TRUST_PROXY_HOPS);
+    if (normalizeHostForOrigin(incomingHost, previewOriginUrl) !== previewOriginUrl.host.toLowerCase()) {
+      await next();
+      return;
+    }
+
+    const requestOrigin = c.req.header('origin')?.trim() || null;
+    const method = c.req.method.toUpperCase();
+    const pathname = new URL(c.req.url).pathname;
+
+    const rejectIsolated = (message: string) =>
+      applyIsolatedPreviewHeaders(
+        c.json({ code: 'PREVIEW_ORIGIN_ISOLATED', error: message, applied: false }, 403),
+        appOriginUrl.origin,
+        corsAllowedOriginSet,
+        requestOrigin,
+      );
+
+    if (method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS') {
+      return rejectIsolated(`Method ${method} is blocked on the isolated preview origin.`);
+    }
+
+    const isPublicPreviewAsset =
+      pathname === '/api/health/live' ||
+      pathname === '/api/runtime.js' ||
+      pathname.startsWith('/api/vendor/gsap/');
+    const isReadOnlyFontAsset = pathname === '/api/fonts' || pathname.startsWith('/api/fonts/');
+    const projectPreviewMatch = PREVIEW_PROJECT_PATH_RE.exec(pathname);
+
+    if (!isPublicPreviewAsset && !isReadOnlyFontAsset && !projectPreviewMatch) {
+      return rejectIsolated(`Route ${pathname} is blocked on the isolated preview origin.`);
+    }
+
+    if (method === 'OPTIONS') {
+      return applyIsolatedPreviewHeaders(
+        new Response(null, {
+          status: 204,
+          headers: {
+            'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
+            'Access-Control-Allow-Headers': 'X-OpenMotion-Preview-Token, Range, If-None-Match',
+            'Access-Control-Max-Age': '600',
+          },
+        }),
+        appOriginUrl.origin,
+        corsAllowedOriginSet,
+        requestOrigin,
+      );
+    }
+
+    if (projectPreviewMatch) {
+      let projectId: string;
+      try {
+        projectId = decodeURIComponent(projectPreviewMatch[1]);
+      } catch {
+        return applyIsolatedPreviewHeaders(
+          c.json({ code: 'INVALID_PATH', error: 'Malformed projectId in preview path.', applied: false }, 400),
+          appOriginUrl.origin,
+          corsAllowedOriginSet,
+          requestOrigin,
+        );
+      }
+
+      const rawPreviewToken = extractPreviewToken(c.req.raw);
+      const verified = rawPreviewToken
+        ? verifyPreviewToken(rawPreviewToken, previewTokenSecret, { expectedProjectId: projectId })
+        : null;
+      if (!verified) {
+        return applyIsolatedPreviewHeaders(
+          c.json(
+            {
+              code: 'UNAUTHORIZED',
+              error: 'Valid project-scoped preview token is required on the isolated preview origin.',
+              applied: false,
+            },
+            401,
+          ),
+          appOriginUrl.origin,
+          corsAllowedOriginSet,
+          requestOrigin,
+        );
+      }
+
+      c.set('auth', buildPreviewAuthContext(verified, config.AUTH_MODE));
+      previewHostRequests.add(c.req.raw);
+    } else if (isReadOnlyFontAsset) {
+      // Baked container fonts & Google Font CSS proxy carry no tenant secrets; never read session cookies.
+      c.set('auth', {
+        workspaceId: PREVIEW_FONT_VIEWER_ID,
+        userId: PREVIEW_FONT_VIEWER_ID,
+        role: 'viewer',
+        scopes: ['projects:read'],
+        authMode: config.AUTH_MODE,
+        authMethod: 'oauth_bearer',
+        displayName: 'Preview Font Reader',
+      });
+      previewHostRequests.add(c.req.raw);
+    }
+
+    await next();
+    c.res = applyIsolatedPreviewHeaders(c.res, appOriginUrl.origin, corsAllowedOriginSet, requestOrigin);
   });
 
   // -------------------------------------------------------------------------
@@ -2309,17 +2530,54 @@ export function createApiApp(deps: CreateApiAppDeps): { app: Hono<AuthEnv>; serv
   app.use('/api/projects/*', authWithWelcome);
   app.use('/api/render/*', authWithWelcome);
   app.use('/api/media-jobs/*', authWithWelcome);
-  app.use('/api/fonts/*', authMiddleware);
+  app.use('/api/fonts/*', fontsAuthMiddleware);
   app.use('/api/events', authWithWelcome);
   app.use('/api/environment/ffmpeg', authMiddleware);
   app.use('/api/open-in-desktop', authMiddleware);
   app.use('/api/assets/global', authMiddleware);
   app.use('/api/registry/blocks', authMiddleware);
 
+  // POST /api/projects/:id/preview-token — Mint short-lived project-scoped HS256 token on the main origin
+  // so Studio / clients can open cookie-less isolated preview URLs on PREVIEW_PUBLIC_ORIGIN (c5).
+  app.post('/api/projects/:id/preview-token', async (c) => {
+    const auth = getAuthContext(c);
+    if (!hasScope(auth, 'projects:read')) {
+      throw new CloudError('INSUFFICIENT_SCOPE', 'Missing required scope: projects:read', {
+        status: 403,
+        applied: false,
+      });
+    }
+    const projectId = c.req.param('id') ?? '';
+    await workspace.getProject(auth, projectId, { allowTrashed: true });
+
+    const signed = signPreviewToken(
+      {
+        workspaceId: auth.workspaceId,
+        projectId,
+        ttlSec: config.PREVIEW_TOKEN_TTL_SEC,
+      },
+      previewTokenSecret,
+    );
+    const previewOrigin = previewOriginUrl ? previewOriginUrl.origin : null;
+    const targetOrigin = previewOrigin ?? appOriginUrl.origin;
+    const previewUrl = `${targetOrigin}/api/projects/${encodeURIComponent(projectId)}/preview?${PREVIEW_TOKEN_QUERY_PARAM}=${encodeURIComponent(signed.token)}`;
+
+    c.header('Cache-Control', 'no-store');
+    return c.json(
+      {
+        token: signed.token,
+        expiresAt: signed.expiresAt,
+        previewOrigin,
+        previewUrl,
+      },
+      200,
+    );
+  });
+
   const detectedFontsDir =
     deps.fontsDir ?? (existsSync('/app/fonts') ? '/app/fonts' : undefined);
 
-  const studioApp = createDisklessStudioApp({
+  const studioDeps: DisklessStudioDeps & { readonly previewOrigin: string | null } = {
     db,
     storage,
     hotTextCache: deps.hotTextCache,
@@ -2333,7 +2591,9 @@ export function createApiApp(deps: CreateApiAppDeps): { app: Hono<AuthEnv>; serv
     fontsDir: detectedFontsDir,
     runtimeRoot,
     studioVersion: VERSION,
-  });
+    previewOrigin: previewOriginUrl ? previewOriginUrl.origin : null,
+  };
+  const studioApp = createDisklessStudioApp(studioDeps);
   app.route('/', studioApp);
 
   // -------------------------------------------------------------------------
@@ -2514,10 +2774,16 @@ export async function startApiServer(options: StartApiServerOptions = {}): Promi
     shutdown.installSignalHandlers(options.onShutdownComplete);
   }
 
+  const corsAllowedOrigins = resolveApiCorsAllowedOrigins(config);
+
   logger.info('OpenMotion cloud API server listening', {
     host: config.BIND_HOST,
     port: config.PORT,
     publicOrigin: config.APP_PUBLIC_ORIGIN,
+    previewOrigin: config.PREVIEW_PUBLIC_ORIGIN ?? null,
+    corsAllowedOrigins,
+    historyCoalesceWindowMs: config.HISTORY_COALESCE_WINDOW_MS,
+    s3PresignCacheWindowSec: config.S3_PRESIGN_CACHE_WINDOW_SEC,
     authMode: config.AUTH_MODE,
     modelGatewayMode: config.MODEL_GATEWAY_MODE,
     version: VERSION,

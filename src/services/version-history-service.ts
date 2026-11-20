@@ -22,6 +22,7 @@ import { workspaceBlobKey } from '../infra/storage.ts';
 import { computeProjectRevision, isSha256Hex, isTextProjectPath, isUuid } from '../../shared/project-validation.ts';
 import { computePreviewImpact, createWriteToken, formatVersionFromSha256 } from '../studio/etag.ts';
 import {
+  DEFAULT_HISTORY_COALESCE_WINDOW_MS,
   assertValidUuid,
   canonicalInputHash,
   loadProjectOrThrow,
@@ -36,6 +37,8 @@ export interface VersionHistoryServiceDeps {
   readonly storage: StoragePort;
   readonly hotTextCache?: HotTextCachePort;
   readonly eventBus?: EventBusPort;
+  /** Coalesce window (ms) shared with ProjectFilesService for interactive Studio edits. Defaults to 4000ms. */
+  readonly historyCoalesceWindowMs?: number;
 }
 
 export interface ProjectVersionSummary {
@@ -175,12 +178,17 @@ export class VersionHistoryService {
   private readonly storage: StoragePort;
   private readonly hotTextCache?: HotTextCachePort;
   private readonly eventBus?: EventBusPort;
+  readonly historyCoalesceWindowMs: number;
 
   constructor(deps: VersionHistoryServiceDeps) {
     this.db = deps.db;
     this.storage = deps.storage;
     this.hotTextCache = deps.hotTextCache;
     this.eventBus = deps.eventBus;
+    this.historyCoalesceWindowMs = Math.max(
+      0,
+      Math.floor(deps.historyCoalesceWindowMs ?? DEFAULT_HISTORY_COALESCE_WINDOW_MS),
+    );
   }
 
   /** Paginated MCP version list (`versionNumber DESC`). */
@@ -412,6 +420,19 @@ export class VersionHistoryService {
             eq(projectHistoryEntries.id, current.id),
           ),
         );
+
+      if (label && current.versionId) {
+        await tx
+          .update(projectVersions)
+          .set(asUpdate(projectVersions, { summary: nextLabel }))
+          .where(
+            and(
+              eq(projectVersions.workspaceId, ctx.workspaceId),
+              eq(projectVersions.projectId, project.id),
+              eq(projectVersions.id, current.versionId),
+            ),
+          );
+      }
 
       return { id: current.id, seq: current.seq, label: nextLabel };
     });
@@ -1184,7 +1205,7 @@ export class VersionHistoryService {
     };
   }
 
-  /** Pin or unpin a history entry (and its associated version). */
+  /** Pin or unpin a history entry (and its associated version) under the project lock. */
   async pinEntry(
     ctx: AuthContext,
     projectId: string,
@@ -1192,36 +1213,42 @@ export class VersionHistoryService {
     pinned: boolean,
   ): Promise<{ ok: true; entryId: string; pinned: boolean }> {
     assertValidUuid(entryId, 'entryId');
-    await loadProjectOrThrow(this.db, ctx.workspaceId, projectId, { allowTrashed: true });
 
-    const rows = await this.db
-      .update(projectHistoryEntries)
-      .set(asUpdate(projectHistoryEntries, { pinned }))
-      .where(
-        and(
-          eq(projectHistoryEntries.workspaceId, ctx.workspaceId),
-          eq(projectHistoryEntries.projectId, projectId),
-          eq(projectHistoryEntries.id, entryId),
-        ),
-      )
-      .returning({ id: projectHistoryEntries.id, versionId: projectHistoryEntries.versionId });
+    return this.db.transaction(async (tx) => {
+      await loadProjectOrThrow(tx, ctx.workspaceId, projectId, {
+        allowTrashed: true,
+        forUpdate: true,
+      });
 
-    const updated = rows[0];
-    if (!updated) {
-      throw new CloudError('NOT_FOUND', `History entry ${entryId} not found.`, { status: 404, applied: false });
-    }
+      const rows = await tx
+        .update(projectHistoryEntries)
+        .set(asUpdate(projectHistoryEntries, { pinned }))
+        .where(
+          and(
+            eq(projectHistoryEntries.workspaceId, ctx.workspaceId),
+            eq(projectHistoryEntries.projectId, projectId),
+            eq(projectHistoryEntries.id, entryId),
+          ),
+        )
+        .returning({ id: projectHistoryEntries.id, versionId: projectHistoryEntries.versionId });
 
-    await this.db
-      .update(projectVersions)
-      .set(asUpdate(projectVersions, { pinned }))
-      .where(
-        and(
-          eq(projectVersions.workspaceId, ctx.workspaceId),
-          eq(projectVersions.id, updated.versionId),
-        ),
-      );
+      const updated = rows[0];
+      if (!updated) {
+        throw new CloudError('NOT_FOUND', `History entry ${entryId} not found.`, { status: 404, applied: false });
+      }
 
-    return { ok: true, entryId: updated.id, pinned };
+      await tx
+        .update(projectVersions)
+        .set(asUpdate(projectVersions, { pinned }))
+        .where(
+          and(
+            eq(projectVersions.workspaceId, ctx.workspaceId),
+            eq(projectVersions.id, updated.versionId),
+          ),
+        );
+
+      return { ok: true as const, entryId: updated.id, pinned };
+    });
   }
 
   /** Inspect files at a historical point (`versionId`, `entryId`, `seq`, or `'head'`). */

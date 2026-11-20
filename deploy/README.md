@@ -92,11 +92,16 @@ All runtime variables are validated strictly by [`src/infra/config.ts`](../src/i
 | Variable | Default (Compose) | Purpose |
 | --- | --- | --- |
 | `APP_PUBLIC_ORIGIN` | `http://127.0.0.1:4173` | Canonical external origin for OAuth metadata, MCP URLs, S3 CORS, and CSRF checks. |
+| `PREVIEW_PUBLIC_ORIGIN` | *(empty)* | Optional cookie-less preview origin (e.g. `https://preview.openmotion.example.com`). When configured on a distinct host, `api` isolates preview iframes from session cookies and blocks `/motion-api/*`, `/auth/*`, `/oauth/*`, `/mcp`, and mutations with `403 PREVIEW_ORIGIN_ISOLATED`. Leave empty for single-host local Compose dev. |
+| `PREVIEW_TOKEN_TTL_SEC` | `900` | Lifetime (seconds) of HS256 project-scoped preview tokens minted by `POST /api/projects/:id/preview-token`. |
 | `AUTH_MODE` | `dev` | `dev` for local Compose; `oidc` required in production (`NODE_ENV=production` refuses `AUTH_MODE=dev` unless `ALLOW_INSECURE_DEV_AUTH=true`). |
 | `DEV_PAT` | `om_pat_devlocal_...` | Synthetic local Bearer token for `/mcp` when `AUTH_MODE=dev`. |
 | `MCP_MAX_BODY_BYTES` | `10485760` | 10 MiB JSON-RPC body cap for large project edits on `/mcp`. |
 | `MODEL_GATEWAY_MODE` | `mock` | `mock` returns deterministic media fixtures locally; set `opendesign` + `OPENDESIGN_S2S_API_KEY` for live media generation. |
 | `S3_ENDPOINT` / `S3_PUBLIC_ENDPOINT` | `http://s3:9000` / `http://127.0.0.1:9000` | Dual S3 clients: internal container I/O vs browser-reachable presigned URLs. |
+| `S3_PRESIGN_CACHE_WINDOW_SEC` | `3600` | UTC time-window alignment (seconds) for cacheable `immutable` Presigned GET URLs on content-addressed blobs/proxies/thumbnails. |
+| `BLOB_GC_GRACE_SECONDS` | `604800` | 7-day grace period (seconds) before Mark-and-Sweep CAS GC physically deletes verified-unreferenced blobs. |
+| `HISTORY_COALESCE_WINDOW_MS` | `4000` | Edit-window duration (ms) for coalescing rapid interactive Studio edits into the head unpinned version (`0` disables coalescing). |
 | `RENDER_SHM_SIZE` / `RENDER_MEM_LIMIT` | `512m` / `2g` | Chromium `/dev/shm` and container memory limit on `worker-render`. Raise to `1g`–`2g` / `4g` on `>= 8 GiB` hosts. |
 
 ## Kubernetes + KEDA Deployment (`deploy/k8s/`)
@@ -105,10 +110,10 @@ Production manifests live under [`deploy/k8s/`](k8s/kustomization.yaml) and targ
 
 ### 1. Provision Secrets & Config
 
-1. Review [`deploy/k8s/configmap.yaml`](k8s/configmap.yaml) and update `APP_PUBLIC_ORIGIN`, `OIDC_ISSUER`, `OIDC_CLIENT_ID`, `OIDC_CALLBACK_URL`, `MCP_OAUTH_ISSUER`, `S3_ENDPOINT`, `S3_PUBLIC_ENDPOINT`, and `S3_BUCKET` for your cluster.
+1. Review [`deploy/k8s/configmap.yaml`](k8s/configmap.yaml) and update `APP_PUBLIC_ORIGIN`, `PREVIEW_PUBLIC_ORIGIN`, `OIDC_ISSUER`, `OIDC_CLIENT_ID`, `OIDC_CALLBACK_URL`, `MCP_OAUTH_ISSUER`, `S3_ENDPOINT`, `S3_PUBLIC_ENDPOINT`, and `S3_BUCKET` for your cluster.
 2. Provision both `openmotion-secrets` and `openmotion-keda-redis-auth` in namespace `openmotion` using [`deploy/k8s/secret.example.yaml`](k8s/secret.example.yaml) as a template (via External Secrets Operator, Sealed Secrets, or SOPS — never commit live credentials).
-3. Ensure your S3/R2 bucket has the canonical CORS policy applied (either run `scripts/init-s3.ts` once against the bucket or configure the same `GET`/`HEAD`/`PUT` + `Range`/`ETag`/`Content-Range` rules via Terraform).
-4. Update `deploy/k8s/ingress.yaml` with your domain and TLS certificate secret, and update `deploy/k8s/networkpolicy.yaml` if PostgreSQL, Redis, or S3 run outside the cluster (pin exact PrivateLink / VPC endpoint CIDRs rather than opening `0.0.0.0/0` to `worker-render`).
+3. Ensure your S3/R2 bucket has the canonical CORS policy applied for both `APP_PUBLIC_ORIGIN` and `PREVIEW_PUBLIC_ORIGIN` (run `scripts/init-s3.ts` with `S3_CORS_ALLOWED_ORIGINS=$PREVIEW_PUBLIC_ORIGIN` or configure the same `GET`/`HEAD`/`PUT` + `Range`/`ETag`/`Content-Range` rules via Terraform).
+4. Update `deploy/k8s/ingress.yaml` with both your main Studio domain (`motion.example.com`) and dedicated cookie-less preview domain (`preview.openmotion.example.com`) plus TLS certificate secret, and update `deploy/k8s/networkpolicy.yaml` if PostgreSQL, Redis, or S3 run outside the cluster (pin exact PrivateLink / VPC endpoint CIDRs rather than opening `0.0.0.0/0` to `worker-render`).
 
 ### 2. Render & Apply Manifests
 
@@ -139,6 +144,7 @@ kubectl -n openmotion wait --for=condition=complete job/openmotion-catalog-sync 
 
 ### 4. Security Hardening Summary
 
+- **Cookie-less Preview Subdomain Isolation:** Setting `PREVIEW_PUBLIC_ORIGIN` (e.g. `https://preview.openmotion.example.com`) alongside the dedicated Ingress rule isolates rendered project HTML/JS previews onto a separate cookie-less origin. The `api` Preview Host Isolation middleware ignores all session cookies, authenticates `/api/projects/:id/preview*` strictly via short-lived project-scoped HS256 preview tokens (`POST /api/projects/:id/preview-token`), applies `Content-Security-Policy: frame-ancestors 'self' <APP_PUBLIC_ORIGIN>;`, `Referrer-Policy: no-referrer`, and `X-Content-Type-Options: nosniff`, and immediately rejects `/motion-api/*`, `/auth/*`, `/oauth/*`, `/mcp`, and any mutating HTTP method with `403 PREVIEW_ORIGIN_ISOLATED`.
 - **Pod Security `restricted`:** All pods run non-root (`runAsUser: 1000`), drop `ALL` Linux capabilities, enforce `seccompProfile: RuntimeDefault`, disable `automountServiceAccountToken`, and mount `readOnlyRootFilesystem: true` with bounded `emptyDir` scratch mounts (`/tmp`, plus memory-backed `/dev/shm` on `worker-render`).
 - **Least-Privilege Secret Projection:** `worker-render` NEVER receives `OPENDESIGN_*`, `OIDC_*`, `SESSION_SECRET`, or `DEV_PAT` environment variables, and strips all remaining infrastructure credentials (`DATABASE_URL`, `REDIS_URL`, `S3_*`) before spawning Chromium/FFmpeg.
 - **Strict Default-Deny `NetworkPolicy`:** `deploy/k8s/networkpolicy.yaml` denies all ingress and egress by default across `openmotion`. `worker-render` permits egress **only** to cluster DNS and PostgreSQL, Redis, and S3 endpoints — blocking all public internet egress, cloud metadata (`169.254.169.254/32`), and the Kubernetes API server.

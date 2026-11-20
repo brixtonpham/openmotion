@@ -22,10 +22,15 @@ const SAFE_VENDOR_PATH_RE = /^[a-zA-Z0-9._/-]{1,200}$/;
 
 type StoredSelection = SelectionEvent & { selection?: unknown };
 
-export function createStudioSystemRoutes(deps: DisklessStudioDeps): Hono<{ Variables: StudioVariables }> {
+export type StudioSystemRouteDeps = DisklessStudioDeps & {
+  readonly previewOrigin?: string | null;
+};
+
+export function createStudioSystemRoutes(deps: StudioSystemRouteDeps): Hono<{ Variables: StudioVariables }> {
   const app = new Hono<{ Variables: StudioVariables }>();
   const runtimeRoot = deps.runtimeRoot ?? process.cwd();
   const studioVersion = deps.studioVersion ?? '0.9.7';
+  const previewOrigin = deps.previewOrigin ?? null;
 
   // In-memory latest selection mirror (per instance, updated via Redis pub/sub for multi-pod sync).
   const latestSelections = new Map<string, StoredSelection>();
@@ -264,6 +269,7 @@ export function createStudioSystemRoutes(deps: DisklessStudioDeps): Hono<{ Varia
       diskless: true,
       multiProject: true,
       projectDir: projectId ? `/virtual/${projectId}` : '/virtual',
+      previewOrigin,
     });
   });
 

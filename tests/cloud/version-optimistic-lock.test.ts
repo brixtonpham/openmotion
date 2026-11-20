@@ -861,7 +861,7 @@ class InMemoryEventBus implements StudioEventBusPort {
   }
 }
 
-function createHarness() {
+function createHarness(options: { historyCoalesceWindowMs?: number; now?: () => Date } = {}) {
   const pgClient = new InMemoryPgClient();
   const db = drizzle({ client: pgClient as never, schema }) as unknown as Database;
   const storage = new InMemoryStorage(pgClient.trace);
@@ -917,8 +917,21 @@ function createHarness() {
     displayName: 'Bob',
   };
 
-  const files = new ProjectFilesService({ db, storage, hotTextCache, eventBus });
-  const history = new VersionHistoryService({ db, storage, hotTextCache, eventBus });
+  const files = new ProjectFilesService({
+    db,
+    storage,
+    hotTextCache,
+    eventBus,
+    historyCoalesceWindowMs: options.historyCoalesceWindowMs,
+    now: options.now,
+  });
+  const history = new VersionHistoryService({
+    db,
+    storage,
+    hotTextCache,
+    eventBus,
+    historyCoalesceWindowMs: options.historyCoalesceWindowMs,
+  });
   const workspace = new WorkspaceService({ db, storage, files, hotTextCache });
   const assetNames = new AssetNamesService({ db, files });
   const workRounds = new WorkRoundsService(db);
@@ -1108,6 +1121,7 @@ describe('Cloud Optimistic Locking, Idempotency & CAS Refcounts', () => {
       ops: [{ op: 'upsert_text', path: 'index.html', content: v3Html }],
       source: 'studio',
       summary: 'Edit v3',
+      forceVersion: true,
     });
     assert.equal(c3.historySeq, 3);
 
@@ -1333,5 +1347,253 @@ describe('Cloud Optimistic Locking, Idempotency & CAS Refcounts', () => {
     assert.equal(imported.imported[0].title, 'Archive Demo');
     const importedHtml = await h.files.readTextFile(h.authB, imported.imported[0].projectId, 'index.html');
     assert.ok(importedHtml?.content.includes('Archive Demo'));
+  });
+
+  it('coalesces 5 rapid Studio edits within 4s into 1 project_versions row with delta project_version_files and exact CAS refcounts, and splits on export-ref / pin / MCP / >4s (c2)', async () => {
+    let clockMs = Date.parse('2026-11-20T12:00:00.000Z');
+    const h = createHarness({
+      historyCoalesceWindowMs: 4000,
+      now: () => new Date(clockMs),
+    });
+
+    const keep = await h.workspace.createProject(h.authA, { title: 'Keep Project' });
+    const proj = await h.workspace.createProject(h.authA, {
+      title: 'Coalesce Demo',
+      initialFiles: [
+        { path: 'index.html', content: '<div data-composition-id="main">base</div>' },
+        { path: 'styles.css', content: '/* unchanged-styles */' },
+        { path: 'a.css', content: '/* unchanged-a */' },
+        { path: 'b.css', content: '/* removable-b */' },
+      ],
+    });
+
+    const assertExactWorkspaceRefCounts = (label: string) => {
+      const expectedCounts = new Map<string, number>();
+      for (const row of h.pgClient.rows('project_files')) {
+        if (row.workspace_id === h.authA.workspaceId && row.blob_scope === 'workspace') {
+          const sha = String(row.sha256).trim();
+          expectedCounts.set(sha, (expectedCounts.get(sha) ?? 0) + 1);
+        }
+      }
+      for (const row of h.pgClient.rows('project_version_files')) {
+        if (row.workspace_id === h.authA.workspaceId && row.blob_scope === 'workspace') {
+          const sha = String(row.sha256).trim();
+          expectedCounts.set(sha, (expectedCounts.get(sha) ?? 0) + 1);
+        }
+      }
+      for (const blob of h.pgClient.rows('workspace_blobs')) {
+        if (blob.workspace_id !== h.authA.workspaceId) continue;
+        const sha = String(blob.sha256).trim();
+        const expected = expectedCounts.get(sha) ?? 0;
+        assert.equal(
+          Number(blob.ref_count),
+          expected,
+          `[${label}] CAS ref_count mismatch for sha=${sha}: actual=${blob.ref_count}, expected=${expected}`,
+        );
+      }
+    };
+
+    // 5 rapid Studio edits within 4s (t=0, +500ms, +1000ms, +1500ms, +2000ms):
+    // Edit 1 allocates v2 (cannot coalesce into v1 baseline); edits 2..5 ALL coalesce into v2!
+    const edit1 = await h.files.commitChanges(h.authA, {
+      projectId: proj.projectId,
+      ops: [{ op: 'upsert_text', path: 'index.html', content: '<div data-composition-id="main">drag-1</div>' }],
+      source: 'studio',
+      summary: 'Drag step 1',
+    });
+    assert.equal(edit1.versionNumber, 2);
+    assert.equal(edit1.historySeq, 2);
+    assert.equal(edit1.coalesced, false);
+
+    clockMs += 500;
+    const edit2 = await h.files.commitChanges(h.authA, {
+      projectId: proj.projectId,
+      ops: [{ op: 'upsert_text', path: 'index.html', content: '<div data-composition-id="main">drag-2</div>' }],
+      source: 'studio',
+      summary: 'Drag step 2',
+    });
+    assert.equal(edit2.versionId, edit1.versionId);
+    assert.equal(edit2.versionNumber, 2);
+    assert.equal(edit2.historySeq, 2);
+    assert.equal(edit2.coalesced, true);
+    assert.notEqual(edit2.revision, edit1.revision);
+
+    clockMs += 500;
+    const edit3 = await h.files.commitChanges(h.authA, {
+      projectId: proj.projectId,
+      ops: [
+        { op: 'upsert_text', path: 'index.html', content: '<div data-composition-id="main">drag-3</div>' },
+        { op: 'upsert_text', path: 'extra.css', content: '/* added-during-burst */' },
+      ],
+      source: 'studio',
+      summary: 'Drag step 3',
+    });
+    assert.equal(edit3.versionId, edit1.versionId);
+    assert.equal(edit3.coalesced, true);
+
+    clockMs += 500;
+    const edit4 = await h.files.commitChanges(h.authA, {
+      projectId: proj.projectId,
+      ops: [
+        { op: 'upsert_text', path: 'index.html', content: '<div data-composition-id="main">drag-4</div>' },
+        { op: 'delete', path: 'b.css' },
+      ],
+      source: 'studio',
+      summary: 'Drag step 4',
+    });
+    assert.equal(edit4.versionId, edit1.versionId);
+    assert.equal(edit4.coalesced, true);
+
+    clockMs += 500;
+    const edit5 = await h.files.commitChanges(h.authA, {
+      projectId: proj.projectId,
+      ops: [{ op: 'upsert_text', path: 'index.html', content: '<div data-composition-id="main">drag-5</div>' }],
+      source: 'studio',
+      summary: 'Drag step 5',
+    });
+    assert.equal(edit5.versionId, edit1.versionId);
+    assert.equal(edit5.versionNumber, 2);
+    assert.equal(edit5.historySeq, 2);
+    assert.equal(edit5.coalesced, true);
+
+    // Only 2 project_versions rows exist (v1 baseline + 1 coalesced v2), NOT 6!
+    const projectVerRows = () =>
+      h.pgClient.rows('project_versions').filter((r) => r.project_id === proj.projectId);
+    assert.equal(projectVerRows().length, 2);
+
+    // v2 project_version_files reflects exact final state (has extra.css, deleted b.css, drag-5 index.html)
+    const v2Files = h.pgClient
+      .rows('project_version_files')
+      .filter((r) => r.version_id === edit1.versionId);
+    assert.deepEqual(
+      v2Files.map((r) => r.path).sort(),
+      ['a.css', 'extra.css', 'index.html', 'styles.css'],
+    );
+    assert.equal(
+      v2Files.find((r) => r.path === 'index.html')?.sha256,
+      sha256Hex('<div data-composition-id="main">drag-5</div>'),
+    );
+
+    // Intermediate drag-1..drag-4 blobs dropped cleanly to ref_count === 0 with zero_ref_since set!
+    for (const step of ['drag-1', 'drag-2', 'drag-3', 'drag-4']) {
+      const deadSha = sha256Hex(`<div data-composition-id="main">${step}</div>`);
+      const blobRow = h.pgClient
+        .rows('workspace_blobs')
+        .find((r) => r.workspace_id === h.authA.workspaceId && r.sha256 === deadSha);
+      assert.equal(blobRow?.ref_count, 0, `expected ref_count=0 for superseded ${step}`);
+      assert.ok(blobRow?.zero_ref_since, `expected zero_ref_since for superseded ${step}`);
+    }
+    assertExactWorkspaceRefCounts('after-5-coalesced-studio-edits');
+
+    // Boundary 1: Export job referencing current head version_id MUST freeze it -> next Studio edit allocates v3!
+    h.pgClient.seed('jobs', {
+      id: randomUUID(),
+      workspace_id: h.authA.workspaceId,
+      project_id: proj.projectId,
+      kind: 'export_render',
+      state: 'queued',
+      stage: 'queued',
+      progress: 0,
+      version_id: edit5.versionId,
+      input_payload: { compositionPath: 'index.html' },
+      created_at: new Date(clockMs).toISOString(),
+      updated_at: new Date(clockMs).toISOString(),
+    });
+    clockMs += 100;
+    const afterExportCol = await h.files.commitChanges(h.authA, {
+      projectId: proj.projectId,
+      ops: [{ op: 'upsert_text', path: 'index.html', content: '<div data-composition-id="main">post-export-1</div>' }],
+      source: 'studio',
+      summary: 'After export col ref',
+    });
+    assert.equal(afterExportCol.coalesced, false);
+    assert.equal(afterExportCol.versionNumber, 3);
+    assert.notEqual(afterExportCol.versionId, edit5.versionId);
+
+    // Also verify jobs referencing versionId via input_payload.versionId freezes v3!
+    h.pgClient.seed('jobs', {
+      id: randomUUID(),
+      workspace_id: h.authA.workspaceId,
+      project_id: proj.projectId,
+      kind: 'export_render',
+      state: 'completed',
+      stage: 'done',
+      progress: 100,
+      version_id: null,
+      input_payload: { versionId: afterExportCol.versionId },
+      created_at: new Date(clockMs).toISOString(),
+      updated_at: new Date(clockMs).toISOString(),
+    });
+    clockMs += 100;
+    const afterExportPayload = await h.files.commitChanges(h.authA, {
+      projectId: proj.projectId,
+      ops: [{ op: 'upsert_text', path: 'index.html', content: '<div data-composition-id="main">post-export-2</div>' }],
+      source: 'studio',
+      summary: 'After export payload ref',
+    });
+    assert.equal(afterExportPayload.coalesced, false);
+    assert.equal(afterExportPayload.versionNumber, 4);
+
+    // Boundary 2: Pinning the head history entry freezes v4 -> next Studio edit allocates v5!
+    const histBeforePin = await h.history.listHistory(h.authA, proj.projectId);
+    const headEntry = histBeforePin.entries.find((e) => e.versionId === afterExportPayload.versionId)!;
+    await h.history.pinEntry(h.authA, proj.projectId, headEntry.id, true);
+
+    clockMs += 100;
+    const afterPin = await h.files.commitChanges(h.authA, {
+      projectId: proj.projectId,
+      ops: [{ op: 'upsert_text', path: 'index.html', content: '<div data-composition-id="main">post-pin</div>' }],
+      source: 'studio',
+      summary: 'After pin',
+    });
+    assert.equal(afterPin.coalesced, false);
+    assert.equal(afterPin.versionNumber, 5);
+
+    // Boundary 3: MCP / Agent edit NEVER coalesces into Studio head (allocates v6),
+    // and subsequent Studio edit NEVER coalesces into Agent head (allocates v7)!
+    clockMs += 100;
+    const mcpEdit = await h.files.commitChanges(h.authA, {
+      projectId: proj.projectId,
+      ops: [{ op: 'upsert_text', path: 'index.html', content: '<div data-composition-id="main">mcp-edit</div>' }],
+      source: 'agent',
+      actorKind: 'agent',
+      summary: 'Agent update',
+    });
+    assert.equal(mcpEdit.coalesced, false);
+    assert.equal(mcpEdit.versionNumber, 6);
+
+    clockMs += 100;
+    const studioAfterMcp = await h.files.commitChanges(h.authA, {
+      projectId: proj.projectId,
+      ops: [{ op: 'upsert_text', path: 'index.html', content: '<div data-composition-id="main">studio-after-mcp</div>' }],
+      source: 'studio',
+      summary: 'Studio after agent',
+    });
+    assert.equal(studioAfterMcp.coalesced, false);
+    assert.equal(studioAfterMcp.versionNumber, 7);
+
+    // Boundary 4: Advancing clock past 4000ms allocates a new immutable version (v8)!
+    clockMs += 4500;
+    const afterWindow = await h.files.commitChanges(h.authA, {
+      projectId: proj.projectId,
+      ops: [{ op: 'upsert_text', path: 'index.html', content: '<div data-composition-id="main">after-4s</div>' }],
+      source: 'studio',
+      summary: 'After window elapsed',
+    });
+    assert.equal(afterWindow.coalesced, false);
+    assert.equal(afterWindow.versionNumber, 8);
+
+    // Verify v2 frozen export snapshot STILL contains drag-5 intact!
+    const v2Peek = await h.history.peekPoint(h.authA, proj.projectId, edit5.versionId!, 'index.html');
+    assert.equal(v2Peek.file?.content, '<div data-composition-id="main">drag-5</div>');
+
+    assertExactWorkspaceRefCounts('after-all-boundaries');
+
+    // Permanent delete cleanly decrements all refs with zero underflow!
+    await h.workspace.trashProject(h.authA, proj.projectId);
+    const del = await h.workspace.deleteProjectPermanently(h.authA, proj.projectId);
+    assert.equal(del.deleted, true);
+    assert.equal(del.activeProjectId, keep.projectId);
+    assertExactWorkspaceRefCounts('after-permanent-delete');
   });
 });

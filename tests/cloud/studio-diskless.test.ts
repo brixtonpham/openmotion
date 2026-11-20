@@ -790,9 +790,10 @@ describe('Diskless Studio HTTP Routes (ETag, HEAD direct, 302 headers, DOM & GSA
     assert.equal(headPreview.headers.get('content-length'), String(videoBytes.byteLength));
     assert.equal(headPreview.headers.get('accept-ranges'), 'bytes');
     assert.equal(headPreview.headers.get('etag'), fileContentVersion(videoBytes));
+    assert.equal(headPreview.headers.get('x-openmotion-media-track'), 'original');
     assert.equal(env.storage.presignGetCalls, presignBefore, 'HEAD must NEVER call presignGet');
 
-    // GET /api/projects/:id/preview/assets/intro.mp4 -> 302 Found with Cache-Control & Vary!
+    // GET /api/projects/:id/preview/assets/intro.mp4 -> 302 Found with Cache-Control, Vary & X-OpenMotion-Media-Track: original!
     const getPreview = await env.studioApp.request(
       `/api/projects/${created.projectId}/preview/assets/intro.mp4`,
       { method: 'GET' },
@@ -801,6 +802,7 @@ describe('Diskless Studio HTTP Routes (ETag, HEAD direct, 302 headers, DOM & GSA
     assert.ok(getPreview.headers.get('location')?.startsWith('https://s3.local/workspaces/'));
     assert.equal(getPreview.headers.get('cache-control'), 'private, max-age=60');
     assert.equal(getPreview.headers.get('vary'), 'Origin, Cookie');
+    assert.equal(getPreview.headers.get('x-openmotion-media-track'), 'original');
 
     // Seed a completed export job in PG and test HEAD vs GET on /api/render/:jobId/view & /download.
     const jobId = randomUUID();
@@ -1271,5 +1273,189 @@ describe('Diskless Studio HTTP Routes (ETag, HEAD direct, 302 headers, DOM & GSA
       body: JSON.stringify({ format: 'mp4' }),
     });
     assert.equal(deniedRender.status, 403);
+  });
+
+  it('serves ready previewProxy on GET/HEAD /preview/* (c1), bypasses on ?original=1 / ?raw=1, and falls back when absent, failed, or cross-tenant', async () => {
+    const env = createStudioTestEnv();
+    const created = await env.workspace.createProject(env.auth, { title: 'Dual Track Proxy' });
+
+    const rawVideo = Buffer.alloc(4096, 0x42);
+    const rawVideoSha = sha256Hex(rawVideo);
+    const proxyVideoKey = `workspaces/${env.auth.workspaceId}/derived/${rawVideoSha}/proxy.mp4`;
+
+    const rawImage = Buffer.alloc(2048, 0x55);
+    const rawImageSha = sha256Hex(rawImage);
+    const proxyImageKey = `workspaces/${env.auth.workspaceId}/derived/${rawImageSha}/proxy.webp`;
+
+    const failedVideo = Buffer.from('FAILED_PROXY_MP4_SOURCE');
+    const failedVideoSha = sha256Hex(failedVideo);
+
+    const tamperedVideo = Buffer.from('CROSS_TENANT_TAMPERED_SOURCE');
+    const tamperedVideoSha = sha256Hex(tamperedVideo);
+    const otherWorkspaceId = '99999999-9999-4999-8999-999999999999';
+
+    await env.files.commitChanges(env.auth, {
+      projectId: created.projectId,
+      ops: [
+        { op: 'upsert_binary', path: 'assets/clip4k.mp4', data: rawVideo, mimeType: 'video/mp4' },
+        { op: 'upsert_binary', path: 'assets/photo.png', data: rawImage, mimeType: 'image/png' },
+        { op: 'upsert_binary', path: 'assets/failed.mp4', data: failedVideo, mimeType: 'video/mp4' },
+        { op: 'upsert_binary', path: 'assets/tampered.mp4', data: tamperedVideo, mimeType: 'video/mp4' },
+      ],
+    });
+
+    // Attach frozen worker-media previewProxy metadata onto workspace_blobs rows
+    const attachMeta = (sha: string, meta: Record<string, unknown>) => {
+      const row = env.pgClient
+        .rows('workspace_blobs')
+        .find((r) => r.workspace_id === env.auth.workspaceId && r.sha256 === sha);
+      assert.ok(row, `expected workspace_blobs row for ${sha}`);
+      row.metadata = meta;
+    };
+
+    attachMeta(rawVideoSha, {
+      modality: 'video',
+      width: 3840,
+      height: 2160,
+      previewProxy: {
+        status: 'ready',
+        s3Key: proxyVideoKey,
+        mimeType: 'video/mp4',
+        sizeBytes: 512,
+        width: 1280,
+        height: 720,
+        codec: 'h264',
+        generatedAt: '2026-11-20T00:00:00.000Z',
+      },
+    });
+    attachMeta(rawImageSha, {
+      modality: 'image',
+      width: 4000,
+      height: 3000,
+      previewProxy: {
+        status: 'ready',
+        s3Key: proxyImageKey,
+        mimeType: 'image/webp',
+        sizeBytes: 256,
+        width: 1920,
+        height: 1440,
+        codec: 'webp',
+        generatedAt: '2026-11-20T00:00:00.000Z',
+      },
+    });
+    attachMeta(failedVideoSha, {
+      modality: 'video',
+      previewProxy: {
+        status: 'failed',
+        s3Key: `workspaces/${env.auth.workspaceId}/derived/${failedVideoSha}/proxy.mp4`,
+        mimeType: 'video/mp4',
+        sizeBytes: 0,
+        generatedAt: '2026-11-20T00:00:00.000Z',
+      },
+    });
+    attachMeta(tamperedVideoSha, {
+      modality: 'video',
+      previewProxy: {
+        status: 'ready',
+        s3Key: `workspaces/${otherWorkspaceId}/derived/${tamperedVideoSha}/proxy.mp4`,
+        mimeType: 'video/mp4',
+        sizeBytes: 128,
+        generatedAt: '2026-11-20T00:00:00.000Z',
+      },
+    });
+
+    // 1. Ready video proxy: HEAD answers 200 directly with proxy metadata (zero S3 redirect!)
+    const presignBefore = env.storage.presignGetCalls;
+    const headProxy = await env.studioApp.request(
+      `/api/projects/${created.projectId}/preview/assets/clip4k.mp4`,
+      { method: 'HEAD' },
+    );
+    assert.equal(headProxy.status, 200);
+    assert.equal(headProxy.headers.get('content-type'), 'video/mp4');
+    assert.equal(headProxy.headers.get('content-length'), '512');
+    assert.equal(headProxy.headers.get('x-openmotion-media-track'), 'proxy');
+    assert.equal(env.storage.presignGetCalls, presignBefore, 'HEAD proxy must NEVER call presignGet');
+
+    // 2. Ready video proxy: GET returns 302 redirecting to derived proxy s3Key with proxy headers
+    const getProxy = await env.studioApp.request(
+      `/api/projects/${created.projectId}/preview/assets/clip4k.mp4`,
+    );
+    assert.equal(getProxy.status, 302);
+    assert.equal(getProxy.headers.get('x-openmotion-media-track'), 'proxy');
+    assert.equal(getProxy.headers.get('cache-control'), 'private, max-age=60');
+    assert.equal(getProxy.headers.get('vary'), 'Origin, Cookie');
+    assert.ok(getProxy.headers.get('location')?.startsWith(`https://s3.local/${proxyVideoKey}`));
+
+    // 3. Ready image WebP proxy switches MIME type & size on HEAD + redirects to proxy.webp on GET
+    const headImgProxy = await env.studioApp.request(
+      `/api/projects/${created.projectId}/preview/assets/photo.png`,
+      { method: 'HEAD' },
+    );
+    assert.equal(headImgProxy.status, 200);
+    assert.equal(headImgProxy.headers.get('content-type'), 'image/webp');
+    assert.equal(headImgProxy.headers.get('content-length'), '256');
+    assert.equal(headImgProxy.headers.get('x-openmotion-media-track'), 'proxy');
+
+    const getImgProxy = await env.studioApp.request(
+      `/api/projects/${created.projectId}/preview/assets/photo.png`,
+    );
+    assert.equal(getImgProxy.status, 302);
+    assert.equal(getImgProxy.headers.get('x-openmotion-media-track'), 'proxy');
+    assert.ok(getImgProxy.headers.get('location')?.startsWith(`https://s3.local/${proxyImageKey}`));
+
+    // 4. ?original=1 and ?raw=1 bypass proxy and serve the original CAS blob
+    const headOriginal = await env.studioApp.request(
+      `/api/projects/${created.projectId}/preview/assets/clip4k.mp4?original=1`,
+      { method: 'HEAD' },
+    );
+    assert.equal(headOriginal.status, 200);
+    assert.equal(headOriginal.headers.get('content-length'), '4096');
+    assert.equal(headOriginal.headers.get('x-openmotion-media-track'), 'original');
+
+    const getOriginal = await env.studioApp.request(
+      `/api/projects/${created.projectId}/preview/assets/clip4k.mp4?original=1`,
+    );
+    assert.equal(getOriginal.status, 302);
+    assert.equal(getOriginal.headers.get('x-openmotion-media-track'), 'original');
+    assert.ok(
+      getOriginal.headers
+        .get('location')
+        ?.startsWith(`https://s3.local/workspaces/${env.auth.workspaceId}/blobs/${rawVideoSha}`),
+    );
+
+    const getRaw = await env.studioApp.request(
+      `/api/projects/${created.projectId}/preview/assets/photo.png?raw=1`,
+    );
+    assert.equal(getRaw.status, 302);
+    assert.equal(getRaw.headers.get('x-openmotion-media-track'), 'original');
+    assert.ok(
+      getRaw.headers
+        .get('location')
+        ?.startsWith(`https://s3.local/workspaces/${env.auth.workspaceId}/blobs/${rawImageSha}`),
+    );
+
+    // 5. Failed proxy seamlessly falls back to original
+    const getFailed = await env.studioApp.request(
+      `/api/projects/${created.projectId}/preview/assets/failed.mp4`,
+    );
+    assert.equal(getFailed.status, 302);
+    assert.equal(getFailed.headers.get('x-openmotion-media-track'), 'original');
+    assert.ok(
+      getFailed.headers
+        .get('location')
+        ?.startsWith(`https://s3.local/workspaces/${env.auth.workspaceId}/blobs/${failedVideoSha}`),
+    );
+
+    // 6. Cross-tenant proxy s3Key is rejected and falls back cleanly to original
+    const getTampered = await env.studioApp.request(
+      `/api/projects/${created.projectId}/preview/assets/tampered.mp4`,
+    );
+    assert.equal(getTampered.status, 302);
+    assert.equal(getTampered.headers.get('x-openmotion-media-track'), 'original');
+    assert.ok(
+      getTampered.headers
+        .get('location')
+        ?.startsWith(`https://s3.local/workspaces/${env.auth.workspaceId}/blobs/${tamperedVideoSha}`),
+    );
   });
 });
