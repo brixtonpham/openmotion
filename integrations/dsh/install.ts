@@ -86,6 +86,35 @@ export async function profileModules(text: string): Promise<string[]> {
   return modules;
 }
 
+const electronManagedProfilePattern = /profile\s+"desktop"\s+is\s+managed\s+exclusively\s+by\s+the\s+Electron\s+application/i;
+
+export function isElectronManagedProfileError(profile: string, error: unknown): boolean {
+  if (profile.toLowerCase() !== "desktop" || !error || typeof error !== "object") return false;
+  const candidate = error as { stderr?: unknown; message?: unknown };
+  const details = [candidate.stderr, candidate.message]
+    .map(value => Buffer.isBuffer(value) ? value.toString("utf8") : typeof value === "string" ? value : "")
+    .join("\n");
+  return electronManagedProfilePattern.test(details);
+}
+
+export async function inspectProfileModules(
+  profile: string,
+  dumpConfig: () => Promise<{ stdout: string }>,
+  warn: (message: string) => void = message => console.error(message),
+): Promise<string[]> {
+  let dump: { stdout: string };
+  try {
+    dump = await dumpConfig();
+  } catch (error) {
+    if (isElectronManagedProfileError(profile, error)) {
+      warn(`[OpenMotion] Skipping read-only DSH config dump for Electron-managed profile "${profile}"; composing patch conservatively.`);
+      return [];
+    }
+    throw error;
+  }
+  return await profileModules(dump.stdout);
+}
+
 export async function installDsh(options: Options) {
   assert(Number(process.versions.node.split(".")[0]) >= 24, "Use Node.js 26.11.1 for source installation (24+ required)");
   const paths = installationPaths(options);
@@ -115,9 +144,11 @@ export async function installDsh(options: Options) {
     await dependencies(root);
     await dependencies(path.join(root, "integrations/dsh"));
   });
-  const dump = await run(process.execPath, [path.join(root, "integrations/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js"),
-    "--profile", options.profile, "--dump-config"]);
-  const patch = await workspacePatch(original, root, data, process.execPath, await profileModules(dump.stdout));
+  const inherited = await inspectProfileModules(options.profile, () => run(process.execPath, [
+    path.join(root, "integrations/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js"),
+    "--profile", options.profile, "--dump-config",
+  ]));
+  const patch = await workspacePatch(original, root, data, process.execPath, inherited);
   await stage("Studio (reuse matching build)", async () => {
     if (!await state.sourceBuildCurrent(root)) {
       await run("npm", ["run", "build:studio"]);

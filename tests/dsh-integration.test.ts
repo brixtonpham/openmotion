@@ -168,3 +168,72 @@ test('DSH installation selects only an explicit profile and preserves unrelated 
   assert(!installationActive(status, root, path.resolve('another workspace')));
   assert(!installationActive({ ...status, tools: [] }, root, data));
 });
+
+test('DSH installation recovers when bundled CLI rejects read-only --dump-config for Electron-managed desktop profile', async () => {
+  const { execFile } = await import('node:child_process');
+  const { promisify } = await import('node:util');
+  const execFileAsync = promisify(execFile);
+  const { inspectProfileModules, isElectronManagedProfileError, workspacePatch } = await import('../integrations/dsh/install.ts');
+  const dshBin = fileURLToPath(new URL('../integrations/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js', import.meta.url));
+
+  // Exercise the actual bundled DSH CLI rejection for the Electron-managed desktop profile.
+  const warnings: string[] = [];
+  const desktopModules = await inspectProfileModules(
+    'desktop',
+    () => execFileAsync(process.execPath, [dshBin, '--profile', 'desktop', '--dump-config']),
+    message => warnings.push(message),
+  );
+  assert.deepEqual(desktopModules, []);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /desktop/i);
+
+  // Case-insensitive desktop profile names recover identically.
+  const mixedCaseModules = await inspectProfileModules(
+    'Desktop',
+    () => execFileAsync(process.execPath, [dshBin, '--profile', 'Desktop', '--dump-config']),
+    () => {},
+  );
+  assert.deepEqual(mixedCaseModules, []);
+
+  // Conservative patch composition still preserves existing YAML, adds missing cards, and stays idempotent.
+  const root = path.resolve('checkout with spaces'), data = path.resolve('workspace data');
+  const before = '# Keep Desktop model configuration\n- id: agent-default-model\n  config:\n    provider: my-provider\n    model: my-model\n';
+  const patch = await workspacePatch(before, root, data, process.execPath, desktopModules);
+  assert(patch.startsWith(before));
+  assert(patch.includes('id: openmotion-workspace'));
+  assert(patch.includes('@deepseek-ai/dsh-action-cards'));
+  assert(patch.includes('@deepseek-ai/dsh-client-ui-action-cards'));
+  assert.equal(await workspacePatch(patch, root, data, process.execPath, desktopModules), patch);
+
+  // If a future DSH CLI allows read-only dumps on desktop, inherited modules are still inspected normally.
+  const upstreamFixedModules = await inspectProfileModules(
+    'desktop',
+    async () => ({ stdout: '- id: action-cards\n  name: "@deepseek-ai/dsh-action-cards"\n' }),
+    () => { throw new Error('should not warn when dump succeeds'); },
+  );
+  assert.deepEqual(upstreamFixedModules, ['@deepseek-ai/dsh-action-cards']);
+
+  // Non-Electron failures on desktop (missing binary, broken YAML, unexpected CLI errors) must still fail fast.
+  const unexpectedError = Object.assign(new Error('Command failed: unexpected failure'), { stderr: 'YAMLParseError: unexpected token' });
+  assert.equal(isElectronManagedProfileError('desktop', unexpectedError), false);
+  await assert.rejects(
+    inspectProfileModules('desktop', async () => { throw unexpectedError; }, () => {}),
+    /unexpected failure/,
+  );
+  await assert.rejects(
+    inspectProfileModules('desktop', async () => ({ stdout: 'invalid: [' }), () => {}),
+    /Could not inspect the existing DSH profile/,
+  );
+
+  // Non-desktop profiles must never treat an Electron-profile message as recoverable.
+  const electronError = Object.assign(
+    new Error('Command failed'),
+    { stderr: 'error: profile "desktop" is managed exclusively by the Electron application\n' },
+  );
+  assert.equal(isElectronManagedProfileError('desktop', electronError), true);
+  assert.equal(isElectronManagedProfileError('web', electronError), false);
+  await assert.rejects(
+    inspectProfileModules('web', async () => { throw electronError; }, () => {}),
+    /Command failed/,
+  );
+});
