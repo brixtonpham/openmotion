@@ -14,6 +14,7 @@
   },
   "include": [
     "*.ts",
+    "src/**/*.ts",
     "shared/**/*.ts",
     "gateway/**/*.ts",
     "tracking/**/*.ts",
