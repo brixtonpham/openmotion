@@ -33,11 +33,14 @@ const cloneBodySchema = z
     title: z.string().min(1).max(100).optional(),
     sessionId: z.string().uuid().optional(),
     requirements: z.string().max(20_000).optional(),
+    instruction: z.string().max(20_000).optional(),
     namingLanguage: z.string().min(2).max(16).optional(),
     requestId: z.string().min(1).max(100).optional(),
     locale: z.string().min(2).max(16).optional(),
     activateWorkspace: z.boolean().optional(),
     workspaceId: z.string().optional(),
+    expectedRevision: z.string().optional(),
+    expectedProjectId: z.string().optional(),
   })
   .strict();
 
@@ -376,14 +379,25 @@ export function createCatalogRoutes(deps: CatalogRoutesDeps): Hono<CatalogRouteE
       templateId: c.req.param('id') ?? '',
       title: body.title,
       sessionId: body.sessionId,
-      requirements: body.requirements,
+      requirements: body.requirements ?? body.instruction,
       namingLanguage: body.namingLanguage,
       requestId: body.requestId,
       locale: body.locale,
       activateWorkspace: body.activateWorkspace,
     });
 
-    return c.json({ project: cloned, ...cloned }, 201);
+    return c.json(
+      {
+        project: cloned,
+        ...cloned,
+        projectId: cloned.projectId,
+        projectTitle: cloned.title,
+        revision: cloned.revision,
+        sessionId: cloned.sessionId,
+        exportJob: null,
+      },
+      201,
+    );
   };
 
   app.post(`${base}/templates/:id/clone`, handleClone);

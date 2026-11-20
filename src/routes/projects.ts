@@ -3,6 +3,7 @@ import type { AuthContext, PatScope, WorkspaceRole } from '../contracts/auth.ts'
 import { CloudError, isCloudError } from '../contracts/errors.ts';
 import type { ProjectType } from '../db/schema/projects.ts';
 import type { AssetNamesService } from '../services/asset-names-service.ts';
+import type { ExportService } from '../services/export-service.ts';
 import type { ProjectArchiveService } from '../services/project-archive-service.ts';
 import type { ProjectFilesService } from '../services/project-files-service.ts';
 import type { VersionHistoryService } from '../services/version-history-service.ts';
@@ -15,6 +16,12 @@ export interface ProductRouteVariables {
   auth: AuthContext;
 }
 
+export interface WorkspaceExportJobSummary {
+  id: string;
+  state: 'pending' | 'running' | 'completed' | 'failed';
+  error?: string;
+}
+
 export interface ProjectsRouterDeps {
   readonly workspace: WorkspaceService;
   readonly files: ProjectFilesService;
@@ -22,7 +29,28 @@ export interface ProjectsRouterDeps {
   readonly assetNames: AssetNamesService;
   readonly workRounds: WorkRoundsService;
   readonly archives?: ProjectArchiveService;
+  readonly exports?: Pick<ExportService, 'listProjectExports'>;
   readonly resolveAuth?: (c: Context<{ Variables: ProductRouteVariables }>) => AuthContext | Promise<AuthContext>;
+}
+
+async function resolveActiveExportJob(
+  exportsService: Pick<ExportService, 'listProjectExports'> | undefined,
+  auth: AuthContext,
+  projectId: string,
+): Promise<WorkspaceExportJobSummary | null> {
+  if (!exportsService) return null;
+  try {
+    const list = await exportsService.listProjectExports(auth, projectId, { limit: 5 });
+    const active = list.find((job) => job.state === 'queued' || job.state === 'running');
+    if (!active) return null;
+    return {
+      id: active.id,
+      state: active.state === 'queued' ? 'pending' : 'running',
+      ...(active.errorMessage ? { error: active.errorMessage } : {}),
+    };
+  } catch {
+    return null;
+  }
 }
 
 async function requireAuth(
@@ -73,6 +101,7 @@ export function createProjectsRouter(deps: ProjectsRouterDeps): Hono<{ Variables
       sessionId?: string;
       requestId?: string;
       prompt?: string;
+      instruction?: string;
       selectActive?: boolean;
     };
 
@@ -84,11 +113,46 @@ export function createProjectsRouter(deps: ProjectsRouterDeps): Hono<{ Variables
       namingLanguage: body.namingLanguage,
       sessionId: body.sessionId,
       requestId: body.requestId,
-      initialPrompt: body.prompt,
+      initialPrompt: body.prompt ?? body.instruction,
       selectActive: body.selectActive,
     });
 
-    return c.json(created, created.replayed ? 200 : 201);
+    return c.json(
+      {
+        ...created,
+        projectTitle: created.title,
+        exportJob: null,
+      },
+      created.replayed ? 200 : 201,
+    );
+  });
+
+  // POST /motion-api/preview/open — Verify target project before mounting Studio ArtifactViewer.
+  app.post('/motion-api/preview/open', async (c) => {
+    const auth = await requireAuth(c, deps, READ_REQ);
+    const body = (await c.req.json().catch(() => ({}))) as { projectId?: string };
+    let targetId = c.req.query('projectId') || body.projectId || '';
+    if (!targetId) {
+      const catalog = await deps.workspace.getCatalog(auth);
+      targetId = catalog.activeId;
+    }
+    if (!targetId) {
+      throw new CloudError('PROJECT_NOT_FOUND', 'No active project available to preview.', {
+        status: 404,
+        applied: false,
+      });
+    }
+    const project = await deps.workspace.getProject(auth, targetId, { allowTrashed: false });
+    const exportJob = await resolveActiveExportJob(deps.exports, auth, project.id);
+    return c.json({
+      ok: true,
+      activeId: project.id,
+      projectId: project.id,
+      projectTitle: project.title,
+      revision: project.revision,
+      sessionId: project.sessionId,
+      exportJob,
+    });
   });
 
   // GET /motion-api/project & /motion-api/project/status — Active project status summary.
@@ -97,7 +161,15 @@ export function createProjectsRouter(deps: ProjectsRouterDeps): Hono<{ Variables
     const catalog = await deps.workspace.getCatalog(auth);
     const requestedId = c.req.query('projectId') || catalog.activeId;
     if (!requestedId) {
-      return c.json({ activeId: '', project: null, projects: catalog.projects });
+      return c.json({
+        activeId: '',
+        projectId: '',
+        projectTitle: '',
+        revision: '',
+        exportJob: null,
+        project: null,
+        projects: catalog.projects,
+      });
     }
     const project = await deps.workspace.getProject(auth, requestedId, { allowTrashed: true });
     const virtual = await deps.files.loadVirtualProject(auth, requestedId);
@@ -105,9 +177,14 @@ export function createProjectsRouter(deps: ProjectsRouterDeps): Hono<{ Variables
       paths: virtual.listFiles().map((f) => f.path),
     });
     const info = infoInMemory(virtual);
+    const exportJob = await resolveActiveExportJob(deps.exports, auth, project.id);
 
     return c.json({
       activeId: catalog.activeId,
+      projectId: project.id,
+      projectTitle: project.title,
+      sessionId: project.sessionId,
+      exportJob,
       project,
       revision: project.revision,
       versionId: project.currentVersionId,
@@ -170,14 +247,25 @@ export function createProjectsRouter(deps: ProjectsRouterDeps): Hono<{ Variables
       expectedTitle: body.expectedTitle,
       requestId: body.requestId,
     });
-    return c.json(result);
+    const catalog = await deps.workspace.getCatalog(auth);
+    return c.json({ ...result, ...catalog });
   });
 
   // POST /motion-api/projects/:id/open — Select active project.
   app.post('/motion-api/projects/:id/open', async (c) => {
     const auth = await requireAuth(c, deps, WRITE_REQ);
     const project = await deps.workspace.selectProject(auth, c.req.param('id'));
-    return c.json({ ok: true, activeId: project.id, project });
+    const exportJob = await resolveActiveExportJob(deps.exports, auth, project.id);
+    return c.json({
+      ok: true,
+      activeId: project.id,
+      projectId: project.id,
+      projectTitle: project.title,
+      revision: project.revision,
+      sessionId: project.sessionId,
+      exportJob,
+      project,
+    });
   });
 
   // POST /motion-api/projects/:id/trash — Move project to trash.

@@ -1380,3 +1380,343 @@ describe('Cloud API Entrypoint — Static Assets, Read-Only GSAP & API 404 vs SP
     assert.equal(spaRes.status, studioBuilt ? 200 : 503);
   });
 });
+
+// ---------------------------------------------------------------------------
+// 6. Studio UI ↔ Cloud Backend Wiring Parity Regressions (#74 / #75)
+// ---------------------------------------------------------------------------
+
+describe('Cloud API Entrypoint — Studio UI Wiring Parity (/preview/open, WorkspaceStatus, /phase1/call, /generations, /tracking/preferences)', () => {
+  it('supports Studio project/session/template navigation, /motion-api/preview/open, /motion-api/phase1/call, /generations, and /tracking/preferences', async () => {
+    const { app, pgClient, storage } = createApiFixture({ config: { AUTH_MODE: 'dev' } });
+
+    // Seed one catalog template so POST /motion-api/templates/:id/open can clone with expectedRevision/expectedProjectId.
+    const tplHtml = Buffer.from('<div data-composition-id="main">Template</div>', 'utf8');
+    const tplSha = createHash('sha256').update(tplHtml).digest('hex');
+    await storage.putBlobIfAbsent(`catalog/blobs/${tplSha}`, tplHtml, 'text/html');
+    pgClient.seed('catalog_templates', {
+      id: 'studio-smoke-tpl',
+      kind: 'builtin',
+      catalog_version: 'v1',
+      sort_order: 1,
+      featured_order: 1,
+      has_html_project: true,
+      metadata: { title: 'Smoke Template', category: 'featured', durationSec: 3, width: 1280, height: 720, fps: 30 },
+      instructions_md: null,
+      motion_md: null,
+      updated_at: new Date().toISOString(),
+    });
+    pgClient.seed('catalog_template_files', {
+      template_id: 'studio-smoke-tpl',
+      path: 'index.html',
+      sha256: tplSha,
+      size_bytes: tplHtml.byteLength,
+      mime_type: 'text/html',
+      metadata: null,
+      is_project_file: true,
+      is_available: true,
+    });
+
+    // 1. POST /motion-api/projects (accepts instruction + returns WorkspaceStatus fields)
+    const createProjRes = await app.request('/motion-api/projects', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'Studio Parity Film', instruction: 'Opening prompt' }),
+    });
+    assert.equal(createProjRes.status, 201);
+    const createdProj = (await createProjRes.json()) as {
+      projectId: string;
+      projectTitle: string;
+      revision: string;
+      sessionId: string;
+      exportJob: unknown;
+    };
+    assert.ok(createdProj.projectId);
+    assert.equal(createdProj.projectTitle, 'Studio Parity Film');
+    assert.equal(createdProj.revision.length, 64);
+    assert.ok(createdProj.sessionId);
+    assert.equal(createdProj.exportJob, null);
+
+    // 2. POST /motion-api/preview/open?projectId=<id> (MotionApp.tsx resolveWorkspaceProject)
+    const previewOpenRes = await app.request(`/motion-api/preview/open?projectId=${createdProj.projectId}`, {
+      method: 'POST',
+    });
+    assert.equal(previewOpenRes.status, 200);
+    const previewOpen = (await previewOpenRes.json()) as {
+      ok: boolean;
+      activeId: string;
+      projectId: string;
+      projectTitle: string;
+      revision: string;
+      sessionId: string;
+      exportJob: unknown;
+    };
+    assert.equal(previewOpen.ok, true);
+    assert.equal(previewOpen.activeId, createdProj.projectId);
+    assert.equal(previewOpen.projectId, createdProj.projectId);
+    assert.equal(previewOpen.projectTitle, 'Studio Parity Film');
+    assert.equal(previewOpen.revision, createdProj.revision);
+    assert.equal(previewOpen.sessionId, createdProj.sessionId);
+    assert.equal(previewOpen.exportJob, null);
+
+    // 3. GET /motion-api/project/status & POST /motion-api/projects/:id/open top-level WorkspaceStatus
+    const statusRes = await app.request(`/motion-api/project/status?projectId=${createdProj.projectId}`);
+    assert.equal(statusRes.status, 200);
+    const statusBody = (await statusRes.json()) as {
+      projectId: string;
+      projectTitle: string;
+      revision: string;
+      sessionId: string;
+      exportJob: unknown;
+    };
+    assert.equal(statusBody.projectId, createdProj.projectId);
+    assert.equal(statusBody.projectTitle, 'Studio Parity Film');
+    assert.equal(statusBody.revision, createdProj.revision);
+    assert.equal(statusBody.sessionId, createdProj.sessionId);
+    assert.equal(statusBody.exportJob, null);
+
+    const openProjRes = await app.request(`/motion-api/projects/${createdProj.projectId}/open`, { method: 'POST' });
+    assert.equal(openProjRes.status, 200);
+    const openProjBody = (await openProjRes.json()) as {
+      ok: boolean;
+      projectId: string;
+      projectTitle: string;
+      revision: string;
+      sessionId: string;
+      exportJob: unknown;
+    };
+    assert.equal(openProjBody.ok, true);
+    assert.equal(openProjBody.projectId, createdProj.projectId);
+    assert.equal(openProjBody.projectTitle, 'Studio Parity Film');
+    assert.equal(openProjBody.revision, createdProj.revision);
+    assert.equal(openProjBody.sessionId, createdProj.sessionId);
+    assert.equal(openProjBody.exportJob, null);
+
+    // 4. PATCH /motion-api/projects/:id returns full ProjectCatalog alongside mutation fields
+    const renameProjRes = await app.request(`/motion-api/projects/${createdProj.projectId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'Renamed Studio Film' }),
+    });
+    assert.equal(renameProjRes.status, 200);
+    const renameProjBody = (await renameProjRes.json()) as {
+      projectId: string;
+      title: string;
+      activeId: string;
+      projects: Array<{ id: string; title: string }>;
+      sessions: Array<{ id: string }>;
+    };
+    assert.equal(renameProjBody.projectId, createdProj.projectId);
+    assert.equal(renameProjBody.title, 'Renamed Studio Film');
+    assert.ok(Array.isArray(renameProjBody.projects));
+    assert.ok(renameProjBody.projects.some((p) => p.id === createdProj.projectId && p.title === 'Renamed Studio Film'));
+    assert.ok(Array.isArray(renameProjBody.sessions));
+
+    // 5. POST /motion-api/sessions (instruction + caller id), /artifacts, /open, /messages, PATCH session
+    const callerSessionId = randomUUID();
+    const createSessRes = await app.request('/motion-api/sessions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: callerSessionId, title: 'Pitch Deck', instruction: 'Make a 10s teaser' }),
+    });
+    assert.equal(createSessRes.status, 201);
+    const createdSess = (await createSessRes.json()) as {
+      sessionId: string;
+      session: { id: string; messages: Array<{ content: string }> };
+    };
+    assert.equal(createdSess.sessionId, callerSessionId);
+    assert.equal(createdSess.session.id, callerSessionId);
+    assert.equal(createdSess.session.messages[0]?.content, 'Make a 10s teaser');
+
+    const artifactRes = await app.request(`/motion-api/sessions/${callerSessionId}/artifacts`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'Teaser Cut 1' }),
+    });
+    assert.equal(artifactRes.status, 201);
+    const artifactBody = (await artifactRes.json()) as {
+      projectId: string;
+      projectTitle: string;
+      revision: string;
+      sessionId: string;
+      exportJob: unknown;
+    };
+    assert.ok(artifactBody.projectId);
+    assert.equal(artifactBody.projectTitle, 'Teaser Cut 1');
+    assert.equal(artifactBody.sessionId, callerSessionId);
+    assert.equal(artifactBody.exportJob, null);
+
+    const openSessRes = await app.request(`/motion-api/sessions/${callerSessionId}/open`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ projectId: artifactBody.projectId }),
+    });
+    assert.equal(openSessRes.status, 200);
+    const openSessBody = (await openSessRes.json()) as {
+      ok: boolean;
+      sessionId: string;
+      projectId: string;
+      projectTitle: string;
+      revision: string;
+      exportJob: unknown;
+    };
+    assert.equal(openSessBody.ok, true);
+    assert.equal(openSessBody.sessionId, callerSessionId);
+    assert.equal(openSessBody.projectId, artifactBody.projectId);
+    assert.equal(openSessBody.projectTitle, 'Teaser Cut 1');
+    assert.equal(openSessBody.revision, artifactBody.revision);
+    assert.equal(openSessBody.exportJob, null);
+
+    const renameSessRes = await app.request(`/motion-api/sessions/${callerSessionId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'Pitch Deck Final' }),
+    });
+    assert.equal(renameSessRes.status, 200);
+    const renameSessBody = (await renameSessRes.json()) as {
+      id: string;
+      projects: unknown[];
+      sessions: Array<{ id: string; title: string }>;
+    };
+    assert.equal(renameSessBody.id, callerSessionId);
+    assert.ok(Array.isArray(renameSessBody.projects));
+    assert.ok(renameSessBody.sessions.some((s) => s.id === callerSessionId && s.title === 'Pitch Deck Final'));
+
+    const msgRes = await app.request(`/motion-api/sessions/${callerSessionId}/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: randomUUID(), content: 'Tighten pacing' }),
+    });
+    assert.equal(msgRes.status, 201);
+    const msgBody = (await msgRes.json()) as { id: string; artifacts: unknown[]; messages: unknown[] };
+    assert.equal(msgBody.id, callerSessionId);
+    assert.ok(Array.isArray(msgBody.artifacts));
+    assert.equal(msgBody.messages.length, 2);
+
+    // 6. POST /motion-api/templates/:id/open accepts expectedRevision & expectedProjectId without 400
+    const tplOpenRes = await app.request('/motion-api/templates/studio-smoke-tpl/open', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        expectedRevision: createdProj.revision,
+        expectedProjectId: createdProj.projectId,
+      }),
+    });
+    assert.equal(tplOpenRes.status, 201);
+    const tplOpenBody = (await tplOpenRes.json()) as {
+      projectId: string;
+      projectTitle: string;
+      revision: string;
+      sessionId: string;
+      exportJob: unknown;
+    };
+    assert.ok(tplOpenBody.projectId);
+    assert.equal(tplOpenBody.projectTitle, 'Smoke Template');
+    assert.equal(tplOpenBody.revision.length, 64);
+    assert.ok(tplOpenBody.sessionId);
+    assert.equal(tplOpenBody.exportJob, null);
+
+    // 7. POST /motion-api/phase1/call (openmotion_get_project currentVersionId, openmotion_assets_use, P2 501)
+    const getProjCall = await app.request('/motion-api/phase1/call', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'openmotion_get_project',
+        arguments: { projectId: createdProj.projectId },
+      }),
+    });
+    assert.equal(getProjCall.status, 200);
+    const getProjBody = (await getProjCall.json()) as {
+      projectId: string;
+      revision: string;
+      currentVersionId: string;
+      version: { versionId: string };
+    };
+    assert.equal(getProjBody.projectId, createdProj.projectId);
+    assert.equal(getProjBody.revision, createdProj.revision);
+    assert.ok(getProjBody.currentVersionId);
+    assert.equal(getProjBody.currentVersionId, getProjBody.version.versionId);
+
+    const assetsListCall = await app.request('/motion-api/phase1/call', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'openmotion_assets_use',
+        arguments: { action: 'list', sort: 'newest', offset: 0, limit: 40 },
+      }),
+    });
+    assert.equal(assetsListCall.status, 200);
+    const assetsListBody = (await assetsListCall.json()) as { assets: unknown[]; total: number };
+    assert.deepEqual(assetsListBody.assets, []);
+    assert.equal(assetsListBody.total, 0);
+
+    const p2Call = await app.request('/motion-api/phase1/call', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'openmotion_manage_project',
+        arguments: { action: 'comments', projectId: createdProj.projectId },
+      }),
+    });
+    assert.equal(p2Call.status, 501);
+    const p2Body = (await p2Call.json()) as { code: string; error: string };
+    assert.equal(p2Body.code, 'FEATURE_DEFERRED_P2');
+    assert.equal(typeof p2Body.error, 'string');
+
+    // 8. GET /motion-api/generations + POST /motion-api/generations/:id/cancel (GenerationJob shape)
+    const submitGenRes = await app.request('/motion-api/models/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        modality: 'image',
+        model: 'opendesign:mock-image-1',
+        prompt: 'Golden hour mountain silhouette',
+        projectId: createdProj.projectId,
+        requestId: 'req-gen-studio-1',
+      }),
+    });
+    assert.equal(submitGenRes.status, 202);
+    const submittedGen = (await submitGenRes.json()) as {
+      job: { id: string; model: { label: string }; createdAt: number; updatedAt: number; assets: unknown[]; saveToLibrary: boolean };
+    };
+    assert.equal(typeof submittedGen.job.createdAt, 'number');
+    assert.equal(typeof submittedGen.job.updatedAt, 'number');
+    assert.equal(typeof submittedGen.job.model.label, 'string');
+    assert.ok(Array.isArray(submittedGen.job.assets));
+    assert.equal(submittedGen.job.saveToLibrary, true);
+
+    const gensRes = await app.request(`/motion-api/generations?projectId=${createdProj.projectId}`);
+    assert.equal(gensRes.status, 200);
+    const gensBody = (await gensRes.json()) as { jobs: Array<{ id: string }> };
+    assert.equal(gensBody.jobs.length, 1);
+    assert.equal(gensBody.jobs[0].id, submittedGen.job.id);
+
+    const cancelGenRes = await app.request(`/motion-api/generations/${submittedGen.job.id}/cancel`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    assert.equal(cancelGenRes.status, 200);
+    const cancelGenBody = (await cancelGenRes.json()) as { job: { id: string; state: string } };
+    assert.equal(cancelGenBody.job.id, submittedGen.job.id);
+    assert.equal(cancelGenBody.job.state, 'cancelled');
+
+    // 9. GET/PUT/POST /motion-api/tracking/preferences & GET /motion-api/health
+    for (const method of ['GET', 'PUT', 'POST'] as const) {
+      const prefRes = await app.request('/motion-api/tracking/preferences', {
+        method,
+        ...(method !== 'GET'
+          ? { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: false }) }
+          : {}),
+      });
+      assert.equal(prefRes.status, 200, `expected 200 for ${method} /motion-api/tracking/preferences`);
+      const prefBody = (await prefRes.json()) as { enabled: boolean; preference: boolean; locked: boolean };
+      assert.equal(prefBody.enabled, false);
+      assert.equal(prefBody.preference, false);
+      assert.equal(prefBody.locked, true);
+    }
+
+    const motionHealthRes = await app.request('/motion-api/health');
+    assert.equal(motionHealthRes.status, 200);
+    assert.ok(((await motionHealthRes.json()) as { version?: string }).version);
+  });
+});
