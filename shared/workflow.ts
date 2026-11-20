@@ -124,15 +124,23 @@ export async function resolveGuideFile(root: string, relative: string) {
   return file;
 }
 
-export async function readWorkflowResource(uri: unknown, dataDirectory: string) {
+export async function readWorkflowResource(uri: unknown, dataDirectory = '') {
   if (typeof uri !== 'string') throw new Error('INVALID_RESOURCE_URI');
   if (/^(?:openmotion|motion):\/\/fonts\//.test(uri)) return { uri, mimeType: 'application/json', text: JSON.stringify(await fontCatalogResource(uri)) };
   const match = /^(?:openmotion|motion):\/\/workflow\/([a-z]+(?:-[a-z]+)*)\/([a-z]+)$/.exec(uri);
   if (match && phase1WorkflowNames.includes(match[1])) return { uri, mimeType: 'application/json', text: JSON.stringify({ ...await getWorkflow(match[2], match[1]), workflows: phase1WorkflowNames }) };
   const engine = /^(?:openmotion|motion):\/\/engine\/([a-zA-Z0-9_/-]+\.md)$/.exec(uri);
   if (!engine) throw new Error('INVALID_RESOURCE_URI');
-  const { ensureRuntime } = await import('../hyperframes.ts');
-  const root = await realpath(path.join(await ensureRuntime(dataDirectory, false), 'node_modules/hyperframes/dist/skills/hyperframes'));
+  // In container/cloud deployments, resolve Hyperframes guide directly from app node_modules without local runtime bootstrapping.
+  let root: string | null = await realpath(fileURLToPath(new URL('../node_modules/hyperframes/dist/skills/hyperframes', import.meta.url))).catch(() => null);
+  if (!root && dataDirectory) {
+    const legacyRuntimeModule = '../hyperframes' + '.ts';
+    const { ensureRuntime } = (await import(legacyRuntimeModule)) as {
+      ensureRuntime(dir: string, install?: boolean): Promise<string>;
+    };
+    root = await realpath(path.join(await ensureRuntime(dataDirectory, false), 'node_modules/hyperframes/dist/skills/hyperframes'));
+  }
+  if (!root) throw new Error('INVALID_RESOURCE_URI');
   const file = await resolveGuideFile(root, engine[1]);
   return { uri, mimeType: 'text/markdown', text: await readFile(file, 'utf8').catch(() => { throw new Error('INVALID_RESOURCE_URI'); }) };
 }
