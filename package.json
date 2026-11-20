@@ -54,6 +54,7 @@
     "@aws-sdk/s3-request-presigner": "^3.782.0",
     "@hono/node-server": "2.1.6",
     "@hyperframes/core": "0.9.7",
+    "@hyperframes/lint": "0.9.7",
     "@hyperframes/parsers": "0.9.7",
     "@hyperframes/player": "0.9.7",
     "@hyperframes/sdk": "0.9.7",
