@@ -20,7 +20,7 @@ export function createStudioHistoryRoutes(deps: DisklessStudioDeps): Hono<{ Vari
 
   // GET /api/projects/:id/history — Unified PG history timeline (diskless, zero local history files).
   app.get('/api/projects/:id/history', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:read' });
     const projectId = c.req.param('id');
     const result = await deps.history.listHistory(auth, projectId);
     return c.json(result);
@@ -28,7 +28,7 @@ export function createStudioHistoryRoutes(deps: DisklessStudioDeps): Hono<{ Vari
 
   // POST /api/projects/:id/history/claim — Claim/label current edit window in PG history.
   app.post('/api/projects/:id/history/claim', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:write', minRole: 'editor' });
     const projectId = c.req.param('id');
     const body = (await c.req.json().catch(() => ({}))) as {
       label?: string;
@@ -48,7 +48,7 @@ export function createStudioHistoryRoutes(deps: DisklessStudioDeps): Hono<{ Vari
 
   // POST /api/projects/:id/history/checkpoint — Create explicit snapshot checkpoint.
   app.post('/api/projects/:id/history/checkpoint', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:write', minRole: 'editor' });
     const projectId = c.req.param('id');
     const body = (await c.req.json().catch(() => ({}))) as {
       label?: string;
@@ -68,7 +68,7 @@ export function createStudioHistoryRoutes(deps: DisklessStudioDeps): Hono<{ Vari
 
   // POST /api/projects/:id/history/step — Step back (undo) or forward (redo).
   app.post('/api/projects/:id/history/step', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:write', minRole: 'editor' });
     const projectId = c.req.param('id');
     const body = (await c.req.json().catch(() => ({}))) as { direction?: string };
     const rawDir = body.direction?.toLowerCase();
@@ -92,7 +92,7 @@ export function createStudioHistoryRoutes(deps: DisklessStudioDeps): Hono<{ Vari
 
   // POST /api/projects/:id/history/undo — Supports both Studio `{ entryId }` and `{ direction: "undo"|"redo" }`.
   app.post('/api/projects/:id/history/undo', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:write', minRole: 'editor' });
     const projectId = c.req.param('id');
     const body = (await c.req.json().catch(() => ({}))) as {
       entryId?: string;
@@ -112,7 +112,7 @@ export function createStudioHistoryRoutes(deps: DisklessStudioDeps): Hono<{ Vari
 
   // POST /api/projects/:id/history/restore — Non-destructive restore to point / versionId / seq.
   app.post('/api/projects/:id/history/restore', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:write', minRole: 'editor' });
     const projectId = c.req.param('id');
     const body = (await c.req.json().catch(() => ({}))) as {
       point?: string;
@@ -141,7 +141,7 @@ export function createStudioHistoryRoutes(deps: DisklessStudioDeps): Hono<{ Vari
 
   // POST /api/projects/:id/history/pin — Pin/unpin a history entry.
   app.post('/api/projects/:id/history/pin', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:write', minRole: 'editor' });
     const projectId = c.req.param('id');
     const body = (await c.req.json().catch(() => ({}))) as {
       entryId?: string;
@@ -158,7 +158,7 @@ export function createStudioHistoryRoutes(deps: DisklessStudioDeps): Hono<{ Vari
 
   // GET /api/projects/:id/history/peek/:point — Inspect historical point files (and optional ?path=).
   app.get('/api/projects/:id/history/peek/:point', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:read' });
     const projectId = c.req.param('id');
     const point = c.req.param('point');
     const filePath = c.req.query('path') ?? undefined;
@@ -168,7 +168,7 @@ export function createStudioHistoryRoutes(deps: DisklessStudioDeps): Hono<{ Vari
 
   // GET /api/projects/:id/history/peek?seq=N&path=... — Query-param variant for Spike 1 contract.
   app.get('/api/projects/:id/history/peek', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:read' });
     const projectId = c.req.param('id');
     const point = c.req.query('point') ?? c.req.query('seq') ?? 'head';
     const filePath = c.req.query('path') ?? undefined;
@@ -178,7 +178,7 @@ export function createStudioHistoryRoutes(deps: DisklessStudioDeps): Hono<{ Vari
 
   // GET /api/projects/:id/history/blob/:hash — Serve immutable historical CAS blob scoped to this project.
   app.get('/api/projects/:id/history/blob/:hash', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:read' });
     const projectId = c.req.param('id');
     const hash = c.req.param('hash');
     const blob = await deps.history.readHistoryBlob(auth, projectId, hash);
@@ -191,7 +191,7 @@ export function createStudioHistoryRoutes(deps: DisklessStudioDeps): Hono<{ Vari
 
   // GET /api/projects/:id/history/blob?hash=... — Query-param variant.
   app.get('/api/projects/:id/history/blob', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:read' });
     const projectId = c.req.param('id');
     const hash = c.req.query('hash') ?? '';
     const blob = await deps.history.readHistoryBlob(auth, projectId, hash);
@@ -204,14 +204,14 @@ export function createStudioHistoryRoutes(deps: DisklessStudioDeps): Hono<{ Vari
 
   // POST /api/projects/:id/history/window — Start an edit coalescing window.
   app.post('/api/projects/:id/history/window', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:write', minRole: 'editor' });
     const projectId = c.req.param('id');
     return c.json(await deps.history.openWindow(auth, projectId));
   });
 
   // POST /api/projects/:id/history/window/:windowId/close — Close an edit coalescing window.
   app.post('/api/projects/:id/history/window/:windowId/close', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:write', minRole: 'editor' });
     const projectId = c.req.param('id');
     const windowId = c.req.param('windowId');
     return c.json(await deps.history.closeWindow(auth, projectId, windowId));

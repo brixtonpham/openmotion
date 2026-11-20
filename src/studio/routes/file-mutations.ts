@@ -48,7 +48,7 @@ export function createStudioFileMutationsRoutes(
 
   // POST /api/projects/:id/file-mutations/patch-element/* — Patch a single DOM element in HTML.
   app.post('/api/projects/:id/file-mutations/patch-element/*', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:write', minRole: 'editor' });
     const projectId = c.req.param('id');
     const filePath = readTargetPath(c.req.url, '/file-mutations/patch-element/');
     const body = (await c.req.json().catch(() => null)) as {
@@ -132,7 +132,7 @@ export function createStudioFileMutationsRoutes(
   // POST /api/projects/:id/file-mutations/patch-element-batches — Multi-file atomic DOM patch batch.
   // Exact shape expected by studio/src/components/inspector/useDomEditCommitsHelpers.ts.
   app.post('/api/projects/:id/file-mutations/patch-element-batches', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:write', minRole: 'editor' });
     const projectId = c.req.param('id');
     const body = (await c.req.json().catch(() => null)) as {
       batches?: Array<{
@@ -248,7 +248,7 @@ export function createStudioFileMutationsRoutes(
 
   // POST /api/projects/:id/file-mutations/patch-elements-batch/* — Multi-edit single-file patch.
   app.post('/api/projects/:id/file-mutations/patch-elements-batch/*', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:write', minRole: 'editor' });
     const projectId = c.req.param('id');
     const filePath = readTargetPath(c.req.url, '/file-mutations/patch-elements-batch/');
     const body = (await c.req.json().catch(() => null)) as {
@@ -317,7 +317,7 @@ export function createStudioFileMutationsRoutes(
 
   // POST /api/projects/:id/file-mutations/remove-element/* — Remove a single element.
   app.post('/api/projects/:id/file-mutations/remove-element/*', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:write', minRole: 'editor' });
     const projectId = c.req.param('id');
     const filePath = readTargetPath(c.req.url, '/file-mutations/remove-element/');
     const body = (await c.req.json().catch(() => null)) as { target?: SourceMutationTarget } | null;
@@ -359,7 +359,7 @@ export function createStudioFileMutationsRoutes(
 
   // POST /api/projects/:id/file-mutations/remove-elements/* — Remove multiple elements atomically.
   app.post('/api/projects/:id/file-mutations/remove-elements/*', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:write', minRole: 'editor' });
     const projectId = c.req.param('id');
     const filePath = readTargetPath(c.req.url, '/file-mutations/remove-elements/');
     const body = (await c.req.json().catch(() => null)) as { targets?: SourceMutationTarget[] } | null;
@@ -402,7 +402,7 @@ export function createStudioFileMutationsRoutes(
 
   // POST /api/projects/:id/file-mutations/split-element/* — Split a single element at `splitTime`.
   app.post('/api/projects/:id/file-mutations/split-element/*', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:write', minRole: 'editor' });
     const projectId = c.req.param('id');
     const filePath = readTargetPath(c.req.url, '/file-mutations/split-element/');
     const body = (await c.req.json().catch(() => null)) as {
@@ -472,7 +472,7 @@ export function createStudioFileMutationsRoutes(
   // POST /api/projects/:id/file-mutations/split-batch — Atomic multi-file razor split transaction.
   // Exact shape checked by studio/src/utils/razorSplitTransaction.ts.
   app.post('/api/projects/:id/file-mutations/split-batch', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:write', minRole: 'editor' });
     const projectId = c.req.param('id');
     const body = (await c.req.json().catch(() => null)) as {
       files?: Array<{ path: string; cuts: AtomicCutTarget[] }>;
@@ -557,7 +557,7 @@ export function createStudioFileMutationsRoutes(
 
   // POST /api/projects/:id/file-mutations/wrap-elements/* — Group elements into a wrapper container.
   app.post('/api/projects/:id/file-mutations/wrap-elements/*', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:write', minRole: 'editor' });
     const projectId = c.req.param('id');
     const filePath = readTargetPath(c.req.url, '/file-mutations/wrap-elements/');
     const body = (await c.req.json().catch(() => null)) as {
@@ -611,7 +611,7 @@ export function createStudioFileMutationsRoutes(
 
   // POST /api/projects/:id/file-mutations/unwrap-elements/* — Ungroup + bake group transforms + clean GSAP.
   app.post('/api/projects/:id/file-mutations/unwrap-elements/*', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:write', minRole: 'editor' });
     const projectId = c.req.param('id');
     const filePath = readTargetPath(c.req.url, '/file-mutations/unwrap-elements/');
     const body = (await c.req.json().catch(() => null)) as {
@@ -655,7 +655,7 @@ export function createStudioFileMutationsRoutes(
 
   // POST /api/projects/:id/file-mutations/probe-element/* — Read-only source probe.
   app.post('/api/projects/:id/file-mutations/probe-element/*', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:read' });
     const projectId = c.req.param('id');
     const filePath = readTargetPath(c.req.url, '/file-mutations/probe-element/');
     const body = (await c.req.json().catch(() => null)) as { target?: SourceMutationTarget } | null;
@@ -669,7 +669,7 @@ export function createStudioFileMutationsRoutes(
 
   // POST /api/projects/:id/file-mutations/probe-elements/* — Read-only batch source probe.
   app.post('/api/projects/:id/file-mutations/probe-elements/*', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:read' });
     const projectId = c.req.param('id');
     const filePath = readTargetPath(c.req.url, '/file-mutations/probe-elements/');
     const body = (await c.req.json().catch(() => null)) as { targets?: SourceMutationTarget[] } | null;
@@ -683,7 +683,7 @@ export function createStudioFileMutationsRoutes(
 
   // POST /api/projects/:id/file-mutations/duplicate-element/* — Clone element & GSAP animations.
   app.post('/api/projects/:id/file-mutations/duplicate-element/*', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:write', minRole: 'editor' });
     const projectId = c.req.param('id');
     const filePath = readTargetPath(c.req.url, '/file-mutations/duplicate-element/');
     const body = (await c.req.json().catch(() => null)) as {
@@ -742,7 +742,7 @@ export function createStudioFileMutationsRoutes(
 
   // POST /api/projects/:id/file-mutations/insert-composition/* — Insert a sub-composition host into parent HTML.
   app.post('/api/projects/:id/file-mutations/insert-composition/*', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:write', minRole: 'editor' });
     const projectId = c.req.param('id');
     const filePath = readTargetPath(c.req.url, '/file-mutations/insert-composition/');
     const body = (await c.req.json().catch(() => null)) as {
@@ -796,7 +796,7 @@ export function createStudioFileMutationsRoutes(
 
   // POST /api/projects/:id/file-mutations/relink-split-halves/* — Relink right-half split elements.
   app.post('/api/projects/:id/file-mutations/relink-split-halves/*', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:write', minRole: 'editor' });
     const projectId = c.req.param('id');
     const filePath = readTargetPath(c.req.url, '/file-mutations/relink-split-halves/');
     const body = (await c.req.json().catch(() => null)) as { rightHalfIds?: string[] } | null;
@@ -832,7 +832,7 @@ export function createStudioFileMutationsRoutes(
 
   // POST /api/projects/:id/file-mutations/batch — Generic multi-file upsert/delete batch.
   app.post('/api/projects/:id/file-mutations/batch', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:write', minRole: 'editor' });
     const projectId = c.req.param('id');
     const body = (await c.req.json().catch(() => null)) as {
       files?: Array<{ path: string; content?: string; delete?: boolean }>;
@@ -876,7 +876,7 @@ export function createStudioFileMutationsRoutes(
 
   // POST /api/projects/:id/file-mutations/freeze-frame — Enqueue async ffmpeg freeze-frame extraction on worker-media.
   app.post('/api/projects/:id/file-mutations/freeze-frame', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:write', minRole: 'editor' });
     const projectId = c.req.param('id');
     const body = (await c.req.json().catch(() => null)) as {
       sourcePath?: string;

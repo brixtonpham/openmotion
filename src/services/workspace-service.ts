@@ -1506,7 +1506,7 @@ export class WorkspaceService {
             ...(activeProj ? { activeArtifactId: activeProj.artifactId } : {}),
           }),
         )
-        .where(eq(sessions.id, sess.id));
+        .where(and(eq(sessions.workspaceId, ctx.workspaceId), eq(sessions.id, sess.id)));
 
       await tx
         .update(workspaces)
@@ -1610,7 +1610,7 @@ export class WorkspaceService {
         await tx
           .update(sessions)
           .set(asUpdate(sessions, { updatedAt: now }))
-          .where(eq(sessions.id, sessionId));
+          .where(and(eq(sessions.workspaceId, ctx.workspaceId), eq(sessions.id, sessionId)));
       }
 
       // Enforce 200-message cap per session (oldest pruned first).

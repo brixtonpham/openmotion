@@ -27,13 +27,13 @@ export function createStudioGsapRoutes(deps: DisklessStudioDeps): Hono<{ Variabl
 
   // GET /api/projects/:id/gsap-mutation-capabilities — Advertise atomic ownership pair support.
   app.get('/api/projects/:id/gsap-mutation-capabilities', async (c) => {
-    await getAuthContext(c, deps);
+    await getAuthContext(c, deps, { scope: 'projects:read' });
     return c.json({ atomicOwnershipPairs: true });
   });
 
   // GET /api/projects/:id/gsap-animations/* — Parse GSAP timeline script with strong ETag caching.
   const handleGetGsapAnimations = async (c: Context<{ Variables: StudioVariables }>) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:read' });
     const projectId = c.req.param('id') ?? '';
     const filePath = resolveGsapFilePath(c.req.url, ['/gsap-animations/']);
     const file = await deps.files.readTextFile(auth, projectId, filePath);
@@ -64,7 +64,7 @@ export function createStudioGsapRoutes(deps: DisklessStudioDeps): Hono<{ Variabl
     c: Context<{ Variables: StudioVariables }>,
     isBatch: boolean,
   ) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:write', minRole: 'editor' });
     const projectId = c.req.param('id') ?? '';
     const filePath = resolveGsapFilePath(c.req.url, [
       '/gsap-mutations-batch/',
@@ -160,7 +160,7 @@ export function createStudioGsapRoutes(deps: DisklessStudioDeps): Hono<{ Variabl
 
   // POST /api/projects/:id/gsap-mutation-rollback/* — Compare-and-swap rollback (`expected` -> `restore`).
   const handleRollback = async (c: Context<{ Variables: StudioVariables }>) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:write', minRole: 'editor' });
     const projectId = c.req.param('id') ?? '';
     const filePath = resolveGsapFilePath(c.req.url, ['/gsap-mutation-rollback/']);
     const body = (await c.req.json().catch(() => null)) as {

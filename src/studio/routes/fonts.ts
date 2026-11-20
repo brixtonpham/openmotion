@@ -19,13 +19,13 @@ export function createStudioFontsRoutes(
 
   // GET /api/fonts — List baked container fonts from /app/fonts (never scans host OS directories).
   app.get('/api/fonts', async (c) => {
-    await getAuthContext(c, deps);
+    await getAuthContext(c, deps, { scope: 'projects:read' });
     return c.json({ fonts: await fontCatalog.listFamilies() });
   });
 
   // GET /api/fonts/google?family=... — Redis-cached Google Fonts CSS proxy.
   app.get('/api/fonts/google', async (c) => {
-    await getAuthContext(c, deps);
+    await getAuthContext(c, deps, { scope: 'projects:read' });
     const families = c.req.queries('family') ?? [];
     const css = await fontCatalog.fetchGoogleFontCss(families, deps.hotTextCache, deps.fetchImpl);
     c.header('Content-Type', 'text/css; charset=utf-8');
@@ -35,7 +35,7 @@ export function createStudioFontsRoutes(
 
   // GET /api/fonts/file?family=... — Serve prepared font binary from baked /app/fonts catalog.
   app.get('/api/fonts/file', async (c) => {
-    await getAuthContext(c, deps);
+    await getAuthContext(c, deps, { scope: 'projects:read' });
     const family = c.req.query('family');
     if (!family) return c.json({ error: 'family parameter required' }, 400);
     const font = await fontCatalog.getFont(family);
@@ -44,7 +44,7 @@ export function createStudioFontsRoutes(
 
   // POST /api/fonts/prepare — Inspect & normalize an uploaded font buffer in memory.
   app.post('/api/fonts/prepare', bodyLimit({ maxSize: MAX_ASSET_BYTES }), async (c) => {
-    await getAuthContext(c, deps);
+    await getAuthContext(c, deps, { scope: 'projects:read' });
     try {
       const bytes = Buffer.from(await c.req.arrayBuffer());
       const prepared = fontCatalog.prepareBuffer(bytes);
@@ -56,7 +56,7 @@ export function createStudioFontsRoutes(
 
   // POST /api/projects/:id/fonts/import — Copy a baked container font into project S3 CAS (`assets/fonts/...`).
   app.post('/api/projects/:id/fonts/import', bodyLimit({ maxSize: 4096 }), async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:write', minRole: 'editor' });
     const projectId = c.req.param('id');
     const body = (await c.req.json().catch(() => null)) as { family?: unknown } | null;
     if (!body || typeof body.family !== 'string' || !body.family.trim()) {

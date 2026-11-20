@@ -1,8 +1,9 @@
 import { createRequire } from 'node:module';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import { streamSSE } from 'hono/streaming';
+import { getHyperframeRuntimeScript } from '@hyperframes/core/runtime-script';
 import { CloudError, featureDeferredP2 } from '../../contracts/errors.ts';
 import type { SelectionEvent } from '../../contracts/events.ts';
 import { projectChannel, selectionChannel } from '../../infra/redis.ts';
@@ -19,36 +20,23 @@ import { getMimeType } from '../etag.ts';
 
 const SAFE_VENDOR_PATH_RE = /^[a-zA-Z0-9._/-]{1,200}$/;
 
+type StoredSelection = SelectionEvent & { selection?: unknown };
+
 export function createStudioSystemRoutes(deps: DisklessStudioDeps): Hono<{ Variables: StudioVariables }> {
   const app = new Hono<{ Variables: StudioVariables }>();
   const runtimeRoot = deps.runtimeRoot ?? process.cwd();
   const studioVersion = deps.studioVersion ?? '0.9.7';
 
   // In-memory latest selection mirror (per instance, updated via Redis pub/sub for multi-pod sync).
-  const latestSelections = new Map<string, SelectionEvent>();
+  const latestSelections = new Map<string, StoredSelection>();
 
   let cachedRuntimeJs: string | null = null;
   const vendorCache = new Map<string, { content: Buffer; mimeType: string }>();
 
-  const loadRuntimeJs = async (): Promise<string> => {
-    if (cachedRuntimeJs !== null) return cachedRuntimeJs;
-    const req = createRequire(path.resolve(runtimeRoot, 'package.json'));
-    const corePkgPath = req.resolve('@hyperframes/core/package.json');
-    const coreRoot = path.dirname(corePkgPath);
-    const candidates = [
-      path.join(coreRoot, 'dist/runtime/index.js'),
-      path.join(coreRoot, 'dist/runtime.js'),
-      path.join(coreRoot, 'dist/browser/runtime.js'),
-    ];
-    for (const candidate of candidates) {
-      try {
-        cachedRuntimeJs = await readFile(candidate, 'utf8');
-        return cachedRuntimeJs;
-      } catch {
-        // Try next candidate path.
-      }
+  const loadRuntimeJs = (): string => {
+    if (cachedRuntimeJs === null) {
+      cachedRuntimeJs = getHyperframeRuntimeScript();
     }
-    cachedRuntimeJs = '/* hyperframes runtime bundle */\n';
     return cachedRuntimeJs;
   };
 
@@ -94,7 +82,7 @@ export function createStudioSystemRoutes(deps: DisklessStudioDeps): Hono<{ Varia
 
   // GET /api/projects/:id/lint — Pure in-memory lintProjectInMemory (reads blobs.metadata, zero ffprobe).
   app.get('/api/projects/:id/lint', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:read' });
     const projectId = c.req.param('id');
     const virtual = await deps.files.loadVirtualProject(auth, projectId);
     const result = await lintProjectInMemory(virtual);
@@ -103,7 +91,7 @@ export function createStudioSystemRoutes(deps: DisklessStudioDeps): Hono<{ Varia
 
   // GET /api/projects/:id/info — Pure in-memory project metadata inspection.
   app.get('/api/projects/:id/info', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:read' });
     const projectId = c.req.param('id');
     const virtual = await deps.files.loadVirtualProject(auth, projectId);
     return c.json(infoInMemory(virtual));
@@ -111,7 +99,7 @@ export function createStudioSystemRoutes(deps: DisklessStudioDeps): Hono<{ Varia
 
   // GET /api/projects/:id/timeline — Pure in-memory composition timeline extraction.
   app.get('/api/projects/:id/timeline', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:read' });
     const projectId = c.req.param('id');
     const virtual = await deps.files.loadVirtualProject(auth, projectId);
     return c.json(timelineInMemory(virtual));
@@ -119,7 +107,7 @@ export function createStudioSystemRoutes(deps: DisklessStudioDeps): Hono<{ Varia
 
   // GET /api/projects/:id/selection — Read latest Studio selection state.
   app.get('/api/projects/:id/selection', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:read' });
     const projectId = c.req.param('id');
     const key = `${auth.workspaceId}:${projectId}`;
     const existing = latestSelections.get(key);
@@ -128,31 +116,52 @@ export function createStudioSystemRoutes(deps: DisklessStudioDeps): Hono<{ Varia
         workspaceId: auth.workspaceId,
         projectId,
         elementIds: [],
+        selection: null,
         ts: 0,
       },
     );
   });
 
-  // POST /api/projects/:id/selection — Publish Studio selection update across instances via RedisEventBus.
-  app.post('/api/projects/:id/selection', async (c) => {
-    const auth = await getAuthContext(c, deps);
-    const projectId = c.req.param('id');
+  // PUT & POST /api/projects/:id/selection — Publish Studio selection update across instances via RedisEventBus.
+  // Supports both Studio `useStudioSelectionPublisher` (`PUT { selection }`) and `{ elementIds, compositionId, senderId }`.
+  const handleUpdateSelection = async (c: Context<{ Variables: StudioVariables }>) => {
+    const auth = await getAuthContext(c, deps, { scope: 'projects:write', minRole: 'editor' });
+    const projectId = c.req.param('id') ?? '';
     const body = (await c.req.json().catch(() => ({}))) as {
+      selection?: unknown;
       compositionId?: string;
       elementIds?: unknown;
       senderId?: string;
     };
 
-    const elementIds = Array.isArray(body.elementIds)
-      ? body.elementIds.filter((id): id is string => typeof id === 'string').slice(0, 500)
-      : [];
+    const nestedSel =
+      body.selection && typeof body.selection === 'object' && !Array.isArray(body.selection)
+        ? (body.selection as Record<string, unknown>)
+        : null;
 
-    const event: SelectionEvent = {
+    const rawIds = Array.isArray(body.elementIds)
+      ? body.elementIds
+      : Array.isArray(nestedSel?.elementIds)
+        ? nestedSel.elementIds
+        : Array.isArray(nestedSel?.ids)
+          ? nestedSel.ids
+          : [];
+    const elementIds = rawIds.filter((id): id is string => typeof id === 'string').slice(0, 500);
+
+    const compositionId =
+      typeof body.compositionId === 'string'
+        ? body.compositionId
+        : typeof nestedSel?.compositionId === 'string'
+          ? nestedSel.compositionId
+          : undefined;
+
+    const event: StoredSelection = {
       workspaceId: auth.workspaceId,
       projectId,
-      ...(typeof body.compositionId === 'string' ? { compositionId: body.compositionId } : {}),
+      ...(compositionId ? { compositionId } : {}),
       elementIds,
       ...(typeof body.senderId === 'string' ? { senderId: body.senderId } : {}),
+      ...(body.selection !== undefined ? { selection: body.selection } : {}),
       ts: Date.now(),
     };
 
@@ -160,12 +169,15 @@ export function createStudioSystemRoutes(deps: DisklessStudioDeps): Hono<{ Varia
     if (deps.eventBus && isUuid(projectId)) {
       void deps.eventBus.publish(selectionChannel(auth.workspaceId, projectId), event).catch(() => {});
     }
-    return c.json({ ok: true, selection: event });
-  });
+    return c.json({ ok: true, selection: body.selection ?? event, event });
+  };
+
+  app.put('/api/projects/:id/selection', handleUpdateSelection);
+  app.post('/api/projects/:id/selection', handleUpdateSelection);
 
   // GET /api/events — Cross-instance SSE subscribing to RedisEventBus `om:project:{wid}:{pid}` + `om:selection:{wid}:{pid}`.
   app.get('/api/events', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:read' });
     const projectId = c.req.query('projectId') ?? '';
     if (!isUuid(projectId)) {
       throw new CloudError('INVALID_ARGUMENT', 'Query parameter "projectId" must be a valid project UUID.', {
@@ -212,7 +224,7 @@ export function createStudioSystemRoutes(deps: DisklessStudioDeps): Hono<{ Varia
         selectionChannel(auth.workspaceId, projectId),
         (payload) => {
           if (closed || stream.aborted) return;
-          const sel = payload as SelectionEvent;
+          const sel = payload as StoredSelection;
           latestSelections.set(`${auth.workspaceId}:${projectId}`, sel);
           void stream
             .writeSSE({
@@ -257,7 +269,7 @@ export function createStudioSystemRoutes(deps: DisklessStudioDeps): Hono<{ Varia
 
   // GET /api/environment/ffmpeg — Reads Redis `om:workers:render:health` heartbeat (never spawns local ffmpeg!).
   app.get('/api/environment/ffmpeg', async (c) => {
-    await getAuthContext(c, deps);
+    await getAuthContext(c, deps, { scope: 'projects:read' });
     const workers = deps.eventBus
       ? await deps.eventBus.getRenderWorkersHealth(60_000).catch(() => [])
       : [];
@@ -280,9 +292,9 @@ export function createStudioSystemRoutes(deps: DisklessStudioDeps): Hono<{ Varia
     });
   });
 
-  // GET /api/runtime.js — Serve bundled Hyperframes browser runtime JS.
-  app.get('/api/runtime.js', async (c) => {
-    const js = await loadRuntimeJs();
+  // GET /api/runtime.js — Serve pre-built Hyperframes browser runtime IIFE directly from @hyperframes/core/runtime-script.
+  app.get('/api/runtime.js', (c) => {
+    const js = loadRuntimeJs();
     c.header('Content-Type', 'application/javascript; charset=utf-8');
     c.header('Cache-Control', 'public, max-age=3600');
     return c.body(js, 200);
@@ -298,26 +310,32 @@ export function createStudioSystemRoutes(deps: DisklessStudioDeps): Hono<{ Varia
     return c.body(new Uint8Array(asset.content), 200);
   });
 
+  // GET /api/open-in-desktop — Probe endpoint called by OpenInDesktopButton; reports desktop handoff unavailable in cloud mode.
+  app.get('/api/open-in-desktop', async (c) => {
+    await getAuthContext(c, deps, { scope: 'projects:read' });
+    return c.json({ available: false, handoff: false, installed: false });
+  });
+
   // POST /api/open-in-desktop — Unavailable in cloud container mode.
   app.post('/api/open-in-desktop', async (c) => {
-    await getAuthContext(c, deps);
+    await getAuthContext(c, deps, { scope: 'projects:write', minRole: 'editor' });
     throw featureDeferredP2('open_in_desktop');
   });
 
   // GET /api/assets/global — Empty container-safe global asset list (workspace assets live in AssetsService).
   app.get('/api/assets/global', async (c) => {
-    await getAuthContext(c, deps);
+    await getAuthContext(c, deps, { scope: 'projects:read' });
     return c.json({ assets: [] });
   });
 
   // GET /api/registry/blocks & POST /api/projects/:id/registry/install
   app.get('/api/registry/blocks', async (c) => {
-    await getAuthContext(c, deps);
+    await getAuthContext(c, deps, { scope: 'projects:read' });
     return c.json({ blocks: [] });
   });
 
   app.post('/api/projects/:id/registry/install', async (c) => {
-    await getAuthContext(c, deps);
+    await getAuthContext(c, deps, { scope: 'projects:write', minRole: 'editor' });
     throw featureDeferredP2('registry_install');
   });
 

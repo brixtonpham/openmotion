@@ -55,7 +55,7 @@ export function createStudioMediaRoutes(deps: DisklessStudioDeps): Hono<{ Variab
 
   // GET /api/projects/:id/media/metadata?path=... — Serve cached ffprobe/Sharp metadata from PG (zero ffprobe on web pod).
   app.get('/api/projects/:id/media/metadata', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:read' });
     const projectId = c.req.param('id');
     const rawPath = c.req.query('path') ?? '';
     if (!rawPath) {
@@ -119,7 +119,7 @@ export function createStudioMediaRoutes(deps: DisklessStudioDeps): Hono<{ Variab
 
   // GET /api/projects/:id/waveform/* and /peaks/* — Serve cached waveform peaks JSON from S3 or enqueue job.
   const handleWaveformPeaks = async (c: Context<{ Variables: StudioVariables }>, marker: string) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:read' });
     const projectId = c.req.param('id') ?? '';
     const rawPath = extractWildcardPath(c.req.url, marker);
     const safePath = normalizeSafeProjectPath(rawPath);
@@ -157,20 +157,32 @@ export function createStudioMediaRoutes(deps: DisklessStudioDeps): Hono<{ Variab
   app.get('/api/projects/:id/waveform/*', (c) => handleWaveformPeaks(c, '/waveform/'));
   app.get('/api/projects/:id/peaks/*', (c) => handleWaveformPeaks(c, '/peaks/'));
 
-  // GET /api/projects/:id/image-thumbnail/* — Serve cached Sharp thumbnail via 302 or enqueue media_ingest.
+  // GET & HEAD /api/projects/:id/image-thumbnail/* — Direct 200 on HEAD; 302 presigned GET on hit or enqueue media_ingest.
   app.get('/api/projects/:id/image-thumbnail/*', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:read' });
     const projectId = c.req.param('id');
     const rawPath = extractWildcardPath(c.req.url, '/image-thumbnail/');
     const safePath = normalizeSafeProjectPath(rawPath);
     const file = await deps.files.getFile(auth, projectId, safePath);
-    if (!file) return c.json({ error: 'Image file not found', path: safePath }, 404);
+    if (!file) {
+      return c.req.method === 'HEAD'
+        ? c.body(null, 404)
+        : c.json({ error: 'Image file not found', path: safePath }, 404);
+    }
 
     const width = parseIntRange(c.req.query('w') ?? c.req.query('width'), 16, 2048, 320);
     const spec = `w${width}`;
     const thumbKey = assertTenantScopedKey(auth.workspaceId, thumbnailKey(auth.workspaceId, file.sha256, spec));
     const head = await deps.storage.headObject(thumbKey);
     if (head) {
+      if (c.req.method === 'HEAD') {
+        c.header('Content-Type', head.contentType ?? 'image/jpeg');
+        c.header('Content-Length', String(head.contentLength));
+        c.header('Accept-Ranges', 'bytes');
+        c.header('Cache-Control', PRESIGNED_REDIRECT_HEADERS['Cache-Control']);
+        c.header('Vary', PRESIGNED_REDIRECT_HEADERS.Vary);
+        return c.body(null, 200);
+      }
       const url = await deps.storage.presignGet(thumbKey, {
         expiresInSec: 300,
         responseContentType: 'image/jpeg',
@@ -186,6 +198,9 @@ export function createStudioMediaRoutes(deps: DisklessStudioDeps): Hono<{ Variab
 
     if (c.req.query('cached') === '1') {
       return c.body(null, 204);
+    }
+    if (c.req.method === 'HEAD') {
+      return c.body(null, 404);
     }
 
     if (deps.queues) {
@@ -203,9 +218,9 @@ export function createStudioMediaRoutes(deps: DisklessStudioDeps): Hono<{ Variab
     return c.json({ pending: true, path: safePath, spec }, 202);
   });
 
-  // GET /api/projects/:id/thumbnail and /thumbnail/* — Composition thumbnail cache (302 on hit, 204 on ?cached=1 miss).
+  // GET & HEAD /api/projects/:id/thumbnail and /thumbnail/* — Direct 200 on HEAD; 302 on GET hit, 204 on ?cached=1 miss.
   const handleCompositionThumbnail = async (c: Context<{ Variables: StudioVariables }>) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:read' });
     const projectId = c.req.param('id') ?? '';
     const project = await loadProjectOrThrow(deps.db, auth.workspaceId, projectId, { allowTrashed: true });
 
@@ -224,6 +239,14 @@ export function createStudioMediaRoutes(deps: DisklessStudioDeps): Hono<{ Variab
 
     const head = await deps.storage.headObject(s3Key);
     if (head) {
+      if (c.req.method === 'HEAD') {
+        c.header('Content-Type', head.contentType ?? 'image/png');
+        c.header('Content-Length', String(head.contentLength));
+        c.header('Accept-Ranges', 'bytes');
+        c.header('Cache-Control', PRESIGNED_REDIRECT_HEADERS['Cache-Control']);
+        c.header('Vary', PRESIGNED_REDIRECT_HEADERS.Vary);
+        return c.body(null, 200);
+      }
       const url = await deps.storage.presignGet(s3Key, {
         expiresInSec: 300,
         responseContentType: 'image/png',
@@ -239,6 +262,9 @@ export function createStudioMediaRoutes(deps: DisklessStudioDeps): Hono<{ Variab
 
     if (c.req.query('cached') === '1') {
       return c.body(null, 204);
+    }
+    if (c.req.method === 'HEAD') {
+      return c.body(null, 404);
     }
 
     if (deps.queues) {
@@ -263,7 +289,7 @@ export function createStudioMediaRoutes(deps: DisklessStudioDeps): Hono<{ Variab
 
   // POST /api/projects/:id/loudness/normalize — Enqueue loudness normalization job on worker-media.
   app.post('/api/projects/:id/loudness/normalize', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:write', minRole: 'editor' });
     const projectId = c.req.param('id');
     const body = (await c.req.json().catch(() => null)) as {
       sourcePath?: string;
@@ -342,13 +368,13 @@ export function createStudioMediaRoutes(deps: DisklessStudioDeps): Hono<{ Variab
 
   // POST /api/projects/:id/media/remove-background — Explicitly deferred to P2 (501 FEATURE_DEFERRED_P2).
   app.post('/api/projects/:id/media/remove-background', async (c) => {
-    await getAuthContext(c, deps);
+    await getAuthContext(c, deps, { scope: 'projects:write', minRole: 'editor' });
     throw featureDeferredP2('remove_background');
   });
 
   // GET /api/media-jobs/:jobId/progress — SSE progress for async media-ingest jobs.
   app.get('/api/media-jobs/:jobId/progress', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:read' });
     const jobId = c.req.param('jobId');
     if (!isUuid(jobId)) return c.notFound();
 

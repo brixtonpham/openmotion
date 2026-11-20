@@ -15,7 +15,7 @@ export function createStudioProjectsRoutes(deps: DisklessStudioDeps): Hono<{ Var
 
   // GET /api/projects — List non-trashed workspace projects (virtual descriptors, zero local paths).
   app.get('/api/projects', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:read' });
     const catalog = await deps.workspace.getCatalog(auth);
     return c.json({
       activeId: catalog.activeId,
@@ -33,7 +33,7 @@ export function createStudioProjectsRoutes(deps: DisklessStudioDeps): Hono<{ Var
 
   // GET /api/projects/:id — Full Studio project payload (virtual files, compositions, fonts, assetNames, info).
   app.get('/api/projects/:id', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:read' });
     const projectId = c.req.param('id');
     const detail = await deps.workspace.getProject(auth, projectId, { allowTrashed: true });
     const virtual = await deps.files.loadVirtualProject(auth, projectId);
@@ -88,7 +88,7 @@ export function createStudioProjectsRoutes(deps: DisklessStudioDeps): Hono<{ Var
 
   // GET /api/projects/:id/signature — Canonical project signature / revision for polling & preview invalidation.
   app.get('/api/projects/:id/signature', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:read' });
     const projectId = c.req.param('id');
     const detail = await deps.workspace.getProject(auth, projectId, { allowTrashed: true });
     const fileList = await deps.files.listFiles(auth, projectId, { allowTrashed: true });
@@ -103,7 +103,7 @@ export function createStudioProjectsRoutes(deps: DisklessStudioDeps): Hono<{ Var
 
   // GET /api/projects/:id/files — Detailed file listing with strong ETags & types.
   app.get('/api/projects/:id/files', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:read' });
     const projectId = c.req.param('id');
     const detail = await deps.workspace.getProject(auth, projectId, { allowTrashed: true });
     const fileList = await deps.files.listFiles(auth, projectId, { allowTrashed: true });

@@ -43,7 +43,7 @@ import {
   type StudioQueuesPort,
   type VirtualFileRecord,
 } from '../../src/studio/index.ts';
-import { compThumbnailKey, exportKey } from '../../src/infra/storage.ts';
+import { compThumbnailKey, exportKey, thumbnailKey } from '../../src/infra/storage.ts';
 
 const REPO_ROOT = fileURLToPath(new URL('../../', import.meta.url));
 
@@ -150,7 +150,7 @@ class StudioTestPgClient {
     if (/^COALESCE\s*\(\s*MAX\s*\(/i.test(selectList)) {
       const col = /MAX\s*\(\s*"([^"]+)"\s*\)/i.exec(selectList)![1];
       const maxVal = matched.reduce((acc, r) => Math.max(acc, Number(r[col] ?? 0)), 0);
-      return { rows: [rowMode === 'array' ? [maxVal] : { maxSeq: maxVal }] };
+      return { rows: [rowMode === 'array' ? [maxVal] : { maxVal }] };
     }
     if (order) {
       const specs = splitTop(order, ',').map((p) => {
@@ -1040,8 +1040,236 @@ describe('Diskless Studio HTTP Routes (ETag, HEAD direct, 302 headers, DOM & GSA
     const retryRender = await env.studioApp.request(`/api/projects/${created.projectId}/render`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ format: 'mp4' }),
+      body: JSON.stringify({ format: 'mp4', composition: 'index.html', variables: { theme: 'dark' } }),
     });
     assert.equal(retryRender.status, 200);
+    const retryRenderJson = (await retryRender.json()) as { settings: { variables?: Record<string, unknown> } };
+    assert.deepEqual(retryRenderJson.settings.variables, { theme: 'dark' });
+  });
+
+  it('verifies #41 fixes: HTTP /preview + /preview/comp/* 200, real /api/runtime.js, worker-render resultJson interop, RBAC/scopes, HEAD thumbnails, PUT selection, GET open-in-desktop, and multi-file upload', async () => {
+    const env = createStudioTestEnv();
+    const subHtml = `<!DOCTYPE html><html><body><div data-composition-id="sub" data-width="1920" data-height="1080" data-duration="3"><span>Sub</span></div></body></html>`;
+    const created = await env.workspace.createProject(env.auth, { title: 'Verifier41 Suite' });
+    await env.files.commitChanges(env.auth, {
+      projectId: created.projectId,
+      ops: [{ op: 'upsert_text', path: 'compositions/sub.html', content: subHtml }],
+    });
+
+    // 1. Live GET /api/projects/:id/preview and /preview/comp/* return 200 with root-relative gsapBaseUrl.
+    const previewRes = await env.studioApp.request(`/api/projects/${created.projectId}/preview`);
+    const previewHtml = await previewRes.text();
+    assert.equal(previewRes.status, 200, previewHtml);
+    assert.ok(previewHtml.includes('/api/vendor/gsap/'));
+    assert.ok(previewHtml.includes('/api/runtime.js'));
+
+    const subPreviewRes = await env.studioApp.request(
+      `/api/projects/${created.projectId}/preview/comp/compositions/sub.html`,
+    );
+    assert.equal(subPreviewRes.status, 200);
+    assert.ok((await subPreviewRes.text()).includes('Sub'));
+
+    // 2. GET /api/runtime.js returns real pre-built Hyperframes browser runtime IIFE (>> 100 KB).
+    const runtimeRes = await env.studioApp.request('/api/runtime.js');
+    assert.equal(runtimeRes.status, 200);
+    const runtimeJs = await runtimeRes.text();
+    assert.ok(runtimeJs.length > 100_000, `Expected full Hyperframes runtime script, got ${runtimeJs.length} bytes`);
+
+    // 3. Render worker interop: resultJson with { outputName, bytes, s3Key } + failed -> 'failed' + ?download=1.
+    const workerJobId = randomUUID();
+    env.pgClient.seed('jobs', {
+      id: workerJobId,
+      workspace_id: env.auth.workspaceId,
+      project_id: created.projectId,
+      kind: 'export_render',
+      state: 'completed',
+      stage: 'done',
+      progress: 100,
+      input_payload: { outputName: 'worker-out.mp4' },
+      result_json: {
+        s3Key: exportKey(env.auth.workspaceId, workerJobId, 'worker-out.mp4'),
+        outputName: 'worker-out.mp4',
+        bytes: 123456,
+        sha256: 'e'.repeat(64),
+      },
+      deleted_at: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+    const failedJobId = randomUUID();
+    env.pgClient.seed('jobs', {
+      id: failedJobId,
+      workspace_id: env.auth.workspaceId,
+      project_id: created.projectId,
+      kind: 'export_render',
+      state: 'failed',
+      stage: 'render',
+      progress: 12,
+      input_payload: { outputName: 'broken.mp4' },
+      error_message: 'boom',
+      deleted_at: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+
+    const headWorkerRender = await env.studioApp.request(`/api/render/${workerJobId}/view`, { method: 'HEAD' });
+    assert.equal(headWorkerRender.status, 200);
+    assert.equal(headWorkerRender.headers.get('content-length'), '123456');
+
+    const rendersList = (await (await env.studioApp.request(`/api/projects/${created.projectId}/renders`)).json()) as {
+      renders: Array<{ id: string; status: string; bytes?: number }>;
+    };
+    assert.equal(rendersList.renders.find((r) => r.id === failedJobId)?.status, 'failed');
+    assert.equal(rendersList.renders.find((r) => r.id === workerJobId)?.bytes, 123456);
+
+    const downloadByFilename = await env.studioApp.request(
+      `/api/projects/${created.projectId}/renders/file/worker-out.mp4?download=1`,
+    );
+    assert.equal(downloadByFilename.status, 302);
+    assert.ok(downloadByFilename.headers.get('location')?.includes('attachment'));
+
+    // 4. HEAD on /thumbnail and /image-thumbnail/* answered directly (200 on hit, 204 on ?cached=1 miss, NEVER 302).
+    const imgBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    await env.files.commitChanges(env.auth, {
+      projectId: created.projectId,
+      ops: [{ op: 'upsert_binary', path: 'assets/pic.png', data: imgBytes, mimeType: 'image/png' }],
+    });
+    const imgSha = sha256Hex(imgBytes);
+    await env.storage.putObject(thumbnailKey(env.auth.workspaceId, imgSha, 'w320'), Buffer.from([0xff, 0xd8, 0xff]), 'image/jpeg');
+
+    const presignBefore = env.storage.presignGetCalls;
+    const headImgThumb = await env.studioApp.request(
+      `/api/projects/${created.projectId}/image-thumbnail/assets/pic.png`,
+      { method: 'HEAD' },
+    );
+    assert.equal(headImgThumb.status, 200);
+    assert.equal(headImgThumb.headers.get('content-type'), 'image/jpeg');
+    assert.equal(headImgThumb.headers.get('content-length'), '3');
+
+    const headCompMiss = await env.studioApp.request(
+      `/api/projects/${created.projectId}/thumbnail?cached=1`,
+      { method: 'HEAD' },
+    );
+    assert.equal(headCompMiss.status, 204);
+    assert.equal(env.storage.presignGetCalls, presignBefore, 'HEAD thumbnail must NEVER call presignGet');
+
+    // 5. PUT /api/projects/:id/selection with { selection } and GET /api/open-in-desktop.
+    const putSel = await env.studioApp.request(`/api/projects/${created.projectId}/selection`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ selection: { elementIds: ['headline'], compositionId: 'main' } }),
+    });
+    assert.equal(putSel.status, 200);
+    const getSel = await (await env.studioApp.request(`/api/projects/${created.projectId}/selection`)).json() as {
+      elementIds: string[];
+    };
+    assert.deepEqual(getSel.elementIds, ['headline']);
+
+    const getDesktop = await env.studioApp.request('/api/open-in-desktop');
+    assert.equal(getDesktop.status, 200);
+    assert.deepEqual(await getDesktop.json(), { available: false, handoff: false, installed: false });
+
+    // 6. Multi-file upload with ?dir=media saves all files, returns files[], and uses spec 'w320'.
+    const form = new FormData();
+    form.append('file', new File([new Uint8Array([0x89, 0x50, 0x4e, 0x47])], 'a.png', { type: 'image/png' }));
+    form.append('file', new File([new Uint8Array([1, 2, 3, 4])], 'b.jpg', { type: 'image/jpeg' }));
+    env.enqueued.length = 0;
+    const uploadRes = await env.studioApp.request(`/api/projects/${created.projectId}/upload?dir=media`, {
+      method: 'POST',
+      body: form,
+    });
+    assert.equal(uploadRes.status, 201);
+    const uploadJson = (await uploadRes.json()) as { files: string[]; path: string };
+    assert.deepEqual(uploadJson.files, ['media/a.png', 'media/b.jpg']);
+    assert.equal(uploadJson.path, 'media/a.png');
+    const thumbJobs = env.enqueued.filter((j) => j.name === 'image_thumbnail');
+    assert.equal(thumbJobs.length, 2);
+    assert.equal((thumbJobs[0].payload as { spec: string }).spec, 'w320');
+
+    // 7. RBAC & PAT scope enforcement: viewer with projects:read only is allowed reads and blocked (403) on writes!
+    const viewerAuth: AuthContext = {
+      ...env.auth,
+      role: 'viewer',
+      scopes: ['projects:read'],
+      authMethod: 'pat',
+    };
+    const db = drizzle({ client: env.pgClient as never, schema }) as unknown as Database;
+    const viewerStudio = createDisklessStudioApp({
+      db,
+      storage: env.storage,
+      hotTextCache: env.hotTextCache,
+      eventBus: env.eventBus,
+      queues: { enqueueMediaIngest: async () => ({}), enqueueRenderExport: async () => ({}) },
+      workspace: env.workspace,
+      files: env.files,
+      history: env.history,
+      assetNames: new AssetNamesService({ db, files: env.files }),
+      resolveAuth: () => viewerAuth,
+      skipDeterministicFonts: true,
+    });
+    const viewerProjects = createProjectsRouter({
+      workspace: env.workspace,
+      files: env.files,
+      history: env.history,
+      assetNames: new AssetNamesService({ db, files: env.files }),
+      workRounds: new WorkRoundsService(db),
+      resolveAuth: () => viewerAuth,
+    });
+    const viewerSessions = createSessionsRouter({ workspace: env.workspace, resolveAuth: () => viewerAuth });
+    const viewerArchives = createArchivesRouter({
+      archives: new ProjectArchiveService({ db, storage: env.storage, workspace: env.workspace, files: env.files }),
+      resolveAuth: () => viewerAuth,
+    });
+
+    assert.equal((await viewerStudio.request(`/api/projects/${created.projectId}/files/index.html`)).status, 200);
+    assert.equal((await viewerProjects.request('/motion-api/projects')).status, 200);
+
+    const viewerPut = await viewerStudio.request(`/api/projects/${created.projectId}/files/index.html`, {
+      method: 'PUT',
+      headers: { 'If-Match': '*' },
+      body: 'nope',
+    });
+    assert.equal(viewerPut.status, 403);
+    assert.equal(((await viewerPut.json()) as { applied: boolean }).applied, false);
+
+    assert.equal(
+      (await viewerProjects.request('/motion-api/projects', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })).status,
+      403,
+    );
+    assert.equal(
+      (await viewerSessions.request('/motion-api/sessions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })).status,
+      403,
+    );
+    assert.equal(
+      (await viewerArchives.request('/motion-api/project-archives/export', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ all: true }) })).status,
+      403,
+    );
+
+    // Editor with projects:write but without exports:write gets 403 on POST /render!
+    const noExportEditor: AuthContext = {
+      ...env.auth,
+      role: 'editor',
+      scopes: ['projects:read', 'projects:write'],
+      authMethod: 'pat',
+    };
+    const noExportStudio = createDisklessStudioApp({
+      db,
+      storage: env.storage,
+      hotTextCache: env.hotTextCache,
+      eventBus: env.eventBus,
+      queues: { enqueueMediaIngest: async () => ({}), enqueueRenderExport: async () => ({}) },
+      workspace: env.workspace,
+      files: env.files,
+      history: env.history,
+      assetNames: new AssetNamesService({ db, files: env.files }),
+      resolveAuth: () => noExportEditor,
+      skipDeterministicFonts: true,
+    });
+    const deniedRender = await noExportStudio.request(`/api/projects/${created.projectId}/render`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ format: 'mp4' }),
+    });
+    assert.equal(deniedRender.status, 403);
   });
 });

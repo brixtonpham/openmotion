@@ -43,7 +43,7 @@ function mapJobStateToStudioStatus(state: JobState): string {
     case 'completed':
       return 'complete';
     case 'failed':
-      return 'error';
+      return 'failed';
     case 'cancelled':
       return 'cancelled';
   }
@@ -53,13 +53,31 @@ function isTerminalState(state: string): boolean {
   return state === 'completed' || state === 'failed' || state === 'cancelled';
 }
 
+function readResultSizeBytes(result: Record<string, unknown>): number | undefined {
+  const candidate = result.bytes ?? result.sizeBytes;
+  return typeof candidate === 'number' && Number.isFinite(candidate) && candidate >= 0
+    ? candidate
+    : undefined;
+}
+
+function readResultFilename(
+  result: Record<string, unknown>,
+  input: Record<string, unknown>,
+  jobId: string,
+): string {
+  return (
+    (typeof result.outputName === 'string' && result.outputName) ||
+    (typeof result.filename === 'string' && result.filename) ||
+    (typeof input.outputName === 'string' && input.outputName) ||
+    `render-${jobId.slice(0, 8)}.mp4`
+  );
+}
+
 function formatRenderAttempt(row: typeof jobs.$inferSelect): Record<string, unknown> {
   const input = (row.inputPayload ?? {}) as Record<string, unknown>;
   const result = (row.resultJson ?? {}) as Record<string, unknown>;
-  const filename =
-    (typeof result.filename === 'string' && result.filename) ||
-    (typeof input.outputName === 'string' && input.outputName) ||
-    `render-${row.id.slice(0, 8)}.mp4`;
+  const filename = readResultFilename(result, input, row.id);
+  const sizeBytes = readResultSizeBytes(result);
 
   const durationMs =
     row.startedAt && row.terminalAt
@@ -81,7 +99,7 @@ function formatRenderAttempt(row: typeof jobs.$inferSelect): Record<string, unkn
     fileAvailable: row.state === 'completed' && typeof result.s3Key === 'string' && result.s3Key.length > 0,
     ...(row.errorMessage ? { error: row.errorMessage } : {}),
     ...(input.settings ? { settings: input.settings } : {}),
-    ...(typeof result.sizeBytes === 'number' ? { sizeBytes: result.sizeBytes } : {}),
+    ...(sizeBytes !== undefined ? { bytes: sizeBytes, sizeBytes } : {}),
     ...(typeof result.sha256 === 'string' ? { sha256: result.sha256 } : {}),
   };
 }
@@ -101,18 +119,12 @@ function resolveRenderArtifactMeta(
   if (!rawKey) return null;
   const s3Key = assertTenantScopedKey(workspaceId, rawKey);
   const input = (row.inputPayload ?? {}) as Record<string, unknown>;
-  const filename =
-    (typeof result.filename === 'string' && result.filename) ||
-    (typeof input.outputName === 'string' && input.outputName) ||
-    `render-${row.id.slice(0, 8)}.mp4`;
+  const filename = readResultFilename(result, input, row.id);
   const contentType =
     (typeof result.mimeType === 'string' && result.mimeType) ||
     (typeof result.contentType === 'string' && result.contentType) ||
     getMimeType(filename);
-  const sizeBytes =
-    typeof result.sizeBytes === 'number' && Number.isFinite(result.sizeBytes) && result.sizeBytes >= 0
-      ? result.sizeBytes
-      : 0;
+  const sizeBytes = readResultSizeBytes(result) ?? 0;
   const sha256 = typeof result.sha256 === 'string' ? result.sha256 : undefined;
   return { s3Key, filename, contentType, sizeBytes, sha256 };
 }
@@ -122,16 +134,30 @@ export function createStudioRenderRoutes(deps: DisklessStudioDeps): Hono<{ Varia
 
   // POST /api/projects/:id/render — Create export job in PG & enqueue to render-export queue.
   app.post('/api/projects/:id/render', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'exports:write', minRole: 'editor' });
     const projectId = c.req.param('id');
     const body = ((await c.req.json().catch(() => ({}))) ?? {}) as EncoderOptionsBody & {
       format?: string;
       quality?: string;
       fps?: number;
       compositionPath?: string;
+      composition?: string;
+      variables?: unknown;
       requestId?: string;
       telemetryOptOut?: boolean;
     };
+
+    const compositionPath =
+      typeof body.compositionPath === 'string' && body.compositionPath.trim()
+        ? body.compositionPath.trim()
+        : typeof body.composition === 'string' && body.composition.trim()
+          ? body.composition.trim()
+          : undefined;
+
+    const variables =
+      body.variables && typeof body.variables === 'object' && !Array.isArray(body.variables)
+        ? (body.variables as Record<string, unknown>)
+        : undefined;
 
     const format = parseFormat(body.format);
     const parsedEncoder = parseEncoderOptions(body, format);
@@ -213,6 +239,7 @@ export function createStudioRenderRoutes(deps: DisklessStudioDeps): Hono<{ Varia
       ...(typeof body.fps === 'number' && Number.isFinite(body.fps) ? { fps: body.fps } : {}),
       ...encoderJobOptions(parsedEncoder.options),
       ...(parsedEncoder.options.gifLoop !== undefined ? { gifLoop: parsedEncoder.options.gifLoop } : {}),
+      ...(variables ? { variables } : {}),
     };
 
     try {
@@ -233,7 +260,8 @@ export function createStudioRenderRoutes(deps: DisklessStudioDeps): Hono<{ Varia
           inputPayload: {
             outputName: filename,
             format,
-            compositionPath: body.compositionPath ?? 'index.html',
+            compositionPath: compositionPath ?? 'index.html',
+            ...(variables ? { variables } : {}),
             settings,
           },
           createdAt: now,
@@ -241,8 +269,10 @@ export function createStudioRenderRoutes(deps: DisklessStudioDeps): Hono<{ Varia
         }),
       );
     } catch (error) {
-      // Handle unique partial index race (`23505` on uq_jobs_active_export_per_project).
-      const pgCode = (error as { code?: string })?.code;
+      // Handle unique partial index race (`23505` on uq_jobs_active_export_per_project),
+      // whether thrown directly by `pg` or wrapped as `error.cause` by Drizzle.
+      const errObj = error as { code?: string; cause?: { code?: string } } | null;
+      const pgCode = errObj?.code ?? errObj?.cause?.code;
       if (pgCode === '23505') {
         return c.json(
           {
@@ -264,7 +294,7 @@ export function createStudioRenderRoutes(deps: DisklessStudioDeps): Hono<{ Varia
           projectId: project.id,
           versionId: project.currentVersionId,
           revision: project.revision.trim(),
-          compositionPath: body.compositionPath,
+          compositionPath,
           outputName: filename,
           format,
           phase1: true,
@@ -305,7 +335,7 @@ export function createStudioRenderRoutes(deps: DisklessStudioDeps): Hono<{ Varia
 
   // GET /api/projects/:id/renders — List non-deleted export render attempts for a project.
   app.get('/api/projects/:id/renders', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:read' });
     const projectId = c.req.param('id');
     await loadProjectOrThrow(deps.db, auth.workspaceId, projectId, { allowTrashed: true });
 
@@ -328,7 +358,7 @@ export function createStudioRenderRoutes(deps: DisklessStudioDeps): Hono<{ Varia
 
   // GET /api/render/:jobId/progress — SSE progress stream backed by PG replay + Redis `om:job:{jobId}`.
   app.get('/api/render/:jobId/progress', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:read' });
     const jobId = c.req.param('jobId');
     if (!isUuid(jobId)) return c.notFound();
 
@@ -403,7 +433,7 @@ export function createStudioRenderRoutes(deps: DisklessStudioDeps): Hono<{ Varia
 
   // POST /api/render/:jobId/cancel — Request cooperative render cancellation via PG + Redis.
   app.post('/api/render/:jobId/cancel', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'exports:write', minRole: 'editor' });
     const jobId = c.req.param('jobId');
     assertValidUuid(jobId, 'jobId');
 
@@ -449,7 +479,7 @@ export function createStudioRenderRoutes(deps: DisklessStudioDeps): Hono<{ Varia
 
   // DELETE /api/render/:jobId — Soft-delete a confirmed terminal render attempt.
   app.delete('/api/render/:jobId', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'exports:write', minRole: 'editor' });
     const jobId = c.req.param('jobId');
     assertValidUuid(jobId, 'jobId');
 
@@ -475,7 +505,7 @@ export function createStudioRenderRoutes(deps: DisklessStudioDeps): Hono<{ Varia
   // GET & HEAD /api/render/:jobId/:action{view|download}
   // Hono v4 dispatches HEAD via GET; answer HEAD DIRECTLY from PG metadata — NEVER 302 to GET-signed S3 URL!
   app.get('/api/render/:jobId/:action{view|download}', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:read' });
     const jobId = c.req.param('jobId');
     if (!isUuid(jobId)) return c.req.method === 'HEAD' ? c.body(null, 404) : c.notFound();
 
@@ -550,15 +580,20 @@ export function createStudioRenderRoutes(deps: DisklessStudioDeps): Hono<{ Varia
   };
 
   app.get('/api/projects/:id/renders/file/:filename', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:read' });
     const artifact = await lookupRenderByFilename(auth.workspaceId, c.req.param('id'), c.req.param('filename'));
     if (!artifact) return c.req.method === 'HEAD' ? c.body(null, 404) : c.notFound();
+
+    const isDownload = c.req.query('download') === '1' || c.req.query('download') === 'true';
 
     if (c.req.method === 'HEAD') {
       c.header('Content-Type', artifact.contentType);
       c.header('Content-Length', String(artifact.sizeBytes));
       c.header('Accept-Ranges', 'bytes');
       if (artifact.sha256) c.header('ETag', formatVersionFromSha256(artifact.sha256));
+      if (isDownload) {
+        c.header('Content-Disposition', buildContentDisposition('attachment', artifact.filename));
+      }
       c.header('Cache-Control', PRESIGNED_REDIRECT_HEADERS['Cache-Control']);
       c.header('Vary', PRESIGNED_REDIRECT_HEADERS.Vary);
       return c.body(null, 200);
@@ -567,7 +602,10 @@ export function createStudioRenderRoutes(deps: DisklessStudioDeps): Hono<{ Varia
     const url = await deps.storage.presignGet(artifact.s3Key, {
       expiresInSec: 300,
       responseContentType: artifact.contentType,
-      responseContentDisposition: buildContentDisposition('inline', artifact.filename),
+      responseContentDisposition: buildContentDisposition(
+        isDownload ? 'attachment' : 'inline',
+        artifact.filename,
+      ),
     });
     return new Response(null, {
       status: 302,

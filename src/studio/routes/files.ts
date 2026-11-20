@@ -105,7 +105,7 @@ export function createStudioFilesRoutes(deps: DisklessStudioDeps): Hono<{ Variab
 
   // GET /api/projects/:id/files/* — Read single text file with strong ETag ("sha256:<hex>").
   app.get('/api/projects/:id/files/*', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:read' });
     const projectId = c.req.param('id');
     const rawPath = extractWildcardPath(c.req.url, '/files/');
     const safePath = normalizeSafeProjectPath(rawPath);
@@ -158,7 +158,7 @@ export function createStudioFilesRoutes(deps: DisklessStudioDeps): Hono<{ Variab
 
   // PUT /api/projects/:id/files/* — Optimistic-concurrency text write with If-Match / If-None-Match: *.
   app.put('/api/projects/:id/files/*', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:write', minRole: 'editor' });
     const projectId = c.req.param('id');
     const rawPath = extractWildcardPath(c.req.url, '/files/');
     const safePath = normalizeSafeProjectPath(rawPath, true);
@@ -232,7 +232,7 @@ export function createStudioFilesRoutes(deps: DisklessStudioDeps): Hono<{ Variab
 
   // POST /api/projects/:id/files/* — Create a new text file (409 if already exists).
   app.post('/api/projects/:id/files/*', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:write', minRole: 'editor' });
     const projectId = c.req.param('id');
     const rawPath = extractWildcardPath(c.req.url, '/files/');
     const safePath = normalizeSafeProjectPath(rawPath, true);
@@ -278,7 +278,7 @@ export function createStudioFilesRoutes(deps: DisklessStudioDeps): Hono<{ Variab
 
   // PATCH /api/projects/:id/files/* — Rename file or folder prefix and rewrite relative references in memory.
   app.patch('/api/projects/:id/files/*', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:write', minRole: 'editor' });
     const projectId = c.req.param('id');
     const rawOldPath = extractWildcardPath(c.req.url, '/files/');
     const oldPath = normalizeSafeProjectPath(rawOldPath);
@@ -372,7 +372,7 @@ export function createStudioFilesRoutes(deps: DisklessStudioDeps): Hono<{ Variab
 
   // DELETE /api/projects/:id/files/* — Delete file or folder prefix; cleans asset names & emits DELETED_VERSION.
   app.delete('/api/projects/:id/files/*', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:write', minRole: 'editor' });
     const projectId = c.req.param('id');
     const rawPath = extractWildcardPath(c.req.url, '/files/');
     const targetPath = normalizeSafeProjectPath(rawPath);
@@ -436,7 +436,7 @@ export function createStudioFilesRoutes(deps: DisklessStudioDeps): Hono<{ Variab
 
   // POST /api/projects/:id/duplicate-file — Clone a project file into a unique sibling path via CAS ref.
   app.post('/api/projects/:id/duplicate-file', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:write', minRole: 'editor' });
     const projectId = c.req.param('id');
     const body = (await c.req.json().catch(() => null)) as { path?: unknown; targetPath?: unknown } | null;
     if (!body || typeof body.path !== 'string' || !body.path.trim()) {
@@ -510,93 +510,145 @@ export function createStudioFilesRoutes(deps: DisklessStudioDeps): Hono<{ Variab
         c.json({ error: 'Upload exceeds 500 MB (500000000 bytes)', maxBytes: MAX_ASSET_BYTES }, 413),
     }),
     async (c) => {
-      const auth = await getAuthContext(c, deps);
+      const auth = await getAuthContext(c, deps, { scope: 'projects:write', minRole: 'editor' });
       const projectId = c.req.param('id');
       const writeToken = createWriteToken(c.req.header('x-hyperframes-write-token'));
 
       const form = await c.req.formData();
-      const uploadedFile = form.get('file');
-      if (!(uploadedFile instanceof File)) {
-        throw new CloudError('INVALID_ARGUMENT', 'Multipart form must include a "file" field.', {
+      const uploadedFiles = form.getAll('file').filter((entry): entry is File => entry instanceof File);
+      if (uploadedFiles.length === 0) {
+        throw new CloudError('INVALID_ARGUMENT', 'Multipart form must include at least one "file" field.', {
           status: 400,
           applied: false,
         });
       }
 
-      const rawDir = typeof form.get('directory') === 'string' ? String(form.get('directory')).trim() : 'assets';
-      const rawTarget = typeof form.get('path') === 'string' ? String(form.get('path')).trim() : '';
-      const safeFileName = path.posix.basename(uploadedFile.name || 'asset.bin').replace(/[\x00-\x1f/\\]/g, '_');
-      const candidatePath = rawTarget || (rawDir ? `${rawDir.replace(/^\/+|\/+$/g, '')}/${safeFileName}` : safeFileName);
-      const safePath = normalizeSafeProjectPath(candidatePath, true);
+      const queryDir = c.req.query('dir');
+      const formDir = form.get('directory');
+      const rawDir =
+        typeof queryDir === 'string' && queryDir.trim()
+          ? queryDir.trim()
+          : typeof formDir === 'string' && formDir.trim()
+            ? formDir.trim()
+            : 'assets';
+      const rawTarget =
+        uploadedFiles.length === 1 && typeof form.get('path') === 'string'
+          ? String(form.get('path')).trim()
+          : '';
 
-      let data: Buffer = Buffer.from(await uploadedFile.arrayBuffer());
-      const mimeType = uploadedFile.type || getMimeType(safePath);
-      if (mimeType === 'image/png' || safePath.toLowerCase().endsWith('.png')) {
-        data = stripSdrPngColourTags(data);
-      }
+      const ops: ProjectFileOp[] = [];
+      const prepared: Array<{
+        path: string;
+        size: number;
+        mimeType: string;
+        sha256: string;
+        version: string;
+        isText: boolean;
+      }> = [];
+      let totalBytes = 0;
 
-      const sha256 = sha256Hex(data);
-      const isText = !isBinaryBuffer(data) && getMimeType(safePath).startsWith('text/');
+      for (const uploadedFile of uploadedFiles) {
+        const safeFileName = path.posix
+          .basename(uploadedFile.name || 'asset.bin')
+          .replace(/[\x00-\x1f/\\]/g, '_');
+        const cleanedDir = rawDir.replace(/^\/+|\/+$/g, '');
+        const candidatePath = rawTarget || (cleanedDir ? `${cleanedDir}/${safeFileName}` : safeFileName);
+        const safePath = normalizeSafeProjectPath(candidatePath, true);
 
-      const committed = await deps.files.commitChanges(auth, {
-        projectId,
-        ops: [
-          {
-            op: 'upsert_binary',
-            path: safePath,
-            data,
-            mimeType,
-          },
-        ],
-        source: 'studio',
-        summary: `Uploaded ${safePath}`,
-        writeToken,
-      });
-
-      // Enqueue background media-ingest metadata probing / waveform / thumbnail jobs for media uploads.
-      if (deps.queues && !isText) {
-        const s3Key = workspaceBlobKey(auth.workspaceId, sha256);
-        if (VIDEO_EXT.test(safePath) || AUDIO_EXT.test(safePath) || IMAGE_EXT.test(safePath)) {
-          void deps.queues
-            .enqueueMediaIngest('media_probe', {
-              workspaceId: auth.workspaceId,
-              blobScope: 'workspace',
-              sha256,
-              s3Key,
-            })
-            .catch(() => {});
+        let data: Buffer = Buffer.from(await uploadedFile.arrayBuffer());
+        const mimeType = uploadedFile.type || getMimeType(safePath);
+        if (mimeType === 'image/png' || safePath.toLowerCase().endsWith('.png')) {
+          data = stripSdrPngColourTags(data);
         }
-        if (AUDIO_EXT.test(safePath) || VIDEO_EXT.test(safePath)) {
-          void deps.queues
-            .enqueueMediaIngest('extract_waveform_peaks', {
-              workspaceId: auth.workspaceId,
-              blobScope: 'workspace',
-              sha256,
-              samples: 512,
-            })
-            .catch(() => {});
-        }
-        if (IMAGE_EXT.test(safePath) && !safePath.toLowerCase().endsWith('.svg')) {
-          void deps.queues
-            .enqueueMediaIngest('image_thumbnail', {
-              workspaceId: auth.workspaceId,
-              blobScope: 'workspace',
-              sha256,
-              spec: 'grid_320',
-              width: 320,
-            })
-            .catch(() => {});
-        }
-      }
 
-      return c.json(
-        {
-          ok: true,
+        const sha256 = sha256Hex(data);
+        const isText = !isBinaryBuffer(data) && getMimeType(safePath).startsWith('text/');
+        totalBytes += data.byteLength;
+
+        ops.push({
+          op: 'upsert_binary',
+          path: safePath,
+          data,
+          mimeType,
+        });
+        prepared.push({
           path: safePath,
           size: data.byteLength,
           mimeType,
           sha256,
           version: formatVersionFromSha256(sha256),
+          isText,
+        });
+      }
+
+      const committed = await deps.files.commitChanges(auth, {
+        projectId,
+        ops,
+        source: 'studio',
+        summary:
+          prepared.length === 1
+            ? `Uploaded ${prepared[0].path}`
+            : `Uploaded ${prepared.length} files`,
+        writeToken,
+      });
+
+      // Enqueue background media-ingest metadata probing / waveform / thumbnail jobs for media uploads.
+      if (deps.queues) {
+        for (const item of prepared) {
+          if (item.isText) continue;
+          const s3Key = workspaceBlobKey(auth.workspaceId, item.sha256);
+          if (VIDEO_EXT.test(item.path) || AUDIO_EXT.test(item.path) || IMAGE_EXT.test(item.path)) {
+            void deps.queues
+              .enqueueMediaIngest('media_probe', {
+                workspaceId: auth.workspaceId,
+                blobScope: 'workspace',
+                sha256: item.sha256,
+                s3Key,
+              })
+              .catch(() => {});
+          }
+          if (AUDIO_EXT.test(item.path) || VIDEO_EXT.test(item.path)) {
+            void deps.queues
+              .enqueueMediaIngest('extract_waveform_peaks', {
+                workspaceId: auth.workspaceId,
+                blobScope: 'workspace',
+                sha256: item.sha256,
+                samples: 512,
+              })
+              .catch(() => {});
+          }
+          if (IMAGE_EXT.test(item.path) && !item.path.toLowerCase().endsWith('.svg')) {
+            void deps.queues
+              .enqueueMediaIngest('image_thumbnail', {
+                workspaceId: auth.workspaceId,
+                blobScope: 'workspace',
+                sha256: item.sha256,
+                spec: 'w320',
+                width: 320,
+              })
+              .catch(() => {});
+          }
+        }
+      }
+
+      const first = prepared[0];
+      const uploadedPaths = prepared.map((p) => p.path);
+      return c.json(
+        {
+          ok: true,
+          files: uploadedPaths,
+          path: first.path,
+          size: totalBytes,
+          mimeType: first.mimeType,
+          sha256: first.sha256,
+          version: first.version,
+          uploaded: prepared.map((p) => ({
+            path: p.path,
+            size: p.size,
+            mimeType: p.mimeType,
+            sha256: p.sha256,
+            version: p.version,
+          })),
           revision: committed.revision,
           writeToken: committed.writeToken,
         },

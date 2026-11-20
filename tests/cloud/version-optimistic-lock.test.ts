@@ -260,6 +260,20 @@ class InMemoryPgClient {
         this.blobLockOrder.push(newRow.sha256);
       }
 
+      // Enforce unique constraint uq_project_versions_number (project_id, version_number).
+      if (tableName === 'project_versions' && newRow.project_id && newRow.version_number !== undefined) {
+        const dup = tableRows.find(
+          (r) => r.project_id === newRow.project_id && r.version_number === newRow.version_number,
+        );
+        if (dup) {
+          const err = new Error('duplicate key value violates unique constraint "uq_project_versions_number"') as Error & {
+            code: string;
+          };
+          err.code = '23505';
+          throw err;
+        }
+      }
+
       // Enforce unique partial index uq_jobs_active_export_per_project.
       if (
         tableName === 'jobs' &&
@@ -1148,17 +1162,30 @@ describe('Cloud Optimistic Locking, Idempotency & CAS Refcounts', () => {
     // Undo after restore, then make a brand new edit: verify stale undone branch is pruned so redo tracks the new branch!
     await h.history.step(h.authA, created.projectId, 'back');
     const v5Html = v1Html.replace('History Film', 'History Film v5 branch');
-    await h.files.commitChanges(h.authA, {
+    const c5 = await h.files.commitChanges(h.authA, {
       projectId: created.projectId,
       ops: [{ op: 'upsert_text', path: 'index.html', content: v5Html }],
       source: 'studio',
       summary: 'Branch v5',
     });
+    assert.equal(c5.versionNumber, 5);
+
+    // Undo v5 -> checkpoint -> undo -> restoreVersion: verify ALL produce monotonic version numbers with zero 23505 collision!
     const backFromV5 = await h.history.step(h.authA, created.projectId, 'back');
     assert.equal(backFromV5.canRedo, true);
     const redoToV5 = await h.history.step(h.authA, created.projectId, 'forward');
     assert.equal(redoToV5.canRedo, false);
     assert.equal((await h.files.readTextFile(h.authA, created.projectId, 'index.html'))?.content, v5Html);
+
+    await h.history.step(h.authA, created.projectId, 'back');
+    const cp = await h.history.checkpoint(h.authA, created.projectId, { label: 'After undo checkpoint' });
+    assert.equal(cp.versionNumber, 6);
+
+    await h.history.step(h.authA, created.projectId, 'back');
+    const restoreAfterUndo = await h.history.restoreVersion(h.authA, created.projectId, {
+      targetVersionId: created.versionId,
+    });
+    assert.equal(restoreAfterUndo.versionNumber, 7);
   });
 
   it('maintains exact workspace_blobs ref_count across edits and decrements ALL live + version refs in sorted sha256 order on permanent delete', async () => {

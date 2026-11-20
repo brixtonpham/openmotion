@@ -48,7 +48,7 @@ export function createStudioPreviewRoutes(deps: DisklessStudioDeps): Hono<{ Vari
 
   // GET /api/projects/:id/preview — Bundled root composition HTML (pure in-memory, zero local FS).
   app.get('/api/projects/:id/preview', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:read' });
     const projectId = c.req.param('id');
     const virtual = await deps.files.loadVirtualProject(auth, projectId);
     const capture = c.req.query('capture') === '1' || c.req.query('capture') === 'true';
@@ -77,7 +77,11 @@ export function createStudioPreviewRoutes(deps: DisklessStudioDeps): Hono<{ Vari
         return c.json({ error: 'Entry composition index.html not found' }, 404);
       }
 
-      const etag = previewEtag(html);
+      const etag = previewEtag(virtual.revision, {
+        gsapBaseUrl: '/api/vendor/gsap/',
+        rawVariables: c.req.query('variables'),
+        capture,
+      });
       if (c.req.header('if-none-match')?.trim() === etag) {
         c.header('ETag', etag);
         return c.body(null, 304);
@@ -97,7 +101,7 @@ export function createStudioPreviewRoutes(deps: DisklessStudioDeps): Hono<{ Vari
 
   // GET /api/projects/:id/preview/comp/* — Standalone sub-composition preview HTML.
   app.get('/api/projects/:id/preview/comp/*', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:read' });
     const projectId = c.req.param('id');
     const compPath = normalizeSafeProjectPath(extractWildcardPath(c.req.url, '/preview/comp/'));
     const virtual = await deps.files.loadVirtualProject(auth, projectId);
@@ -126,7 +130,16 @@ export function createStudioPreviewRoutes(deps: DisklessStudioDeps): Hono<{ Vari
       return c.json({ error: 'Sub-composition not found', path: compPath }, 404);
     }
 
-    const etag = previewEtag(html);
+    const etag = previewEtag(virtual.revision, {
+      compPath,
+      gsapBaseUrl: '/api/vendor/gsap/',
+      rawVariables: c.req.query('variables'),
+      capture,
+    });
+    if (c.req.header('if-none-match')?.trim() === etag) {
+      c.header('ETag', etag);
+      return c.body(null, 304);
+    }
     c.header('Content-Type', 'text/html; charset=utf-8');
     c.header('ETag', etag);
     c.header('Cache-Control', 'no-store');
@@ -137,7 +150,7 @@ export function createStudioPreviewRoutes(deps: DisklessStudioDeps): Hono<{ Vari
   // Note: Hono v4 dispatches HEAD requests through GET handlers; check `c.req.method === 'HEAD'`
   // explicitly and answer HEAD DIRECTLY from PG metadata — NEVER redirect HEAD to a GET-signed S3 URL!
   app.get('/api/projects/:id/preview/*', async (c) => {
-    const auth = await getAuthContext(c, deps);
+    const auth = await getAuthContext(c, deps, { scope: 'projects:read' });
     const projectId = c.req.param('id');
     const rawPath = extractWildcardPath(c.req.url, '/preview/');
     if (!rawPath) {

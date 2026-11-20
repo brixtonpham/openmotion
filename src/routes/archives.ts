@@ -1,9 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import { Hono, type Context } from 'hono';
 import { bodyLimit } from 'hono/body-limit';
-import type { AuthContext } from '../contracts/auth.ts';
+import type { AuthContext, PatScope, WorkspaceRole } from '../contracts/auth.ts';
 import { CloudError, isCloudError } from '../contracts/errors.ts';
 import type { ProjectArchiveService } from '../services/project-archive-service.ts';
+import { assertAuthAccess } from '../studio/context.ts';
 import { PRESIGNED_REDIRECT_HEADERS, buildContentDisposition } from '../studio/etag.ts';
 import { PROJECT_ARCHIVE_LIMITS } from '../../shared/project-archive.ts';
 import type { ProductRouteVariables } from './projects.ts';
@@ -13,15 +14,19 @@ export interface ArchivesRouterDeps {
   readonly resolveAuth?: (c: Context<{ Variables: ProductRouteVariables }>) => AuthContext | Promise<AuthContext>;
 }
 
+const READ_REQ = { scope: 'projects:read' } as const;
+const WRITE_REQ = { scope: 'projects:write', minRole: 'editor' } as const;
+
 async function requireAuth(
   c: Context<{ Variables: ProductRouteVariables }>,
   deps: ArchivesRouterDeps,
+  requirements: { scope: PatScope; minRole?: WorkspaceRole },
 ): Promise<AuthContext> {
-  if (deps.resolveAuth) return deps.resolveAuth(c);
-  const auth = c.get('auth');
+  const auth = deps.resolveAuth ? await deps.resolveAuth(c) : c.get('auth');
   if (!auth) {
     throw new CloudError('UNAUTHORIZED', 'Authentication is required.', { status: 401, applied: false });
   }
+  assertAuthAccess(auth, requirements);
   return auth;
 }
 
@@ -40,7 +45,7 @@ export function createArchivesRouter(deps: ArchivesRouterDeps): Hono<{ Variables
 
   // POST /motion-api/project-archives/export — Export workspace projects to S3 ZIP archive.
   app.post('/motion-api/project-archives/export', async (c) => {
-    const auth = await requireAuth(c, deps);
+    const auth = await requireAuth(c, deps, WRITE_REQ);
     const body = (await c.req.json().catch(() => ({}))) as {
       requestId?: string;
       projectIds?: string[];
@@ -64,7 +69,7 @@ export function createArchivesRouter(deps: ArchivesRouterDeps): Hono<{ Variables
       onError: (c) => c.json({ code: 'INVALID_ARGUMENT', error: 'Project archive exceeds 500 MB limit.' }, 413),
     }),
     async (c) => {
-      const auth = await requireAuth(c, deps);
+      const auth = await requireAuth(c, deps, WRITE_REQ);
       const contentType = c.req.header('content-type') ?? '';
       let zipBytes: Buffer;
       let requestId: string;
@@ -104,7 +109,7 @@ export function createArchivesRouter(deps: ArchivesRouterDeps): Hono<{ Variables
   // GET & HEAD /motion-api/project-archives/:archiveId/file
   // Hono v4 dispatches HEAD via GET; answer HEAD directly via headArchive without redirecting HEAD!
   app.get('/motion-api/project-archives/:archiveId/file', async (c) => {
-    const auth = await requireAuth(c, deps);
+    const auth = await requireAuth(c, deps, READ_REQ);
     const archiveId = c.req.param('archiveId');
     const filename = c.req.query('filename') ?? undefined;
 

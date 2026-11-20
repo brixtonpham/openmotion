@@ -1,5 +1,11 @@
 import type { Context } from 'hono';
-import type { AuthContext } from '../contracts/auth.ts';
+import {
+  hasMinRole,
+  hasScope,
+  type AuthContext,
+  type PatScope,
+  type WorkspaceRole,
+} from '../contracts/auth.ts';
 import { CloudError, isCloudError } from '../contracts/errors.ts';
 import type { RenderWorkerHealth } from '../contracts/events.ts';
 import type {
@@ -65,18 +71,43 @@ export interface DisklessStudioDeps {
 export async function getAuthContext(
   c: Context<{ Variables: StudioVariables }>,
   deps: DisklessStudioDeps,
+  requirements?: { scope: PatScope; minRole?: WorkspaceRole },
 ): Promise<AuthContext> {
-  if (deps.resolveAuth) {
-    return deps.resolveAuth(c);
-  }
-  const existing = c.get('auth');
-  if (!existing) {
+  const auth = deps.resolveAuth ? await deps.resolveAuth(c) : c.get('auth');
+  if (!auth) {
     throw new CloudError('UNAUTHORIZED', 'Authentication context is required.', {
       status: 401,
       applied: false,
     });
   }
-  return existing;
+  if (requirements) {
+    assertAuthAccess(auth, requirements);
+  }
+  return auth;
+}
+
+export function assertAuthAccess(
+  auth: AuthContext,
+  requirements: { scope: PatScope; minRole?: WorkspaceRole },
+): void {
+  if (requirements.minRole && !hasMinRole(auth, requirements.minRole)) {
+    throw new CloudError(
+      'FORBIDDEN',
+      `Workspace role "${requirements.minRole}" or higher is required for this operation.`,
+      {
+        status: 403,
+        applied: false,
+        details: { requiredRole: requirements.minRole, role: auth.role },
+      },
+    );
+  }
+  if (!hasScope(auth, requirements.scope)) {
+    throw new CloudError('FORBIDDEN', `Scope "${requirements.scope}" is required for this operation.`, {
+      status: 403,
+      applied: false,
+      details: { requiredScope: requirements.scope },
+    });
+  }
 }
 
 /** Extract a wildcard path segment after `marker` (e.g. `"/files/"`), safely URI-decoded. */

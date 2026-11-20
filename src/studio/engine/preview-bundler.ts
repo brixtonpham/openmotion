@@ -122,12 +122,34 @@ function escapeGsapUrl(url: string): string {
   return url.replace(/&/g, '&amp;').replace(/"/g, '&quot;');
 }
 
+function resolveGsapDistUrl(baseUrl: string): string {
+  if (baseUrl.startsWith('/')) {
+    return baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`;
+  }
+  return gsapCdnDist(undefined, baseUrl);
+}
+
 function gsapScriptTag(file: string, baseUrl: string): string {
-  return `<script src="${escapeGsapUrl(gsapCdnDist(undefined, baseUrl) + file)}"></script>`;
+  return `<script src="${escapeGsapUrl(resolveGsapDistUrl(baseUrl) + file)}"></script>`;
 }
 
 function resolvePreviewGsapBaseUrl(override?: string): string {
   const configured = override ?? process.env.HYPERFRAMES_GSAP_BASE_URL;
+  if (typeof configured === 'string') {
+    const trimmed = configured.trim();
+    if (trimmed.startsWith('/')) {
+      if (
+        trimmed.includes('?') ||
+        trimmed.includes('#') ||
+        trimmed.includes('..') ||
+        trimmed.includes('\\') ||
+        /[\x00-\x1f]/.test(trimmed)
+      ) {
+        throw new Error('Root-relative GSAP base URL must not contain query, fragment, or traversal.');
+      }
+      return trimmed.endsWith('/') ? trimmed : `${trimmed}/`;
+    }
+  }
   return normalizeGsapBaseUrl(configured);
 }
 
@@ -337,7 +359,7 @@ function htmlHasMotionPathPlugin(html: string): boolean {
 }
 
 function gsapCdnFallbackScript(baseUrl: string): string {
-  return `<script ${GSAP_FALLBACK_ATTR}>(function(){var cdnBase=${JSON.stringify(gsapCdnDist(undefined, baseUrl)).replace(/</g, '\\u003c')};var loaded={};function loadFallback(file){if(loaded[file])return loaded[file];return loaded[file]=new Promise(function(ok,fail){var s=document.createElement("script");s.src=cdnBase+file;s.hfGsapFallback=true;s.onload=ok;s.onerror=fail;document.head.appendChild(s);});}document.addEventListener("error",function(e){var t=e.target;if(!t||t.tagName!=="SCRIPT"||!t.src||t.hfGsapFallback)return;var m=t.src.match(/gsap[^/]*\\/dist\\/(.+\\.js)/);if(m)loadFallback(m[1]).catch(function(){});},true);})();</script>`;
+  return `<script ${GSAP_FALLBACK_ATTR}>(function(){var cdnBase=${JSON.stringify(resolveGsapDistUrl(baseUrl)).replace(/</g, '\\u003c')};var loaded={};function loadFallback(file){if(loaded[file])return loaded[file];return loaded[file]=new Promise(function(ok,fail){var s=document.createElement("script");s.src=cdnBase+file;s.hfGsapFallback=true;s.onload=ok;s.onerror=fail;document.head.appendChild(s);});}document.addEventListener("error",function(e){var t=e.target;if(!t||t.tagName!=="SCRIPT"||!t.src||t.hfGsapFallback)return;var m=t.src.match(/gsap[^/]*\\/dist\\/(.+\\.js)/);if(m)loadFallback(m[1]).catch(function(){});},true);})();</script>`;
 }
 
 function injectGsapCdnFallback(html: string, baseUrl: string): string {
@@ -349,7 +371,10 @@ function injectGsapCdnFallback(html: string, baseUrl: string): string {
 
 function injectMotionPathPluginIfNeeded(html: string, baseUrl: string): string {
   if (!htmlUsesMotionPath(html) || htmlHasMotionPathPlugin(html)) return html;
-  const tag = `<script src="${escapeGsapUrl(motionPathPluginUrl(undefined, baseUrl))}"></script>`;
+  const pluginUrl = baseUrl.startsWith('/')
+    ? `${resolveGsapDistUrl(baseUrl)}MotionPathPlugin.min.js`
+    : motionPathPluginUrl(undefined, baseUrl);
+  const tag = `<script src="${escapeGsapUrl(pluginUrl)}"></script>`;
   return insertBeforeCloseTag(html, 'head', `${tag}\n`) ?? `${tag}\n${html}`;
 }
 

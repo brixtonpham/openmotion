@@ -406,7 +406,12 @@ export class VersionHistoryService {
             endedAt: now,
           }),
         )
-        .where(eq(projectHistoryEntries.id, current.id));
+        .where(
+          and(
+            eq(projectHistoryEntries.workspaceId, ctx.workspaceId),
+            eq(projectHistoryEntries.id, current.id),
+          ),
+        );
 
       return { id: current.id, seq: current.seq, label: nextLabel };
     });
@@ -463,8 +468,17 @@ export class VersionHistoryService {
             eq(projectHistoryEntries.projectId, project.id),
           ),
         );
+      const maxVerRow = await tx
+        .select({ maxVer: sql<number>`COALESCE(MAX(${projectVersions.versionNumber}), 0)` })
+        .from(projectVersions)
+        .where(
+          and(
+            eq(projectVersions.workspaceId, ctx.workspaceId),
+            eq(projectVersions.projectId, project.id),
+          ),
+        );
       const nextSeq = Math.max(project.currentHistorySeq, Number(maxSeqRow[0]?.maxSeq ?? 0)) + 1;
-      const nextVersionNumber = project.currentVersionNumber + 1;
+      const nextVersionNumber = Math.max(project.currentVersionNumber, Number(maxVerRow[0]?.maxVer ?? 0)) + 1;
       const now = new Date();
 
       const parentRows =
@@ -622,7 +636,12 @@ export class VersionHistoryService {
         await tx
           .update(projectHistoryEntries)
           .set(asUpdate(projectHistoryEntries, { undone: true }))
-          .where(eq(projectHistoryEntries.id, currentEntry.id));
+          .where(
+            and(
+              eq(projectHistoryEntries.workspaceId, ctx.workspaceId),
+              eq(projectHistoryEntries.id, currentEntry.id),
+            ),
+          );
       } else {
         const undone = entries.filter((e) => e.undone && e.seq > project.currentHistorySeq);
         if (undone.length === 0) {
@@ -633,7 +652,12 @@ export class VersionHistoryService {
         await tx
           .update(projectHistoryEntries)
           .set(asUpdate(projectHistoryEntries, { undone: false }))
-          .where(eq(projectHistoryEntries.id, targetEntry.id));
+          .where(
+            and(
+              eq(projectHistoryEntries.workspaceId, ctx.workspaceId),
+              eq(projectHistoryEntries.id, targetEntry.id),
+            ),
+          );
       }
 
       const [targetVersion] = await tx
@@ -756,7 +780,12 @@ export class VersionHistoryService {
         await tx
           .update(projectHistoryEntries)
           .set(asUpdate(projectHistoryEntries, { undone: true }))
-          .where(inArray(projectHistoryEntries.id, toUndoIds));
+          .where(
+            and(
+              eq(projectHistoryEntries.workspaceId, ctx.workspaceId),
+              inArray(projectHistoryEntries.id, toUndoIds),
+            ),
+          );
       }
 
       const [restoreVersion] = await tx
@@ -975,7 +1004,16 @@ export class VersionHistoryService {
       const nextRevision = computeProjectRevision(
         snapshotFiles.map((f) => ({ path: f.path, size: Number(f.sizeBytes), hash: f.sha256.trim() })),
       );
-      const nextVersionNumber = project.currentVersionNumber + 1;
+      const maxVerRow = await tx
+        .select({ maxVer: sql<number>`COALESCE(MAX(${projectVersions.versionNumber}), 0)` })
+        .from(projectVersions)
+        .where(
+          and(
+            eq(projectVersions.workspaceId, ctx.workspaceId),
+            eq(projectVersions.projectId, project.id),
+          ),
+        );
+      const nextVersionNumber = Math.max(project.currentVersionNumber, Number(maxVerRow[0]?.maxVer ?? 0)) + 1;
 
       const maxSeqRow = await tx
         .select({ maxSeq: sql<number>`COALESCE(MAX(${projectHistoryEntries.seq}), 0)` })

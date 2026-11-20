@@ -1035,7 +1035,16 @@ export class ProjectFilesService {
 
       // 9. Append immutable project_versions + project_version_files + project_history_entries.
       if (shouldCreateVersion) {
-        nextVersionNumber = project.currentVersionNumber + 1;
+        const maxVerRow = await tx
+          .select({ maxVer: sql<number>`COALESCE(MAX(${projectVersions.versionNumber}), 0)` })
+          .from(projectVersions)
+          .where(
+            and(
+              eq(projectVersions.workspaceId, ctx.workspaceId),
+              eq(projectVersions.projectId, project.id),
+            ),
+          );
+        nextVersionNumber = Math.max(project.currentVersionNumber, Number(maxVerRow[0]?.maxVer ?? 0)) + 1;
 
         const maxSeqRow = await tx
           .select({ maxSeq: sql<number>`COALESCE(MAX(${projectHistoryEntries.seq}), 0)` })
